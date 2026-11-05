@@ -888,6 +888,11 @@ fn guard_groups_for(state_flags: CachedStateFlags) -> bool {
 static mut HOT_EDGE_THRESHOLD: u32 = 256;
 static mut HOT_EDGE_EXTRA_PAGES: u32 = 5;
 static mut HOT_EDGE_MAX_JOINS: u32 = 256;
+static mut HOT_EDGE_PROMPT_REFORM: bool = true;
+#[no_mangle]
+pub fn set_jit_hot_edge_prompt_reform(on: u32) { unsafe { HOT_EDGE_PROMPT_REFORM = on != 0 } }
+#[no_mangle]
+pub fn get_jit_hot_edge_prompt_reform() -> u32 { unsafe { HOT_EDGE_PROMPT_REFORM as u32 } }
 // Sample one exit in 2^HOT_EDGE_SAMPLE_SHIFT: the per-exit cost is then one load and a branch.
 const HOT_EDGE_SAMPLE_SHIFT: u32 = 4;
 // Halve every counter each 2^16 samples (~1M exits), so "hot" means a sustained rate.
@@ -1053,7 +1058,25 @@ fn hot_edge_form(src_page: Page, target: u32) {
         HOT_EDGE_STATS[0] += 1;
         HOT_EDGE_STATS[1] += 1;
     }
-    free_wasm_module_tree(&mut ctx, src_index);
+    if unsafe { HOT_EDGE_PROMPT_REFORM } {
+        free_for_reform(&mut ctx, src_index);
+    }
+    else {
+        free_wasm_module_tree(&mut ctx, src_index);
+    }
+}
+
+fn free_for_reform(ctx: &mut JitState, root: WasmTableIndex) {
+    let before: Vec<Page> = ctx.pages.keys().copied().collect();
+    free_wasm_module_tree(ctx, root);
+    for page in before {
+        if ctx.pages.contains_key(&page) {
+            continue;
+        }
+        if let Some((hotness, _)) = ctx.entry_points.get_mut(&page) {
+            *hotness = (*hotness).max(JIT_THRESHOLD);
+        }
+    }
 }
 
 /// Analyse one instruction without reading past the end of its page. None = it would cross.
@@ -1102,6 +1125,11 @@ static mut JIT_CHAIN_TIER2_ACCOUNTING: bool = true;
 // page is already in the module's page set. set_jit_config(13); budget idx 14 caps the
 // callee's total instruction count (leaf qualification).
 static mut JIT_RET_SPECULATION: bool = false;
+static mut JIT_RET_MEMO_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_ret_memo_inline(on: u32) { unsafe { JIT_RET_MEMO_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_ret_memo_inline() -> u32 { unsafe { JIT_RET_MEMO_INLINE as u32 } }
 static mut JIT_RET_SPEC_MAX_INSTR: u32 = 24;
 const RET_SPEC_MAX_CANDIDATES: usize = 4;
 
@@ -5320,6 +5348,99 @@ fn gen_chain_or_exit_to_known_successor(
 /// Attribute this activation's local guest-instruction count to its module at a real
 /// module exit. Cross-module chain exits fold the same operation into their existing
 /// lookup helper to avoid a second wasm call on the hottest edge.
+fn gen_ret_memo_inline_probe(ctx: &mut JitContext, state_flags: CachedStateFlags) {
+    if !unsafe { JIT_RET_MEMO_INLINE } || unsafe { JIT_TIER2_THRESHOLD } != 0 {
+        return;
+    }
+    let miss = ctx.builder.block_void();
+
+    ctx.builder.load_fixed_u8(std::ptr::addr_of!(TIER2_UNGATED) as u32);
+    ctx.builder.br_if(miss);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(WRONG_ENTRY_REFUSE) as u32);
+    ctx.builder.br_if(miss);
+    ctx.builder.load_fixed_u8(std::ptr::addr_of!(RET_CACHE_HASH_MIX) as u32);
+    ctx.builder.br_if(miss);
+
+    let hp = unsafe { hypercall::hp_ptr() as u32 };
+    ctx.builder.load_fixed_i32(hp);
+    let limit = ctx.builder.set_new_local();
+    ctx.builder.get_local(&limit);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+        ctx.builder.load_fixed_i32(hp + 0x008);
+        ctx.builder.br_if(miss);
+        ctx.builder.const_i32(100_003);
+        ctx.builder.set_local(&limit);
+    ctx.builder.block_end();
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
+    ctx.builder.sub_i32();
+    ctx.builder.get_local(&limit);
+    ctx.builder.geu_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.free_local(limit);
+    ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
+    ctx.builder.br_if(miss);
+
+    ctx.builder.const_i32(std::ptr::addr_of!(RET_CACHE) as u32 as i32);
+    ctx.builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
+    let eip = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(2);
+    ctx.builder.shr_u_i32();
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(RET_CACHE_MASK) as u32);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(std::mem::size_of::<RetMemo>() as i32);
+    ctx.builder.mul_i32();
+    ctx.builder.add_i32();
+    let entry = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(0);
+    ctx.builder.get_local(&eip);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.free_local(eip);
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(4);
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(12);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(8);
+    let packed = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.lt_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.free_local(entry);
+
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(cpu::WASM_TABLE_OFFSET as i32);
+    ctx.builder.sub_i32();
+    let table_index = ctx.builder.set_new_local();
+    gen_direct_chain_entry_accounting(ctx, &table_index);
+    ctx.builder.free_local(table_index);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::RET_CHAIN_HIT);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::RET_MEMO_HIT);
+
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.return_call_indirect_fn1();
+    ctx.builder.free_local(packed);
+
+    ctx.builder.block_end();
+}
+
 pub fn gen_tier2_note_retired(ctx: &mut JitContext) {
     if unsafe { JIT_TIER2_THRESHOLD } == 0 {
         return;
@@ -5857,6 +5978,8 @@ fn jit_generate_module(
                         if ret_chaining_enabled() {
                             codegen::gen_move_registers_from_locals_to_memory(ctx);
                             codegen::gen_update_instruction_counter(ctx);
+
+                            gen_ret_memo_inline_probe(ctx, state_flags);
 
                             ctx.builder.const_i32(state_flags.to_u32() as i32);
                             ctx.builder.const_i32(ctx.wasm_table_index as i32);
@@ -7384,6 +7507,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if WBUF_CALL_SITES != 0 {
             add(0x7A11_0004);
+        }
+        if JIT_RET_MEMO_INLINE {
+            add(0x7A11_0005);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
