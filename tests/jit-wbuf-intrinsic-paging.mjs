@@ -204,6 +204,21 @@ function after_halt(emulator)
     result.alias_cleanup = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
     result.alias_head = dv.getUint32(CTRL, true);
     result.alias_first_word = dv.getUint32(DATA + HEAD_ALIAS, true);
+
+    const HEAD_RO = 0x4000;
+    dv.setUint32(CTRL, HEAD_RO, true);
+    frame(CONST_OK);
+    result.warm_cleanup = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
+    const ctrl_pte = PT0_ADDR + (CTRL >>> 12) * 4;
+    dv.setUint32(ctrl_pte, dv.getUint32(ctrl_pte, true) & ~2, true);
+    cpu.cr[0] |= 0x10000;
+    ex.full_clear_tlb();
+    frame(CONST_OK);
+    dv.setUint32(CTRL, HEAD_RO, true);
+    result.ro_cleanup = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
+    frame(CONST_OK);
+    result.ro_cleanup_tlb = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
+    result.ro_head = dv.getUint32(CTRL, true);
     return result;
 }
 
@@ -224,4 +239,7 @@ if(r.recover_cleanup !== 16 || r.recover_head !== 0x2000 + STRIDE)
     fail("(b3) intrinsic did not recover after the decline");
 if(r.alias_cleanup !== -1 || r.alias_head !== 0x3000 || r.alias_first_word !== 0x7E577E57)
     fail("(b4) a constant block aliasing its own ring slot was executed");
+if(r.warm_cleanup !== 16) fail("(b5) warm-up call on a writable ring was refused");
+if(r.ro_cleanup !== -1 || r.ro_cleanup_tlb !== -1 || r.ro_head !== 0x4000)
+    fail("(b5) a ring control word on a read-only page (CR0.WP) was written");
 console.log("  ok — hits under paging, and a non-present constant page declines with no side effect");

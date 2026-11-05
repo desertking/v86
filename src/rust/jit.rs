@@ -277,6 +277,48 @@ unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool
     }
 }
 
+#[derive(Clone, Copy)]
+struct WbufAccess {
+    mem_size: u32,
+    paging: bool,
+    need_read: i32,
+    need_write: i32,
+}
+
+#[inline(always)]
+unsafe fn wbuf_access() -> WbufAccess {
+    let paging = *global_pointers::cr & cpu::CR0_PG != 0;
+    let user = if *global_pointers::cpl == 3 { cpu::TLB_NO_USER } else { 0 };
+    WbufAccess {
+        mem_size: *global_pointers::memory_size,
+        paging,
+        need_read: cpu::TLB_VALID | cpu::TLB_IN_MAPPED_RANGE | user,
+        need_write: cpu::TLB_VALID | cpu::TLB_IN_MAPPED_RANGE | user | cpu::TLB_READONLY,
+    }
+}
+
+#[inline(always)]
+unsafe fn wbuf_ok(acc: &WbufAccess, addr: u32, size: u32, for_writing: bool) -> bool {
+    let end = match addr.checked_add(size) {
+        Some(end) if end <= acc.mem_size => end,
+        _ => return false,
+    };
+    if !acc.paging || size == 0 {
+        return true;
+    }
+    let page = addr & !0xFFF;
+    if page == (end - 1) & !0xFFF {
+        let entry = cpu::tlb_data[(page >> 12) as usize];
+        let need = if for_writing { acc.need_write } else { acc.need_read };
+        if entry & need == cpu::TLB_VALID
+            && ((entry & !0xFFF) as u32 ^ page).wrapping_sub(memory::mem8 as u32) == page
+        {
+            return true;
+        }
+    }
+    wbuf_range_accessible(addr, size, for_writing)
+}
+
 #[inline]
 unsafe fn wbuf_range_fill_tlb(addr: u32, size: u32, for_writing: bool) {
     if size == 0 || *global_pointers::cr & cpu::CR0_PG == 0 {
@@ -455,7 +497,8 @@ pub unsafe fn jit_wbuf_intrinsic_execute_call_site(esp: u32) -> i32 {
 
 unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
     WBUF_WALKED = false;
-    if !wbuf_range_accessible(esp, 4, false) {
+    let acc = wbuf_access();
+    if !wbuf_ok(&acc, esp, 4, false) {
         return -1;
     }
     let ret = wbuf_read_u32(esp);
@@ -463,18 +506,18 @@ unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
         Some(site) => site,
         None => return -1,
     };
-    if !wbuf_range_accessible(site, 5, false) || *memory::mem8.add(site as usize) != 0xE8 {
+    if !wbuf_ok(&acc, site, 5, false) || *memory::mem8.add(site as usize) != 0xE8 {
         return -1;
     }
     let stub = ret.wrapping_add(wbuf_read_u32(site + 1));
-    if !wbuf_range_accessible(stub, 6, false)
+    if !wbuf_ok(&acc, stub, 6, false)
         || *memory::mem8.add(stub as usize) != 0xFF
         || *memory::mem8.add(stub as usize + 1) != 0x25
     {
         return -1;
     }
     let slot = wbuf_read_u32(stub + 2);
-    if !wbuf_range_accessible(slot, 4, false) {
+    if !wbuf_ok(&acc, slot, 4, false) {
         return -1;
     }
     let target = wbuf_read_u32(slot);
@@ -482,7 +525,7 @@ unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
         return -1;
     }
     let cleanup = match esp.checked_add(4) {
-        Some(args) => wbuf_intrinsic_execute_inner(target, args, 4),
+        Some(args) => wbuf_intrinsic_execute_with(&acc, target, args, 4),
         None => -1,
     };
     if cleanup >= 0 && WBUF_WALKED {
@@ -496,9 +539,15 @@ unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
 /// Every guest range this may touch is validated — bounds AND paging — before the first byte
 /// moves, so a decline is indistinguishable from the CALL never having been intercepted.
 unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 {
+    let acc = wbuf_access();
+    wbuf_intrinsic_execute_with(&acc, target, esp, lead)
+}
+
+#[inline(always)]
+unsafe fn wbuf_intrinsic_execute_with(acc: &WbufAccess, target: u32, esp: u32, lead: u32) -> i32 {
     let desc = wbuf_intrinsic_find(target);
     // The control word is read AND written back, so it must be writable, not merely present.
-    if desc.target == 0 || !wbuf_range_accessible(desc.ctrl_addr, 4, true) {
+    if desc.target == 0 || !wbuf_ok(acc, desc.ctrl_addr, 4, true) {
         return -1;
     }
 
@@ -510,7 +559,7 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 
         Some(base) => base,
         None => return -1,
     };
-    if !wbuf_range_accessible(stack_base, lead + stack_bytes, false) {
+    if !wbuf_ok(acc, stack_base, lead + stack_bytes, false) {
         return -1;
     }
 
@@ -533,7 +582,7 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 
             return -1;
         }
         let payload_bytes = vec4_count * 16;
-        if !wbuf_range_accessible(data_ptr, payload_bytes, false) {
+        if !wbuf_ok(acc, data_ptr, payload_bytes, false) {
             return -1;
         }
         payload = (data_ptr, payload_bytes);
@@ -543,7 +592,7 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 
         Some(dst) => dst,
         None => return -1,
     };
-    if stride > desc.capacity - head || !wbuf_range_accessible(dst, stride, true) {
+    if stride > desc.capacity - head || !wbuf_ok(acc, dst, stride, true) {
         return -1;
     }
     // The ring is guest-addressable and both source ranges are guest-controlled, so an
