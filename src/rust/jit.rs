@@ -76,6 +76,7 @@ pub(crate) const WBUF_INTRINSIC_CAPACITY: usize = 512;
 pub(crate) const WBUF_INTRINSIC_PROBES: usize = 8;
 const WBUF_KIND_SCALAR: u32 = 0;
 const WBUF_KIND_SHADER_CONSTANT: u32 = 1;
+const WBUF_KIND_NO_ARGS: u32 = 2;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -143,6 +144,12 @@ pub(crate) fn wbuf_intrinsic_hot_min_target_ptr() -> u32 {
 pub(crate) fn wbuf_intrinsic_hot_max_target_ptr() -> u32 {
     std::ptr::addr_of!(WBUF_INTRINSIC_HOT_MAX_TARGET) as u32
 }
+pub(crate) fn wbuf_intrinsic_min_target_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_MIN_TARGET) as u32
+}
+pub(crate) fn wbuf_intrinsic_max_target_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_MAX_TARGET) as u32
+}
 
 #[no_mangle]
 pub unsafe fn jit_wbuf_intrinsic_set_enabled(enabled: u32) {
@@ -166,9 +173,10 @@ pub unsafe fn jit_wbuf_intrinsic_register(
         || ctrl_addr == 0
         || data_base == 0
         || capacity < 32
-        || kind > WBUF_KIND_SHADER_CONSTANT
+        || kind > WBUF_KIND_NO_ARGS
         || kind == WBUF_KIND_SCALAR && !(1..=8).contains(&arg_count)
         || kind == WBUF_KIND_SHADER_CONSTANT && arg_count != 4
+        || kind == WBUF_KIND_NO_ARGS && arg_count != 0
     {
         return 0;
     }
@@ -279,7 +287,25 @@ pub unsafe fn jit_wbuf_intrinsic_execute(target: u32, esp: u32) -> i32 {
     if WBUF_INTRINSIC_ENABLED == 0 {
         return -1;
     }
-    let cleanup = wbuf_intrinsic_execute_inner(target, esp);
+    let cleanup = wbuf_intrinsic_execute_inner(target, esp, 0);
+    if cleanup < 0 {
+        WBUF_INTRINSIC_FALLBACKS = WBUF_INTRINSIC_FALLBACKS.wrapping_add(1);
+    }
+    else {
+        WBUF_INTRINSIC_HITS = WBUF_INTRINSIC_HITS.wrapping_add(1);
+    }
+    cleanup
+}
+
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_execute_tail(target: u32, esp: u32) -> i32 {
+    if WBUF_INTRINSIC_ENABLED == 0 {
+        return -1;
+    }
+    let cleanup = match esp.checked_add(4) {
+        Some(args) => wbuf_intrinsic_execute_inner(target, args, 4),
+        None => -1,
+    };
     if cleanup < 0 {
         WBUF_INTRINSIC_FALLBACKS = WBUF_INTRINSIC_FALLBACKS.wrapping_add(1);
     }
@@ -291,7 +317,7 @@ pub unsafe fn jit_wbuf_intrinsic_execute(target: u32, esp: u32) -> i32 {
 
 /// Every guest range this may touch is validated — bounds AND paging — before the first byte
 /// moves, so a decline is indistinguishable from the CALL never having been intercepted.
-unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
+unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 {
     let mut desc = WBUF_INTRINSIC_EMPTY;
     for hot in WBUF_INTRINSIC_HOT {
         if hot.target == target {
@@ -325,7 +351,11 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
     let arg_count = desc.meta >> 8 & 0xFF;
     let is_stdcall = desc.meta >> 16 & 1 != 0;
     let stack_bytes = arg_count * 4;
-    if !wbuf_range_accessible(esp, stack_bytes, false) {
+    let stack_base = match esp.checked_sub(lead) {
+        Some(base) => base,
+        None => return -1,
+    };
+    if !wbuf_range_accessible(stack_base, lead + stack_bytes, false) {
         return -1;
     }
 
@@ -337,6 +367,9 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
     let mut payload = (0u32, 0u32); // (data_ptr, byte length) — empty for the scalar kind
     let stride = if kind == WBUF_KIND_SCALAR {
         (arg_count + 1) * 4
+    }
+    else if kind == WBUF_KIND_NO_ARGS {
+        8
     }
     else {
         let data_ptr = wbuf_read_u32(esp + 8);
@@ -361,7 +394,7 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
     // The ring is guest-addressable and both source ranges are guest-controlled, so an
     // aliasing caller could otherwise make the copy read bytes this call is still writing.
     if wbuf_ranges_overlap(payload.0, payload.1, dst, stride)
-        || wbuf_ranges_overlap(esp, stack_bytes, dst, stride)
+        || wbuf_ranges_overlap(stack_base, lead + stack_bytes, dst, stride)
     {
         return -1;
     }
@@ -371,6 +404,9 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
         for i in 0..arg_count {
             wbuf_write_u32(dst + 4 + i * 4, wbuf_read_u32(esp + i * 4));
         }
+    }
+    else if kind == WBUF_KIND_NO_ARGS {
+        wbuf_write_u32(dst + 4, 0);
     }
     else {
         let this_ptr = wbuf_read_u32(esp);
