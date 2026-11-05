@@ -239,6 +239,8 @@ unsafe fn wbuf_guest_range_ok(addr: u32, size: u32) -> bool {
 /// LINEAR address through `mem8`, so a non-identity mapping would touch the wrong page. The
 /// walk is non-faulting and sets no accessed/dirty bits, so declining leaves the guest's own
 /// CALL to raise the exact #PF at the exact place.
+static mut WBUF_WALKED: bool = false;
+
 #[inline]
 unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool {
     if !wbuf_guest_range_ok(addr, size) {
@@ -249,9 +251,23 @@ unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool
     }
     let last = (addr + size - 1) & !0xFFF;
     let mut page = addr & !0xFFF;
+    let need = cpu::TLB_VALID
+        | cpu::TLB_IN_MAPPED_RANGE
+        | if *global_pointers::cpl == 3 { cpu::TLB_NO_USER } else { 0 }
+        | if for_writing { cpu::TLB_READONLY } else { 0 };
     loop {
+        let entry = cpu::tlb_data[(page >> 12) as usize];
+        if entry & need == cpu::TLB_VALID
+            && ((entry & !0xFFF) as u32 ^ page).wrapping_sub(memory::mem8 as u32) == page
+        {
+            if page == last {
+                return true;
+            }
+            page += 0x1000;
+            continue;
+        }
         match cpu::translate_address_no_fault(page as i32, for_writing) {
-            Some(phys) if phys == page => {},
+            Some(phys) if phys == page => WBUF_WALKED = true,
             _ => return false,
         }
         if page == last {
@@ -309,6 +325,7 @@ pub unsafe fn jit_wbuf_intrinsic_execute(target: u32, esp: u32) -> i32 {
     if WBUF_INTRINSIC_ENABLED == 0 {
         return -1;
     }
+    WBUF_WALKED = false;
     let cleanup = wbuf_intrinsic_execute_inner(target, esp, 0);
     if cleanup < 0 {
         WBUF_INTRINSIC_FALLBACKS = WBUF_INTRINSIC_FALLBACKS.wrapping_add(1);
@@ -324,6 +341,7 @@ pub unsafe fn jit_wbuf_intrinsic_execute_tail(target: u32, esp: u32) -> i32 {
     if WBUF_INTRINSIC_ENABLED == 0 {
         return -1;
     }
+    WBUF_WALKED = false;
     let cleanup = match esp.checked_add(4) {
         Some(args) => wbuf_intrinsic_execute_inner(target, args, 4),
         None => -1,
@@ -436,6 +454,7 @@ pub unsafe fn jit_wbuf_intrinsic_execute_call_site(esp: u32) -> i32 {
 }
 
 unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
+    WBUF_WALKED = false;
     if !wbuf_range_accessible(esp, 4, false) {
         return -1;
     }
@@ -462,10 +481,16 @@ unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
     if target < WBUF_INTRINSIC_MIN_TARGET || target > WBUF_INTRINSIC_MAX_TARGET {
         return -1;
     }
-    match esp.checked_add(4) {
+    let cleanup = match esp.checked_add(4) {
         Some(args) => wbuf_intrinsic_execute_inner(target, args, 4),
         None => -1,
+    };
+    if cleanup >= 0 && WBUF_WALKED {
+        wbuf_range_fill_tlb(site, 5, false);
+        wbuf_range_fill_tlb(stub, 6, false);
+        wbuf_range_fill_tlb(slot, 4, false);
     }
+    cleanup
 }
 
 /// Every guest range this may touch is validated — bounds AND paging — before the first byte
@@ -529,10 +554,12 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 
         return -1;
     }
 
-    wbuf_range_fill_tlb(desc.ctrl_addr, 4, true);
-    wbuf_range_fill_tlb(stack_base, lead + stack_bytes, false);
-    wbuf_range_fill_tlb(dst, stride, true);
-    wbuf_range_fill_tlb(payload.0, payload.1, false);
+    if WBUF_WALKED {
+        wbuf_range_fill_tlb(desc.ctrl_addr, 4, true);
+        wbuf_range_fill_tlb(stack_base, lead + stack_bytes, false);
+        wbuf_range_fill_tlb(dst, stride, true);
+        wbuf_range_fill_tlb(payload.0, payload.1, false);
+    }
 
     wbuf_write_u32(dst, desc.func_id);
     if kind == WBUF_KIND_SCALAR {
