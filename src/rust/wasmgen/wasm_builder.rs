@@ -1349,6 +1349,9 @@ impl WasmBuilder {
     pub fn promote_f32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64PROMOTEF32); }
     pub fn demote_f64_to_f32(&mut self) { self.instruction_body.push(op::OP_F32DEMOTEF64); }
     pub fn convert_i32_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI32); }
+    pub fn convert_i32_to_f32(&mut self) { self.instruction_body.push(op::OP_F32CONVERTSI32); }
+    pub fn sqrt_f32(&mut self) { self.instruction_body.push(op::OP_F32SQRT); }
+    pub fn sqrt_f64(&mut self) { self.instruction_body.push(op::OP_F64SQRT); }
     pub fn convert_i64_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI64); }
     pub fn trunc_s_f64_to_i32(&mut self) { self.instruction_body.push(op::OP_I32TRUNCSF64); }
     pub fn extend_unsigned_i32_to_i64(&mut self) {

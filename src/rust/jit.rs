@@ -1126,6 +1126,23 @@ static mut JIT_CHAIN_TIER2_ACCOUNTING: bool = true;
 // callee's total instruction count (leaf qualification).
 static mut JIT_RET_SPECULATION: bool = false;
 static mut JIT_RET_MEMO_INLINE: bool = false;
+static mut JIT_FWAIT_INLINE: bool = false;
+static mut JIT_MULTI_ENTRY_LOOP_SAFETY: bool = false;
+static mut JIT_SSE_SCALAR_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_sse_scalar_inline(on: u32) { unsafe { JIT_SSE_SCALAR_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_sse_scalar_inline() -> u32 { unsafe { JIT_SSE_SCALAR_INLINE as u32 } }
+pub fn sse_scalar_inline_enabled() -> bool { unsafe { JIT_SSE_SCALAR_INLINE } }
+#[no_mangle]
+pub fn set_jit_multi_entry_loop_safety(on: u32) { unsafe { JIT_MULTI_ENTRY_LOOP_SAFETY = on != 0 } }
+#[no_mangle]
+pub fn get_jit_multi_entry_loop_safety() -> u32 { unsafe { JIT_MULTI_ENTRY_LOOP_SAFETY as u32 } }
+#[no_mangle]
+pub fn set_jit_fwait_inline(on: u32) { unsafe { JIT_FWAIT_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_fwait_inline() -> u32 { unsafe { JIT_FWAIT_INLINE as u32 } }
+pub fn fwait_inline_enabled() -> bool { unsafe { JIT_FWAIT_INLINE } }
 #[no_mangle]
 pub fn set_jit_ret_memo_inline(on: u32) { unsafe { JIT_RET_MEMO_INLINE = on != 0 } }
 #[no_mangle]
@@ -6527,6 +6544,23 @@ fn jit_generate_module(
                         }
                     }
                 }
+                else if unsafe { JIT_USE_LOOP_SAFETY && JIT_MULTI_ENTRY_LOOP_SAFETY } {
+                    ctx.builder.get_local(&ctx.instruction_counter);
+                    ctx.builder.const_i32(cpu::LOOP_COUNTER);
+                    ctx.builder.geu_i32();
+                    ctx.builder.if_void();
+                    for &addr in entries.iter() {
+                        let index = *index_for_addr.get(&addr).unwrap();
+                        ctx.builder.get_local(target_block);
+                        ctx.builder.const_i32(index.into());
+                        ctx.builder.eq_i32();
+                        ctx.builder.if_void();
+                        codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
+                        ctx.builder.br(exit_label);
+                        ctx.builder.block_end();
+                    }
+                    ctx.builder.block_end();
+                }
 
                 let mut olds = HashMap::new();
                 for &target in entries.iter() {
@@ -6880,7 +6914,15 @@ fn jit_generate_basic_block(
                 ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
             }
         }
-        jit_instructions::jit_instruction(ctx, &mut instruction_flags);
+        if fwait_inline_enabled() && read_jit_u8(ctx.cpu.eip) == 0x9B {
+            ctx.cpu.prefixes = 0;
+            ctx.start_of_current_instruction = ctx.cpu.eip;
+            ctx.cpu.read_imm8();
+            codegen::gen_fwait_inline(ctx);
+        }
+        else {
+            jit_instructions::jit_instruction(ctx, &mut instruction_flags);
+        }
         let end_eip = ctx.cpu.eip;
 
         // The PC predicate is deliberately narrower than the generic ST cache:
@@ -7510,6 +7552,15 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_RET_MEMO_INLINE {
             add(0x7A11_0005);
+        }
+        if JIT_FWAIT_INLINE {
+            add(0x7A11_0006);
+        }
+        if JIT_MULTI_ENTRY_LOOP_SAFETY {
+            add(0x7A11_0007);
+        }
+        if JIT_SSE_SCALAR_INLINE {
+            add(0x7A11_0008);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

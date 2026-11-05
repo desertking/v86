@@ -16,7 +16,7 @@ use crate::regs;
 use crate::regs::{AX, BP, BX, CX, DI, DX, SI, SP};
 use crate::regs::{CS, DS, ES, FS, GS, SS};
 use crate::regs::{EAX, EBP, EBX, ECX, EDI, EDX, ESI, ESP};
-use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal};
+use crate::wasmgen::wasm_builder::{WasmBuilder, WasmLocal, WasmLocalI64};
 
 enum LocalOrImmediate<'a> {
     WasmLocal(&'a WasmLocal),
@@ -142,6 +142,173 @@ pub fn instr_F2_jit(ctx: &mut JitContext, instr_flags: &mut u32) {
 pub fn instr_F3_jit(ctx: &mut JitContext, instr_flags: &mut u32) {
     ctx.cpu.prefixes |= PREFIX_F3;
     jit_handle_prefix(ctx, instr_flags)
+}
+
+fn sse_inline() -> bool { crate::jit::sse_scalar_inline_enabled() }
+
+fn sse_scalar_xmm_mem(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, op: SseScalarOp, f64_op: bool) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let dst = global_pointers::get_reg_xmm_offset(r) as i32;
+    if f64_op {
+        codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+        let src = ctx.builder.set_new_local_i64();
+        ctx.builder.const_i32(dst);
+        ctx.builder.const_i32(dst);
+        ctx.builder.load_aligned_f64(0);
+        ctx.builder.get_local_i64(&src);
+        ctx.builder.reinterpret_i64_as_f64();
+        match op {
+            SseScalarOp::Add => ctx.builder.add_f64(),
+            SseScalarOp::Sub => ctx.builder.sub_f64(),
+            SseScalarOp::Mul => ctx.builder.mul_f64(),
+            SseScalarOp::Div => ctx.builder.div_f64(),
+        }
+        ctx.builder.store_aligned_f64(0);
+        ctx.builder.free_local_i64(src);
+    }
+    else {
+        codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+        let src = ctx.builder.set_new_local();
+        ctx.builder.const_i32(dst);
+        ctx.builder.const_i32(dst);
+        ctx.builder.load_aligned_f32(0);
+        ctx.builder.get_local(&src);
+        ctx.builder.reinterpret_i32_as_f32();
+        match op {
+            SseScalarOp::Add => ctx.builder.add_f32(),
+            SseScalarOp::Sub => ctx.builder.sub_f32(),
+            SseScalarOp::Mul => ctx.builder.mul_f32(),
+            SseScalarOp::Div => ctx.builder.div_f32(),
+        }
+        ctx.builder.store_aligned_f32(0);
+        ctx.builder.free_local(src);
+    }
+}
+
+fn sse_source_f32_bits(ctx: &mut JitContext, source: Option<u32>, modrm_byte: Option<ModrmByte>) -> WasmLocal {
+    match (source, modrm_byte) {
+        (Some(r1), _) => {
+            ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+            ctx.builder.load_aligned_i32(0);
+        },
+        (None, Some(m)) => codegen::gen_modrm_resolve_safe_read32(ctx, m),
+        _ => unreachable!(),
+    }
+    ctx.builder.set_new_local()
+}
+
+fn sse_source_f64_bits(ctx: &mut JitContext, source: Option<u32>, modrm_byte: Option<ModrmByte>) -> WasmLocalI64 {
+    match (source, modrm_byte) {
+        (Some(r1), _) => {
+            ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+            ctx.builder.load_aligned_i64(0);
+        },
+        (None, Some(m)) => codegen::gen_modrm_resolve_safe_read64(ctx, m),
+        _ => unreachable!(),
+    }
+    ctx.builder.set_new_local_i64()
+}
+
+fn sse_sqrt_inline(ctx: &mut JitContext, source: Option<u32>, modrm_byte: Option<ModrmByte>, r: u32, f64_op: bool) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let dst = global_pointers::get_reg_xmm_offset(r) as i32;
+    if f64_op {
+        let src = sse_source_f64_bits(ctx, source, modrm_byte);
+        ctx.builder.const_i32(dst);
+        ctx.builder.get_local_i64(&src);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.sqrt_f64();
+        ctx.builder.store_aligned_f64(0);
+        ctx.builder.free_local_i64(src);
+    }
+    else {
+        let src = sse_source_f32_bits(ctx, source, modrm_byte);
+        ctx.builder.const_i32(dst);
+        ctx.builder.get_local(&src);
+        ctx.builder.reinterpret_i32_as_f32();
+        ctx.builder.sqrt_f32();
+        ctx.builder.store_aligned_f32(0);
+        ctx.builder.free_local(src);
+    }
+}
+
+fn sse_compare_inline(ctx: &mut JitContext, source: Option<u32>, modrm_byte: Option<ModrmByte>, r: u32, f64_op: bool) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let dst = global_pointers::get_reg_xmm_offset(r) as i32;
+    let (d, s) = if f64_op {
+        let s = sse_source_f64_bits(ctx, source, modrm_byte);
+        ctx.builder.const_i32(dst);
+        ctx.builder.load_aligned_i64(0);
+        (ctx.builder.set_new_local_i64(), s)
+    }
+    else {
+        let s32 = sse_source_f32_bits(ctx, source, modrm_byte);
+        ctx.builder.get_local(&s32);
+        ctx.builder.reinterpret_i32_as_f32();
+        ctx.builder.promote_f32_to_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        let s = ctx.builder.set_new_local_i64();
+        ctx.builder.free_local(s32);
+        ctx.builder.const_i32(dst);
+        ctx.builder.load_aligned_f32(0);
+        ctx.builder.promote_f32_to_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        (ctx.builder.set_new_local_i64(), s)
+    };
+    codegen::gen_sse_compare_flags(ctx.builder, &d, &s);
+    ctx.builder.free_local_i64(d);
+    ctx.builder.free_local_i64(s);
+}
+
+fn sse_cvt_inline(ctx: &mut JitContext, source: Option<u32>, modrm_byte: Option<ModrmByte>, r: u32, kind: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let dst = global_pointers::get_reg_xmm_offset(r) as i32;
+    match kind {
+        0 => {
+            let src = sse_source_f32_bits(ctx, source, modrm_byte);
+            ctx.builder.const_i32(dst);
+            ctx.builder.get_local(&src);
+            ctx.builder.reinterpret_i32_as_f32();
+            ctx.builder.promote_f32_to_f64();
+            ctx.builder.store_aligned_f64(0);
+            ctx.builder.free_local(src);
+        },
+        1 => {
+            let src = sse_source_f64_bits(ctx, source, modrm_byte);
+            ctx.builder.const_i32(dst);
+            ctx.builder.get_local_i64(&src);
+            ctx.builder.reinterpret_i64_as_f64();
+            ctx.builder.demote_f64_to_f32();
+            ctx.builder.store_aligned_f32(0);
+            ctx.builder.free_local_i64(src);
+        },
+        _ => {
+            let src = sse_source_f64_bits(ctx, source, modrm_byte);
+            for lane in 0..2 {
+                ctx.builder.const_i32(dst + lane * 8);
+                ctx.builder.get_local_i64(&src);
+                if lane == 1 {
+                    ctx.builder.const_i64(32);
+                    ctx.builder.shr_u_i64();
+                }
+                ctx.builder.wrap_i64_to_i32();
+                ctx.builder.reinterpret_i32_as_f32();
+                ctx.builder.promote_f32_to_f64();
+                ctx.builder.store_aligned_f64(0);
+            }
+            ctx.builder.free_local_i64(src);
+        },
+    }
+}
+
+fn sse_cvtsi2ss_inline(ctx: &mut JitContext, r: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let src = ctx.builder.set_new_local();
+    ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r) as i32);
+    ctx.builder.get_local(&src);
+    ctx.builder.convert_i32_to_f32();
+    ctx.builder.store_aligned_f32(0);
+    ctx.builder.free_local(src);
 }
 
 fn sse_read_f32_xmm_mem(ctx: &mut JitContext, name: &str, modrm_byte: ModrmByte, r: u32) {
@@ -6305,11 +6472,21 @@ pub fn instr_F20F2A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     ctx.builder.call_fn2("instr_F20F2A")
 }
 pub fn instr_F30F2A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+        sse_cvtsi2ss_inline(ctx, r);
+        return;
+    }
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
     ctx.builder.const_i32(r as i32);
     ctx.builder.call_fn2("instr_F30F2A")
 }
 pub fn instr_F30F2A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        codegen::gen_get_reg32(ctx, r1);
+        sse_cvtsi2ss_inline(ctx, r2);
+        return;
+    }
     codegen::gen_get_reg32(ctx, r1);
     ctx.builder.const_i32(r2 as i32);
     ctx.builder.call_fn2("instr_F30F2A")
@@ -6387,28 +6564,60 @@ pub fn instr_F30F2D_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F2E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, None, Some(modrm_byte), r, false);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_0F2E", modrm_byte, r);
 }
 pub fn instr_0F2E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, Some(r1), None, r2, false);
+        return;
+    }
     sse_read_f32_xmm_xmm(ctx, "instr_0F2E", r1, r2);
 }
 pub fn instr_660F2E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, None, Some(modrm_byte), r, true);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_660F2E", modrm_byte, r);
 }
 pub fn instr_660F2E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, Some(r1), None, r2, true);
+        return;
+    }
     sse_read64_xmm_xmm(ctx, "instr_660F2E", r1, r2);
 }
 
 pub fn instr_0F2F_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, None, Some(modrm_byte), r, false);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_0F2F", modrm_byte, r);
 }
 pub fn instr_0F2F_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, Some(r1), None, r2, false);
+        return;
+    }
     sse_read_f32_xmm_xmm(ctx, "instr_0F2F", r1, r2);
 }
 pub fn instr_660F2F_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, None, Some(modrm_byte), r, true);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_660F2F", modrm_byte, r);
 }
 pub fn instr_660F2F_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_compare_inline(ctx, Some(r1), None, r2, true);
+        return;
+    }
     sse_read64_xmm_xmm(ctx, "instr_660F2F", r1, r2);
 }
 
@@ -6425,15 +6634,31 @@ pub fn instr_660F51_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F51", r1, r2);
 }
 pub fn instr_F20F51_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_sqrt_inline(ctx, None, Some(modrm_byte), r, true);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_F20F51", modrm_byte, r);
 }
 pub fn instr_F20F51_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_sqrt_inline(ctx, Some(r1), None, r2, true);
+        return;
+    }
     sse_read64_xmm_xmm(ctx, "instr_F20F51", r1, r2);
 }
 pub fn instr_F30F51_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_sqrt_inline(ctx, None, Some(modrm_byte), r, false);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_F30F51", modrm_byte, r);
 }
 pub fn instr_F30F51_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_sqrt_inline(ctx, Some(r1), None, r2, false);
+        return;
+    }
     sse_read_f32_xmm_xmm(ctx, "instr_F30F51", r1, r2);
 }
 
@@ -6537,6 +6762,10 @@ pub fn instr_660F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F58", r1, r2);
 }
 pub fn instr_F20F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Add, true);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_F20F58", modrm_byte, r);
 }
 pub fn instr_F20F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
@@ -6544,6 +6773,10 @@ pub fn instr_F20F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_scalar_f64_xmm_xmm(ctx, r1, r2, SseScalarOp::Add);
 }
 pub fn instr_F30F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Add, false);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_F30F58", modrm_byte, r);
 }
 pub fn instr_F30F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
@@ -6582,6 +6815,10 @@ fn mulpd_inline(ctx: &mut JitContext, src: u32, dst: u32) {
     }
 }
 pub fn instr_F20F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Mul, true);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_F20F59", modrm_byte, r);
 }
 pub fn instr_F20F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
@@ -6589,6 +6826,10 @@ pub fn instr_F20F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_scalar_f64_xmm_xmm(ctx, r1, r2, SseScalarOp::Mul);
 }
 pub fn instr_F30F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Mul, false);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_F30F59", modrm_byte, r);
 }
 pub fn instr_F30F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
@@ -6597,9 +6838,17 @@ pub fn instr_F30F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F5A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_cvt_inline(ctx, None, Some(modrm_byte), r, 2);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_0F5A", modrm_byte, r);
 }
 pub fn instr_0F5A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_cvt_inline(ctx, Some(r1), None, r2, 2);
+        return;
+    }
     sse_read64_xmm_xmm(ctx, "instr_0F5A", r1, r2);
 }
 pub fn instr_660F5A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -6609,15 +6858,31 @@ pub fn instr_660F5A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F5A", r1, r2);
 }
 pub fn instr_F20F5A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_cvt_inline(ctx, None, Some(modrm_byte), r, 1);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_F20F5A", modrm_byte, r);
 }
 pub fn instr_F20F5A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_cvt_inline(ctx, Some(r1), None, r2, 1);
+        return;
+    }
     sse_read64_xmm_xmm(ctx, "instr_F20F5A", r1, r2);
 }
 pub fn instr_F30F5A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_cvt_inline(ctx, None, Some(modrm_byte), r, 0);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_F30F5A", modrm_byte, r);
 }
 pub fn instr_F30F5A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_inline() {
+        sse_cvt_inline(ctx, Some(r1), None, r2, 0);
+        return;
+    }
     sse_read_f32_xmm_xmm(ctx, "instr_F30F5A", r1, r2);
 }
 
@@ -6653,6 +6918,10 @@ pub fn instr_660F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F5C", r1, r2);
 }
 pub fn instr_F20F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Sub, true);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_F20F5C", modrm_byte, r);
 }
 pub fn instr_F20F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
@@ -6660,6 +6929,10 @@ pub fn instr_F20F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_scalar_f64_xmm_xmm(ctx, r1, r2, SseScalarOp::Sub);
 }
 pub fn instr_F30F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Sub, false);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_F30F5C", modrm_byte, r);
 }
 pub fn instr_F30F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
@@ -6705,6 +6978,10 @@ pub fn instr_660F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_read128_xmm_xmm(ctx, "instr_660F5E", r1, r2);
 }
 pub fn instr_F20F5E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Div, true);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_F20F5E", modrm_byte, r);
 }
 pub fn instr_F20F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
@@ -6712,6 +6989,10 @@ pub fn instr_F20F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     sse_scalar_f64_xmm_xmm(ctx, r1, r2, SseScalarOp::Div);
 }
 pub fn instr_F30F5E_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_inline() {
+        sse_scalar_xmm_mem(ctx, modrm_byte, r, SseScalarOp::Div, false);
+        return;
+    }
     sse_read_f32_xmm_mem(ctx, "instr_F30F5E", modrm_byte, r);
 }
 pub fn instr_F30F5E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {

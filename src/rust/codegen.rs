@@ -2935,6 +2935,65 @@ pub fn gen_task_switch_test(ctx: &mut JitContext) {
     ctx.builder.block_end();
 }
 
+pub fn gen_sse_compare_flags(builder: &mut WasmBuilder, d: &WasmLocalI64, s: &WasmLocalI64) {
+    gen_clear_flags_changed_bits(builder, -1);
+    let to_f64 = |b: &mut WasmBuilder, l: &WasmLocalI64| {
+        b.get_local_i64(l);
+        b.reinterpret_i64_as_f64();
+    };
+    let flags_addr = global_pointers::flags as i32;
+    let locals = builder.flag_locals.is_some();
+    if !locals {
+        builder.const_i32(flags_addr);
+    }
+    gen_get_flags(builder);
+    builder.const_i32(!crate::cpu::cpu::FLAGS_ALL);
+    builder.and_i32();
+    builder.const_i32(crate::cpu::cpu::FLAG_ZERO);
+    builder.const_i32(crate::cpu::cpu::FLAG_CARRY);
+    builder.const_i32(0);
+    builder.const_i32(crate::cpu::cpu::FLAG_ZERO | crate::cpu::cpu::FLAG_PARITY | crate::cpu::cpu::FLAG_CARRY);
+    to_f64(builder, s);
+    to_f64(builder, d);
+    builder.lt_f64();
+    builder.select();
+    to_f64(builder, d);
+    to_f64(builder, s);
+    builder.lt_f64();
+    builder.select();
+    to_f64(builder, d);
+    to_f64(builder, s);
+    builder.eq_f64();
+    builder.select();
+    builder.or_i32();
+    if locals {
+        builder.flag_local_set(FLAG_LOCAL_FLAGS);
+    }
+    else {
+        builder.store_aligned_i32(0);
+    }
+}
+
+pub fn gen_fwait_inline(ctx: &mut JitContext) {
+    let cr0_offset = global_pointers::get_creg_offset(0);
+    ctx.builder.load_fixed_u8(cr0_offset);
+    ctx.builder.const_i32((crate::cpu::cpu::CR0_MP as u32 | regs::CR0_TS) as i32);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32((crate::cpu::cpu::CR0_MP as u32 | regs::CR0_TS) as i32);
+    ctx.builder.eq_i32();
+    ctx.builder.if_void();
+    {
+        gen_debug_track_jit_exit(ctx.builder, ctx.start_of_current_instruction);
+        gen_fn1_const(
+            ctx.builder,
+            "task_switch_test_jit",
+            ctx.start_of_current_instruction & 0xFFF,
+        );
+        ctx.builder.br(ctx.exit_with_fault_label);
+    }
+    ctx.builder.block_end();
+}
+
 pub fn gen_task_switch_test_mmx(ctx: &mut JitContext) {
     // generate if(cr[0] & (CR0_EM | CR0_TS)) { task_switch_test_mmx_jit(); goto exit_with_fault; }
     let cr0_offset = global_pointers::get_creg_offset(0);

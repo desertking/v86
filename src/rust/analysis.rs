@@ -34,6 +34,9 @@ pub fn analyze_step(mut cpu: &mut CpuContext) -> Analysis {
     cpu.prefixes = 0;
     let opcode = cpu.read_imm8() as u32 | (cpu.osize_32() as u32) << 8;
     gen::analyzer::analyzer(opcode, &mut cpu, &mut analysis);
+    if opcode & 0xFF == 0x9B && crate::jit::fwait_inline_enabled() {
+        analysis.ty = AnalysisType::Normal;
+    }
     analysis
 }
 
