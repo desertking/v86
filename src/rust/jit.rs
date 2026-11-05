@@ -262,6 +262,28 @@ unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool
 }
 
 #[inline]
+unsafe fn wbuf_range_fill_tlb(addr: u32, size: u32, for_writing: bool) {
+    if size == 0 || *global_pointers::cr & cpu::CR0_PG == 0 {
+        return;
+    }
+    let user = *global_pointers::cpl == 3;
+    let need = cpu::TLB_VALID
+        | if user { cpu::TLB_NO_USER } else { 0 }
+        | if for_writing { cpu::TLB_READONLY } else { 0 };
+    let last = (addr + size - 1) & !0xFFF;
+    let mut page = addr & !0xFFF;
+    loop {
+        if cpu::tlb_data[(page >> 12) as usize] & need != cpu::TLB_VALID {
+            let _ = cpu::translate_address(page as i32, for_writing, user, false, true);
+        }
+        if page == last {
+            return;
+        }
+        page += 0x1000;
+    }
+}
+
+#[inline]
 fn wbuf_ranges_overlap(a: u32, a_len: u32, b: u32, b_len: u32) -> bool {
     a_len != 0
         && b_len != 0
@@ -398,6 +420,11 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 
     {
         return -1;
     }
+
+    wbuf_range_fill_tlb(desc.ctrl_addr, 4, true);
+    wbuf_range_fill_tlb(stack_base, lead + stack_bytes, false);
+    wbuf_range_fill_tlb(dst, stride, true);
+    wbuf_range_fill_tlb(payload.0, payload.1, false);
 
     wbuf_write_u32(dst, desc.func_id);
     if kind == WBUF_KIND_SCALAR {
