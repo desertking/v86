@@ -5669,8 +5669,47 @@ pub fn gen_condition_fn_negated(ctx: &mut JitContext, condition: u8) {
     gen_condition_fn(ctx, condition ^ 1)
 }
 
+fn gen_wbuf_call_site_condition(ctx: &mut JitContext, negated: bool) {
+    gen_get_reg32(ctx, regs::ESP);
+    ctx.builder
+        .load_fixed_i32(global_pointers::get_seg_offset(regs::SS));
+    ctx.builder.add_i32();
+    ctx.builder.call_fn1_ret("jit_wbuf_intrinsic_execute_call_site");
+    gen_read_tlb_cache_invalidate(ctx);
+    let cleanup = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&cleanup);
+    ctx.builder.const_i32(0);
+    ctx.builder.ge_i32();
+    ctx.builder.if_void();
+    gen_get_reg32(ctx, regs::ESP);
+    ctx.builder.get_local(&cleanup);
+    ctx.builder.add_i32();
+    ctx.builder.const_i32(4);
+    ctx.builder.add_i32();
+    gen_set_reg32(ctx, regs::ESP);
+    ctx.builder.const_i32(0);
+    gen_set_reg32(ctx, regs::EAX);
+    ctx.builder.const_i32(0xB077);
+    gen_set_reg32(ctx, regs::EDX);
+    ctx.builder.block_end();
+
+    ctx.builder.get_local(&cleanup);
+    ctx.builder.const_i32(0);
+    if negated {
+        ctx.builder.ge_i32();
+    }
+    else {
+        ctx.builder.lt_i32();
+    }
+    ctx.builder.free_local(cleanup);
+}
+
 pub fn gen_condition_fn(ctx: &mut JitContext, condition: u8) {
-    if condition & 0xF0 == 0x00 || condition & 0xF0 == 0x70 || condition & 0xF0 == 0x80 {
+    if condition & !1 == crate::jit::WBUF_CALL_CONDITION {
+        gen_wbuf_call_site_condition(ctx, condition & 1 != 0);
+    }
+    else if condition & 0xF0 == 0x00 || condition & 0xF0 == 0x70 || condition & 0xF0 == 0x80 {
         match condition & 0xF {
             0x0 => {
                 gen_getof(ctx);

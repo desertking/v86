@@ -337,33 +337,141 @@ pub unsafe fn jit_wbuf_intrinsic_execute_tail(target: u32, esp: u32) -> i32 {
     cleanup
 }
 
-/// Every guest range this may touch is validated — bounds AND paging — before the first byte
-/// moves, so a decline is indistinguishable from the CALL never having been intercepted.
-unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 {
-    let mut desc = WBUF_INTRINSIC_EMPTY;
+pub const WBUF_CALL_CONDITION: u8 = 0xF0;
+static mut WBUF_CALL_SITES: u32 = 1;
+static mut WBUF_CALL_SITES_COMPILED: u32 = 0;
+static mut WBUF_CALL_SITE_HITS: u32 = 0;
+static mut WBUF_CALL_SITE_FALLBACKS: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_set_enabled(enabled: u32) { WBUF_CALL_SITES = (enabled != 0) as u32; }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_enabled() -> u32 { WBUF_CALL_SITES }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_compiled() -> u32 { WBUF_CALL_SITES_COMPILED }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_hits() -> u32 { WBUF_CALL_SITE_HITS }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_fallbacks() -> u32 { WBUF_CALL_SITE_FALLBACKS }
+
+unsafe fn wbuf_intrinsic_find(target: u32) -> WbufIntrinsicDesc {
     for hot in WBUF_INTRINSIC_HOT {
         if hot.target == target {
-            desc = hot;
-            break;
+            return hot;
         }
     }
     // The direct slots cover the common shader/draw targets. Keep the exact table as a
     // correctness-preserving secondary path: duplicate exports can legitimately make a
     // different same-name stub hot, and the outer min/max guard has already rejected the
     // overwhelming majority of ordinary indirect CALL targets.
-    if desc.target == 0 {
-        let start = wbuf_intrinsic_hash(target);
-        for probe in 0..WBUF_INTRINSIC_PROBES {
-            let candidate = WBUF_INTRINSIC_TABLE[(start + probe) & (WBUF_INTRINSIC_CAPACITY - 1)];
-            if candidate.target == target {
-                desc = candidate;
-                break;
-            }
-            if candidate.target == 0 {
-                break;
-            }
+    let start = wbuf_intrinsic_hash(target);
+    for probe in 0..WBUF_INTRINSIC_PROBES {
+        let candidate = WBUF_INTRINSIC_TABLE[(start + probe) & (WBUF_INTRINSIC_CAPACITY - 1)];
+        if candidate.target == target {
+            return candidate;
+        }
+        if candidate.target == 0 {
+            break;
         }
     }
+    WBUF_INTRINSIC_EMPTY
+}
+
+/// Compile-time filter for a direct CALL: true when its target is a `jmp dword [abs32]`
+/// import thunk whose slot currently holds a registered WBUF target. Only a hint for the
+/// code shape; `jit_wbuf_intrinsic_execute_call_site` re-checks every byte at run time.
+pub(crate) unsafe fn wbuf_call_site_candidate(call_target: i32) -> bool {
+    if WBUF_CALL_SITES == 0 || WBUF_INTRINSIC_ENABLED == 0 || WBUF_INTRINSIC_REGISTERED == 0 {
+        return false;
+    }
+    let stub = match cpu::translate_address_read_no_side_effects(call_target) {
+        Ok(phys) => phys,
+        Err(()) => return false,
+    };
+    if stub & 0xFFF > 0x1000 - 6 || !wbuf_guest_range_ok(stub, 6) || memory::in_mapped_range(stub) {
+        return false;
+    }
+    if memory::read8(stub) != 0xFF || memory::read8(stub + 1) != 0x25 {
+        return false;
+    }
+    let slot = memory::read32s(stub + 2);
+    let slot_phys = match cpu::translate_address_read_no_side_effects(slot) {
+        Ok(phys) => phys,
+        Err(()) => return false,
+    };
+    if slot_phys & 0xFFF > 0x1000 - 4
+        || !wbuf_guest_range_ok(slot_phys, 4)
+        || memory::in_mapped_range(slot_phys)
+    {
+        return false;
+    }
+    let target = memory::read32s(slot_phys) as u32;
+    if wbuf_intrinsic_find(target).target == 0 {
+        return false;
+    }
+    if !codegen_dry_run() {
+        WBUF_CALL_SITES_COMPILED = WBUF_CALL_SITES_COMPILED.wrapping_add(1);
+    }
+    true
+}
+
+/// Runs after a direct `CALL rel32` has pushed its return address. When the callee is still
+/// a `jmp dword [abs32]` thunk whose slot holds a registered target, executes that target
+/// exactly as the tail-JMP path would and returns the stack cleanup (the caller then pops the
+/// return address itself). -1 lets the CALL proceed into the thunk unchanged.
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_execute_call_site(esp: u32) -> i32 {
+    if WBUF_INTRINSIC_ENABLED == 0 || WBUF_CALL_SITES == 0 {
+        return -1;
+    }
+    let cleanup = wbuf_call_site_inner(esp);
+    if cleanup < 0 {
+        WBUF_CALL_SITE_FALLBACKS = WBUF_CALL_SITE_FALLBACKS.wrapping_add(1);
+    }
+    else {
+        WBUF_CALL_SITE_HITS = WBUF_CALL_SITE_HITS.wrapping_add(1);
+        WBUF_INTRINSIC_HITS = WBUF_INTRINSIC_HITS.wrapping_add(1);
+    }
+    cleanup
+}
+
+unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
+    if !wbuf_range_accessible(esp, 4, false) {
+        return -1;
+    }
+    let ret = wbuf_read_u32(esp);
+    let site = match ret.checked_sub(5) {
+        Some(site) => site,
+        None => return -1,
+    };
+    if !wbuf_range_accessible(site, 5, false) || *memory::mem8.add(site as usize) != 0xE8 {
+        return -1;
+    }
+    let stub = ret.wrapping_add(wbuf_read_u32(site + 1));
+    if !wbuf_range_accessible(stub, 6, false)
+        || *memory::mem8.add(stub as usize) != 0xFF
+        || *memory::mem8.add(stub as usize + 1) != 0x25
+    {
+        return -1;
+    }
+    let slot = wbuf_read_u32(stub + 2);
+    if !wbuf_range_accessible(slot, 4, false) {
+        return -1;
+    }
+    let target = wbuf_read_u32(slot);
+    if target < WBUF_INTRINSIC_MIN_TARGET || target > WBUF_INTRINSIC_MAX_TARGET {
+        return -1;
+    }
+    match esp.checked_add(4) {
+        Some(args) => wbuf_intrinsic_execute_inner(target, args, 4),
+        None => -1,
+    }
+}
+
+/// Every guest range this may touch is validated — bounds AND paging — before the first byte
+/// moves, so a decline is indistinguishable from the CALL never having been intercepted.
+unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 {
+    let desc = wbuf_intrinsic_find(target);
     // The control word is read AND written back, so it must be writable, not merely present.
     if desc.target == 0 || !wbuf_range_accessible(desc.ctrl_addr, 4, true) {
         return -1;
@@ -3718,6 +3826,41 @@ fn jit_find_basic_blocks(
                         // Execution will eventually come back to the next instruction (CALL)
                         marked_as_entry.insert(current_virt_addr);
                         to_visit_stack.push(current_virt_addr);
+                    }
+
+                    if has_next_instruction
+                        && is_32
+                        && cpu.ssize_32()
+                        && cpu.cs_offset == 0
+                        && memory::read8(addr_before_instruction) == 0xE8
+                        && unsafe { wbuf_call_site_candidate(jump_target) }
+                    {
+                        let next_block_addr = if !next_on_page
+                            || !tails && is_near_end_of_page(current_address)
+                        {
+                            None
+                        }
+                        else {
+                            Some(current_address)
+                        };
+                        current_block.ty = BasicBlockType::ConditionalJump {
+                            next_block_addr,
+                            next_block_branch_taken_addr: follow_jump(
+                                jump_target,
+                                ctx,
+                                &mut pages,
+                                &mut page_blacklist,
+                                max_pages,
+                                &mut marked_as_entry,
+                                &mut to_visit_stack,
+                                Some(Page::page_of(phys_addr)),
+                                &mut join,
+                            ),
+                            condition: WBUF_CALL_CONDITION,
+                            jump_offset: offset,
+                            jump_offset_is_32: is_32,
+                        };
+                        break;
                     }
 
                     current_block.ty = BasicBlockType::Normal {
@@ -7162,6 +7305,9 @@ fn jit_codegen_fingerprint() -> u64 {
         if JIT_HOT_EDGE_REGIONS {
             add(0x7A11_0002);
             add(HOT_EDGE_EXTRA_PAGES);
+        }
+        if WBUF_CALL_SITES != 0 {
+            add(0x7A11_0004);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
