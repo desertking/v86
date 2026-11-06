@@ -176,6 +176,18 @@ function buildImage(seed) {
             else if (k === 7) emit(0xD9, ...mem(2, st32()));
             else if (R(2)) emit(0xDD, 0xD0 | sti);
             else emit(0xDD, ...mem(2, st64()));
+            if (R(4) === 0) {
+                const c = R(8);
+                if (c === 0) { emit(0xD8, ...mem(2, f32())); }
+                else if (c === 1) { emit(0xD8, ...mem(3, f32())); depth--; }
+                else if (c === 2) { emit(0xDC, ...mem(R(2) ? 2 : 3, f64())); }
+                else if (c === 3) { emit(0xDA, ...mem(2, i32())); }
+                else if (c === 4) { emit(0xD8, 0xD0 | sti); }
+                else if (c === 5) { emit(0xDE, 0xD9); depth -= 2; }
+                else if (c === 6) { emit(0xDD, 0xE8 | sti); depth--; }
+                else { emit(0xDA, 0xE9); depth -= 2; }
+                if (R(2)) emit(0xDF, 0xE0, 0x31, 0x05, ...d32(CHK), 0xD1, 0x05, ...d32(CHK));
+            }
         }
     }
     emit(0xDD, 0x35, ...d32(SAVE));

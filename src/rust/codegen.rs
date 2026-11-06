@@ -5984,6 +5984,9 @@ pub enum X87RunOp {
     Chs,
     Abs,
     Wait,
+    ComMem(X87RunMem, u32),
+    ComSti(u32, u32),
+    Fnstsw,
 }
 
 pub struct X87RunInsn {
@@ -6061,7 +6064,28 @@ impl X87RunModel {
 
     pub fn step(&mut self, op: &X87RunOp) -> bool {
         match *op {
-            X87RunOp::Wait => true,
+            X87RunOp::Wait | X87RunOp::Fnstsw => true,
+            X87RunOp::ComMem(_, pops) => {
+                if !self.read(0) {
+                    return false;
+                }
+                for _ in 0..pops {
+                    self.pop();
+                }
+                true
+            },
+            X87RunOp::ComSti(i, pops) => {
+                if !(self.read(0) && self.read(i)) {
+                    return false;
+                }
+                for _ in 0..pops {
+                    if self.state[self.slot(0)] != X87RunSlot::Valid {
+                        return false;
+                    }
+                    self.pop();
+                }
+                true
+            },
             X87RunOp::PushMem(_) | X87RunOp::PushConst(_) => self.push(),
             X87RunOp::PushSti(i) => self.read(i) && self.push(),
             X87RunOp::BinMem(..) | X87RunOp::Chs | X87RunOp::Abs => {
@@ -6186,11 +6210,6 @@ fn gen_x87_run_m80_bits(
     ctx.builder.and_i32();
     let exp = ctx.builder.set_new_local();
 
-    ctx.builder.get_local(&se);
-    ctx.builder.const_i32(FPU_RELAXED_TAG);
-    ctx.builder.eq_i32();
-    let tagged = ctx.builder.set_new_local();
-
     ctx.builder.get_local_i64(&mant);
     ctx.builder.const_i64(63);
     ctx.builder.shr_u_i64();
@@ -6218,9 +6237,7 @@ fn gen_x87_run_m80_bits(
     ctx.builder.and_i32();
     let inf = ctx.builder.set_new_local();
 
-    ctx.builder.get_local(&tagged);
     ctx.builder.get_local(&normal);
-    ctx.builder.or_i32();
     ctx.builder.get_local(&inf);
     ctx.builder.or_i32();
     ctx.builder.get_local(&exp);
@@ -6232,8 +6249,6 @@ fn gen_x87_run_m80_bits(
     ctx.builder.or_i32();
     ctx.builder.eqz_i32();
     ctx.builder.br_if(slow);
-
-    ctx.builder.get_local_i64(&mant);
 
     ctx.builder.get_local(&se);
     ctx.builder.const_i32(15);
@@ -6260,14 +6275,10 @@ fn gen_x87_run_m80_bits(
     ctx.builder.get_local(&normal);
     ctx.builder.select();
     ctx.builder.or_i64();
-
-    ctx.builder.get_local(&tagged);
-    ctx.builder.select();
     let bits = ctx.builder.set_new_local_i64();
 
     ctx.builder.free_local(inf);
     ctx.builder.free_local(normal);
-    ctx.builder.free_local(tagged);
     ctx.builder.free_local(exp);
     ctx.builder.free_local(se);
     ctx.builder.free_local_i64(mant);
@@ -6331,7 +6342,7 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
     for insn in run {
         let access = match insn.op {
             X87RunOp::PushMem(X87RunMem::M80) => Some((10, false)),
-            X87RunOp::PushMem(m) | X87RunOp::BinMem(_, m) => {
+            X87RunOp::PushMem(m) | X87RunOp::BinMem(_, m) | X87RunOp::ComMem(m, _) => {
                 Some((if m == X87RunMem::M64 { 8 } else { 4 }, false))
             },
             X87RunOp::StoreMem { m64, .. } => Some((if m64 { 8 } else { 4 }, true)),
@@ -6391,6 +6402,16 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
         });
     }
 
+    let touches_status = run.iter().any(|i| matches!(i.op, X87RunOp::ComMem(..) | X87RunOp::ComSti(..)))
+        || model.pushed;
+    let status = if touches_status || run.iter().any(|i| matches!(i.op, X87RunOp::Fnstsw)) {
+        ctx.builder
+            .load_fixed_u16(global_pointers::fpu_status_word as u32);
+        Some(ctx.builder.set_new_local())
+    }
+    else {
+        None
+    };
     let mut owned: Vec<WasmLocalI64> = Vec::new();
     let mut vals: [Option<WasmLocalI64>; 8] = std::array::from_fn(|_| None);
     let mut sim = X87RunModel::new();
@@ -6424,28 +6445,66 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
     for (k, insn) in run.iter().enumerate() {
         match insn.op {
             X87RunOp::Wait => {},
+            X87RunOp::Fnstsw => {
+                ctx.builder.get_local(status.as_ref().unwrap());
+                ctx.builder.const_i32(!(7 << 11));
+                ctx.builder.and_i32();
+                ctx.builder.get_local(&top);
+                ctx.builder.const_i32(sim.top);
+                ctx.builder.add_i32();
+                ctx.builder.const_i32(7);
+                ctx.builder.and_i32();
+                ctx.builder.const_i32(11);
+                ctx.builder.shl_i32();
+                ctx.builder.or_i32();
+                gen_set_reg16(ctx, regs::AX);
+            },
+            X87RunOp::ComMem(m, pops) => {
+                let x = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                sim.read(0);
+                gen_x87_run_mem_f64(ctx, hosts[k].as_ref().unwrap(), m);
+                let y = fresh(ctx, &mut owned);
+                gen_x87_run_compare(ctx, status.as_ref().unwrap(), &x, &y);
+                for _ in 0..pops {
+                    sim.pop();
+                }
+            },
+            X87RunOp::ComSti(i, pops) => {
+                let x = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                let y = value(ctx, &sim, &mut vals, &mut owned, &top, i);
+                sim.read(0);
+                sim.read(i);
+                gen_x87_run_compare(ctx, status.as_ref().unwrap(), &x, &y);
+                for _ in 0..pops {
+                    sim.pop();
+                }
+            },
             X87RunOp::PushMem(X87RunMem::M80) => {
                 let v = m80[k].as_ref().unwrap().unsafe_clone();
                 sim.push();
                 vals[sim.slot(0)] = Some(v);
+                gen_x87_run_clear_c1(ctx, status.as_ref().unwrap());
             },
             X87RunOp::PushMem(m) => {
                 gen_x87_run_mem_f64(ctx, hosts[k].as_ref().unwrap(), m);
                 let v = fresh(ctx, &mut owned);
                 sim.push();
                 vals[sim.slot(0)] = Some(v);
+                gen_x87_run_clear_c1(ctx, status.as_ref().unwrap());
             },
             X87RunOp::PushConst(c) => {
                 ctx.builder.const_f64(c);
                 let v = fresh(ctx, &mut owned);
                 sim.push();
                 vals[sim.slot(0)] = Some(v);
+                gen_x87_run_clear_c1(ctx, status.as_ref().unwrap());
             },
             X87RunOp::PushSti(i) => {
                 let v = value(ctx, &sim, &mut vals, &mut owned, &top, i);
                 sim.read(i);
                 sim.push();
                 vals[sim.slot(0)] = Some(v);
+                gen_x87_run_clear_c1(ctx, status.as_ref().unwrap());
             },
             X87RunOp::BinMem(op, m) => {
                 let a = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
@@ -6585,13 +6644,10 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
         ctx.builder.and_i32();
         ctx.builder.store_u8(0);
     }
-    if sim.pushed {
+    if touches_status {
         ctx.builder
             .const_i32(global_pointers::fpu_status_word as i32);
-        ctx.builder
-            .load_fixed_u16(global_pointers::fpu_status_word as u32);
-        ctx.builder.const_i32(!FPU_C1);
-        ctx.builder.and_i32();
+        ctx.builder.get_local(status.as_ref().unwrap());
         ctx.builder.store_aligned_u16(0);
     }
     gen_dispatch_stat_increment(ctx.builder, profiler::stat::X87_RUN_FAST);
@@ -6608,9 +6664,30 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
     for h in hosts.into_iter().flatten() {
         ctx.builder.free_local(h);
     }
+    if let Some(status) = status {
+        ctx.builder.free_local(status);
+    }
     ctx.builder.free_local(rot);
     ctx.builder.free_local(empty);
     ctx.builder.free_local(top);
+}
+
+fn gen_x87_run_clear_c1(ctx: &mut JitContext, status: &WasmLocal) {
+    ctx.builder.get_local(status);
+    ctx.builder.const_i32(!FPU_C1);
+    ctx.builder.and_i32();
+    ctx.builder.set_local(status);
+}
+
+fn gen_x87_run_compare(ctx: &mut JitContext, status: &WasmLocal, x: &WasmLocalI64, y: &WasmLocalI64) {
+    let flags = gen_fpu_compare_flags(ctx, x, y, FPU_C0 | FPU_C2 | FPU_C3, FPU_C0, FPU_C3);
+    ctx.builder.get_local(status);
+    ctx.builder.const_i32(!FPU_RESULT_FLAGS);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&flags);
+    ctx.builder.or_i32();
+    ctx.builder.set_local(status);
+    ctx.builder.free_local(flags);
 }
 
 pub fn gen_x87_run_join(ctx: &mut JitContext) {

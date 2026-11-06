@@ -7124,6 +7124,10 @@ fn x87_run_decode(addr: u32) -> Option<codegen::X87RunOp> {
         _ => None,
     };
     match (opcode, is_mem, reg) {
+        (0xD8, true, 2) => Some(O::ComMem(M::M32, 0)),
+        (0xD8, true, 3) => Some(O::ComMem(M::M32, 1)),
+        (0xD8, false, 2) => Some(O::ComSti(rm, 0)),
+        (0xD8, false, 3) => Some(O::ComSti(rm, 1)),
         (0xD8, true, r) => binop(r).map(|op| O::BinMem(op, M::M32)),
         (0xD8, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: 0, pop: false }),
         (0xD9, true, 0) => Some(O::PushMem(M::M32)),
@@ -7135,6 +7139,9 @@ fn x87_run_decode(addr: u32) -> Option<codegen::X87RunOp> {
         (0xD9, false, 4) if rm == 1 => Some(O::Abs),
         (0xD9, false, 5) if rm == 0 => Some(O::PushConst(1.0)),
         (0xD9, false, 5) if rm == 6 => Some(O::PushConst(0.0)),
+        (0xDA, true, 2) => Some(O::ComMem(M::I32, 0)),
+        (0xDA, true, 3) => Some(O::ComMem(M::I32, 1)),
+        (0xDA, false, 5) if rm == 1 => Some(O::ComSti(1, 2)),
         (0xDA, true, r) => binop(r).map(|op| O::BinMem(op, M::I32)),
         (0xDB, true, 0) => Some(O::PushMem(M::I32)),
         (0xDB, true, 5)
@@ -7143,6 +7150,10 @@ fn x87_run_decode(addr: u32) -> Option<codegen::X87RunOp> {
         {
             Some(O::PushMem(M::M80))
         },
+        (0xDC, true, 2) => Some(O::ComMem(M::M64, 0)),
+        (0xDC, true, 3) => Some(O::ComMem(M::M64, 1)),
+        (0xDC, false, 2) => Some(O::ComSti(rm, 0)),
+        (0xDC, false, 3) => Some(O::ComSti(rm, 1)),
         (0xDC, true, r) => binop(r).map(|op| O::BinMem(op, M::M64)),
         (0xDC, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: rm, pop: false }),
         (0xDD, true, 0) => Some(O::PushMem(M::M64)),
@@ -7150,6 +7161,9 @@ fn x87_run_decode(addr: u32) -> Option<codegen::X87RunOp> {
         (0xDD, true, 3) => Some(O::StoreMem { m64: true, pop: true }),
         (0xDD, false, 2) => Some(O::StoreSti { i: rm, pop: false }),
         (0xDD, false, 3) => Some(O::StoreSti { i: rm, pop: true }),
+        (0xDD, false, 5) => Some(O::ComSti(rm, 1)),
+        (0xDE, false, 3) if rm == 1 => Some(O::ComSti(1, 2)),
+        (0xDF, false, 4) if rm == 0 => Some(O::Fnstsw),
         (0xDE, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: rm, pop: true }),
         _ => None,
     }
@@ -7190,6 +7204,9 @@ fn x87_run_scan(start: u32, last_instruction_addr: u32) -> Vec<codegen::X87RunIn
         ops += 1;
         run.push(codegen::X87RunInsn { addr, op });
         addr += len;
+        if matches!(op, codegen::X87RunOp::Fnstsw) {
+            break;
+        }
     }
     if ops < 2 {
         run.clear();
