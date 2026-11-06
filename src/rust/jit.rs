@@ -398,6 +398,137 @@ pub unsafe fn jit_wbuf_intrinsic_execute_tail(target: u32, esp: u32) -> i32 {
 }
 
 pub const WBUF_CALL_CONDITION: u8 = 0xF0;
+pub const FTOL_CALL_CONDITION: u8 = 0xF2;
+const FTOL_LEAF: [u8; 9] = [0x83, 0xEC, 0x08, 0xDD, 0x0C, 0x24, 0x58, 0x5A, 0xC3];
+static mut FTOL_CALL_FUSION: bool = false;
+static mut FTOL_CALL_SITES_COMPILED: u32 = 0;
+static mut FTOL_CALL_SITE_HITS: u32 = 0;
+static mut FTOL_CALL_SITE_FALLBACKS: u32 = 0;
+pub static mut FTOL_CALL_RESULT_LO: i32 = 0;
+pub static mut FTOL_CALL_RESULT_HI: i32 = 0;
+
+#[no_mangle]
+pub fn set_jit_ftol_call_fusion(on: u32) { unsafe { FTOL_CALL_FUSION = on != 0 } }
+#[no_mangle]
+pub fn get_jit_ftol_call_fusion() -> u32 { unsafe { FTOL_CALL_FUSION as u32 } }
+#[no_mangle]
+pub unsafe fn jit_ftol_call_sites_get_compiled() -> u32 { FTOL_CALL_SITES_COMPILED }
+#[no_mangle]
+pub unsafe fn jit_ftol_call_sites_get_hits() -> u32 { FTOL_CALL_SITE_HITS }
+#[no_mangle]
+pub unsafe fn jit_ftol_call_sites_get_fallbacks() -> u32 { FTOL_CALL_SITE_FALLBACKS }
+
+pub(crate) unsafe fn ftol_call_site_candidate(call_target: i32) -> bool {
+    if !FTOL_CALL_FUSION {
+        return false;
+    }
+    let phys = match cpu::translate_address_read_no_side_effects(call_target) {
+        Ok(phys) => phys,
+        Err(()) => return false,
+    };
+    if phys & 0xFFF > 0x1000 - FTOL_LEAF.len() as u32 || memory::in_mapped_range(phys) {
+        return false;
+    }
+    for (i, &b) in FTOL_LEAF.iter().enumerate() {
+        if memory::read8(phys + i as u32) as u8 != b {
+            return false;
+        }
+    }
+    if !codegen_dry_run() {
+        FTOL_CALL_SITES_COMPILED = FTOL_CALL_SITES_COMPILED.wrapping_add(1);
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe fn jit_ftol_call_site(esp: u32) -> i32 {
+    if !FTOL_CALL_FUSION {
+        return -1;
+    }
+    let r = ftol_call_site_inner(esp);
+    if r < 0 {
+        FTOL_CALL_SITE_FALLBACKS = FTOL_CALL_SITE_FALLBACKS.wrapping_add(1);
+    }
+    else {
+        FTOL_CALL_SITE_HITS = FTOL_CALL_SITE_HITS.wrapping_add(1);
+    }
+    r
+}
+
+#[inline(always)]
+unsafe fn ftol_st0_truncated() -> i64 {
+    let sp = *global_pointers::fpu_stack_ptr;
+    if crate::softfloat::is_fpu_relaxed() && 0 == *global_pointers::fpu_stack_empty >> sp & 1 {
+        let st0 = *global_pointers::fpu_st.offset(sp as isize);
+        if st0.sign_exponent == crate::softfloat::RELAXED_TAG {
+            let f = f64::from_bits(st0.mantissa).trunc();
+            return if f.is_nan() || f >= 9223372036854775808.0 || f < -9223372036854775808.0 {
+                i64::MIN
+            }
+            else {
+                f as i64
+            };
+        }
+    }
+    crate::cpu::fpu::fpu_truncate_to_i64(crate::cpu::fpu::fpu_get_st0())
+}
+
+#[inline(always)]
+unsafe fn ftol_dst_without_code(dst: u32) -> bool {
+    let page = dst & !0xFFF;
+    if page == (dst + 7) & !0xFFF {
+        let entry = cpu::tlb_data[(page >> 12) as usize];
+        if entry & (cpu::TLB_VALID | cpu::TLB_HAS_CODE | cpu::TLB_READONLY | cpu::TLB_IN_MAPPED_RANGE)
+            == cpu::TLB_VALID
+            && ((entry & !0xFFF) as u32 ^ page).wrapping_sub(memory::mem8 as u32) == page
+        {
+            return true;
+        }
+    }
+    !jit_page_has_code(Page::page_of(dst)) && !jit_page_has_code(Page::page_of(dst + 7))
+}
+
+unsafe fn ftol_call_site_inner(esp: u32) -> i32 {
+    if *global_pointers::cr & (cpu::CR0_EM | cpu::CR0_TS) != 0 {
+        return -1;
+    }
+    let acc = wbuf_access();
+    if !wbuf_ok(&acc, esp, 4, false) {
+        return -1;
+    }
+    let ret = wbuf_read_u32(esp);
+    let site = match ret.checked_sub(5) {
+        Some(site) => site,
+        None => return -1,
+    };
+    if !wbuf_ok(&acc, site, 5, false) || *memory::mem8.add(site as usize) != 0xE8 {
+        return -1;
+    }
+    let target = ret.wrapping_add(wbuf_read_u32(site + 1));
+    if !wbuf_ok(&acc, target, FTOL_LEAF.len() as u32, false) {
+        return -1;
+    }
+    for (i, &b) in FTOL_LEAF.iter().enumerate() {
+        if *memory::mem8.add(target as usize + i) != b {
+            return -1;
+        }
+    }
+    let dst = match esp.checked_sub(8) {
+        Some(dst) => dst,
+        None => return -1,
+    };
+    if !wbuf_ok(&acc, dst, 8, true) || !ftol_dst_without_code(dst) {
+        return -1;
+    }
+    let value = ftol_st0_truncated();
+    wbuf_write_u32(dst, value as u32);
+    wbuf_write_u32(dst + 4, (value >> 32) as u32);
+    crate::cpu::fpu::fpu_pop();
+    cpu::mark_fpu_simd_dirty();
+    FTOL_CALL_RESULT_LO = value as i32;
+    FTOL_CALL_RESULT_HI = (value >> 32) as i32;
+    0
+}
 static mut WBUF_CALL_SITES: u32 = 1;
 static mut WBUF_CALL_SITES_COMPILED: u32 = 0;
 static mut WBUF_CALL_SITE_HITS: u32 = 0;
@@ -4013,6 +4144,41 @@ fn jit_find_basic_blocks(
                         // Execution will eventually come back to the next instruction (CALL)
                         marked_as_entry.insert(current_virt_addr);
                         to_visit_stack.push(current_virt_addr);
+                    }
+
+                    if has_next_instruction
+                        && is_32
+                        && cpu.ssize_32()
+                        && cpu.cs_offset == 0
+                        && memory::read8(addr_before_instruction) == 0xE8
+                        && unsafe { ftol_call_site_candidate(jump_target) }
+                    {
+                        let next_block_addr = if !next_on_page
+                            || !tails && is_near_end_of_page(current_address)
+                        {
+                            None
+                        }
+                        else {
+                            Some(current_address)
+                        };
+                        current_block.ty = BasicBlockType::ConditionalJump {
+                            next_block_addr,
+                            next_block_branch_taken_addr: follow_jump(
+                                jump_target,
+                                ctx,
+                                &mut pages,
+                                &mut page_blacklist,
+                                max_pages,
+                                &mut marked_as_entry,
+                                &mut to_visit_stack,
+                                Some(Page::page_of(phys_addr)),
+                                &mut join,
+                            ),
+                            condition: FTOL_CALL_CONDITION,
+                            jump_offset: offset,
+                            jump_offset_is_32: is_32,
+                        };
+                        break;
                     }
 
                     if has_next_instruction
@@ -7884,6 +8050,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_FLAG_LOCALS_AUTO {
             add(0x7A11_0010);
+        }
+        if FTOL_CALL_FUSION {
+            add(0x7A11_0011);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
