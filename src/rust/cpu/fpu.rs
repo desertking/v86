@@ -468,13 +468,40 @@ pub fn set_fpu_fld80_relaxed(on: u32) { unsafe { FPU_FLD80_RELAXED = on != 0 } }
 #[no_mangle]
 pub fn get_fpu_fld80_relaxed() -> u32 { unsafe { FPU_FLD80_RELAXED as u32 } }
 
+static mut FPU_FLD80_EXACT_FAST: bool = false;
+static mut FPU_FLD80_EXACT_HITS: u32 = 0;
+#[no_mangle]
+pub fn set_fpu_fld80_exact_fast(on: u32) { unsafe { FPU_FLD80_EXACT_FAST = on != 0 } }
+#[no_mangle]
+pub fn get_fpu_fld80_exact_fast() -> u32 { unsafe { FPU_FLD80_EXACT_FAST as u32 } }
+#[no_mangle]
+pub fn get_fpu_fld80_exact_hits() -> u32 { unsafe { FPU_FLD80_EXACT_HITS } }
+
+fn f80_fits_f64_exactly(v: &F80) -> bool {
+    let exp = (v.sign_exponent & 0x7FFF) as i32;
+    let mant = v.mantissa;
+    if exp == 0 {
+        return mant == 0;
+    }
+    if exp == 0x7FFF {
+        return mant == 1 << 63;
+    }
+    let unbiased = exp - 16383;
+    mant >> 63 == 1 && mant & 0x7FF == 0 && unbiased >= -1022 && unbiased <= 1023
+}
+
 unsafe fn fld80_value(v: F80) -> F80 {
-    if FPU_FLD80_RELAXED && crate::softfloat::is_fpu_relaxed() && v.sign_exponent != crate::softfloat::RELAXED_TAG {
-        F80::of_f64(v.to_f64_strict())
+    if !crate::softfloat::is_fpu_relaxed() || v.sign_exponent == crate::softfloat::RELAXED_TAG {
+        return v;
     }
-    else {
-        v
+    if FPU_FLD80_RELAXED {
+        return F80::of_f64(v.to_f64_strict());
     }
+    if FPU_FLD80_EXACT_FAST && f80_fits_f64_exactly(&v) {
+        FPU_FLD80_EXACT_HITS = FPU_FLD80_EXACT_HITS.wrapping_add(1);
+        return F80::of_f64(v.to_f64_strict());
+    }
+    v
 }
 
 #[no_mangle]

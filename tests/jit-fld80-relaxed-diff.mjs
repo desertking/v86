@@ -45,7 +45,11 @@ function buildImage(seed) {
         else if (kind === 2) { mant = 1n << 63n; se = 0x7FFF | (R(2) << 15); }
         else if (kind === 3) { mant = BigInt(R(1 << 20)); se = R(2) << 15; }
         else if (kind === 4) { se = 0x3FFF + 2000; }
+        else if (kind === 5 || kind === 6) { mant = (mant | 1n << 63n) & ~0x7FFn; }
+        else if (kind === 7) { mant = (mant | 1n << 63n) & ~0x7FFn; se = (R(2) << 15) | (R(2) ? 0x3FFF - 1022 : 0x3FFF + 1023); }
+        else if (kind === 8) { mant = (mant | 1n << 63n) & ~0x7FFn; se = (R(2) << 15) | (R(2) ? 0x3FFF - 1023 : 0x3FFF + 1024); }
         else mant |= 1n << 63n;
+        if (i === 63) { mant |= (1n << 63n) | 1n; se = 0x3FFF; }
         dv.setBigUint64(a, mant, true); dv.setUint16(a + 8, se, true);
         dv.setFloat32(0x5800 + 4 * i, (rnd() - 0.5) * 16, true);
         dv.setFloat64(0x5C00 + 8 * i, (rnd() - 0.5) * 1e3, true);
@@ -62,8 +66,8 @@ function buildImage(seed) {
     emit(0xA1, ...d32(CTR), 0x83, 0xE0, 0x03, 0xD9, 0x2C, 0x45, ...d32(CWTAB));
     const n = 8 + R(8);
     for (let i = 0; i < n; i++) {
-        emit(0xDB, 0x2D, ...d32(DATA + 10 * R(64)));
-        if (i === 0 || R(3) === 0) { emit(0xDB, 0x3D, ...d32(OUT + 0x380 + 10 * (i & 7))); continue; }
+        emit(0xDB, 0x2D, ...d32(DATA + 10 * (i === 0 ? 63 : R(64))));
+        if (i === 0 || R(3) === 0) { emit(0xDB, 0x3D, ...d32(i === 0 ? OUT + 0x3F0 : OUT + 0x380 + 10 * (i & 3))); continue; }
         for (let j = 0; j < 1 + R(3); j++) {
             const k = R(3);
             if (k === 0) emit(0xD8, 0x05 | [0, 1, 4, 6][R(4)] << 3, ...d32(DATA + 0x800 + 4 * R(64)));
@@ -95,7 +99,7 @@ function run(img, cfg) {
             if (done) return; done = true; currentFinish = null; clearTimeout(timer);
             try { emulator.stop(); } catch { }
             resolve({ status, out: Buffer.from(emulator.read_memory(OUT, 0x400)).toString("hex"),
-                      sw: cpu.fpu_status_word?.[0], fallback: w.profiler_fpu_relaxed_fallback_get?.() ?? -1 });
+                      sw: cpu.fpu_status_word?.[0], hits: w.get_fpu_fld80_exact_hits?.() ?? 0, fallback: w.profiler_fpu_relaxed_fallback_get?.() ?? -1 });
         };
         emulator.add_listener("emulator-loaded", () => {
             cpu = emulator.v86.cpu; w = cpu.wm.exports;
@@ -103,6 +107,8 @@ function run(img, cfg) {
             w.set_relaxed_fpu?.(1);
             if (!w.set_fpu_fld80_relaxed) { resolve({ status: "NO-SWITCH" }); return; }
             w.set_fpu_fld80_relaxed(cfg.on ? 1 : 0);
+            if (cfg.exact && !w.set_fpu_fld80_exact_fast) { resolve({ status: "NO-SWITCH" }); return; }
+            w.set_fpu_fld80_exact_fast?.(cfg.exact ? 1 : 0);
             if (cfg.jit) {
                 for (const [i, v] of [[5, 1], [11, 1], [12, 1], [13, 1], [22, 1]]) cpu.set_jit_config(i, v);
                 w.set_jit_page_tails?.(1); w.set_jit_guard_groups?.(1);
@@ -128,15 +134,19 @@ for (let seed = SEED_START; seed < SEED_START + SEED_COUNT; seed++) {
     const r = {};
     for (const [name, cfg] of [["interp-off", { jit: false, on: false }], ["jit-off", { jit: true, on: false }],
                                ["interp-on", { jit: false, on: true }], ["jit-on", { jit: true, on: true }],
-                               ["jit-on-lean", { jit: true, on: true, lean: true }], ["jit-on-top", { jit: true, on: true, lean: true, top: true }]]) r[name] = await run(img, cfg);
+                               ["jit-on-lean", { jit: true, on: true, lean: true }], ["jit-on-top", { jit: true, on: true, lean: true, top: true }],
+                               ["interp-exact", { jit: false, exact: true }], ["jit-exact", { jit: true, exact: true }],
+                               ["jit-exact-lean", { jit: true, exact: true, lean: true, top: true }]]) r[name] = await run(img, cfg);
     if (Object.values(r).some(x => x.status === "NO-SWITCH")) { fail(`seed ${seed}: engine has no set_fpu_fld80_relaxed`); continue; }
     if (Object.values(r).some(x => x.status !== "done")) { fail(`seed ${seed}: ${Object.entries(r).map(([k, x]) => k + "=" + x.status).join(" ")}`); continue; }
     if (r["jit-off"].out !== r["interp-off"].out) fail(`seed ${seed}: switch off, JIT diverges from the interpreter`);
     if (r["jit-on"].out !== r["interp-on"].out) fail(`seed ${seed}: switch on, JIT diverges from the interpreter`);
     if (r["jit-on-top"].out !== r["interp-on"].out) fail(`seed ${seed}: switch on + lean + top, JIT diverges from the interpreter`);
     if (r["jit-on-lean"].out !== r["interp-on"].out) fail(`seed ${seed}: switch on + lean, JIT diverges from the interpreter`);
+    for (const k of ["interp-exact", "jit-exact", "jit-exact-lean"]) if (r[k].out !== r["interp-off"].out) fail(`seed ${seed}: ${k} is not bit-identical to the switch-off result`);
+    if (r["jit-exact"].hits <= 0) fail(`seed ${seed}: exact fast path never taken`);
     if (r["interp-on"].out === r["interp-off"].out) fail(`seed ${seed}: switch on changed nothing — the feature was not exercised`);
-    console.log(`seed ${seed}: checked`);
+    console.log(`seed ${seed}: checked (exact fast loads ${r["jit-exact"].hits})`);
 }
 if (failures) { console.error(`${failures} failure(s)`); process.exit(1); }
 console.log("all seeds consistent");
