@@ -1131,6 +1131,29 @@ static mut JIT_MULTI_ENTRY_LOOP_SAFETY: bool = false;
 static mut JIT_SSE_SCALAR_INLINE: bool = false;
 static mut JIT_X87_LEAN: bool = false;
 static mut JIT_X87_TOP_LOCAL: bool = false;
+static mut JIT_X87_RUNS: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_runs(on: u32) { unsafe { JIT_X87_RUNS = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_runs() -> u32 { unsafe { JIT_X87_RUNS as u32 } }
+static mut X87_RUNS_COMPILED: u32 = 0;
+#[no_mangle]
+pub fn jit_x87_runs_compiled() -> u32 { unsafe { X87_RUNS_COMPILED } }
+pub fn x87_runs_note_compiled() {
+    if !codegen_dry_run() {
+        unsafe { X87_RUNS_COMPILED = X87_RUNS_COMPILED.saturating_add(1) }
+    }
+}
+pub fn x87_runs_enabled() -> bool {
+    unsafe {
+        JIT_X87_RUNS
+            && !JIT_X87_TOP_LOCAL
+            && !JIT_X87_LOCALS
+            && JIT_READ_TLB_CACHE_MODE == 0
+            && crate::cpu::perm_map::get_perm_map_reads() == 0
+            && crate::softfloat::is_fpu_relaxed()
+    }
+}
 #[no_mangle]
 pub fn set_jit_x87_top_local(on: u32) { unsafe { JIT_X87_TOP_LOCAL = on != 0 } }
 #[no_mangle]
@@ -2975,6 +2998,7 @@ pub struct JitContext<'a> {
     /// aka _ftol, FSQRT/FSIN/FCOS, FINCSTP/FDECSTP, FLD m80, FIADD-family, …)
     /// silently mutate the FPU stack / shift TOP behind stale cached values.
     pub x87_cache_kept: bool,
+    pub x87_run_left: u32,
     pub gg: codegen::GgCtx<'a>,
 }
 
@@ -5726,6 +5750,7 @@ fn jit_generate_module(
         fpu_pc_cache_kept: false,
         cr0_fpu_ok: false,
         x87_cache_kept: false,
+        x87_run_left: 0,
         gg,
     };
 
@@ -6939,6 +6964,17 @@ fn jit_generate_basic_block(
             }
         }
 
+        if ctx.x87_run_left == 0 && x87_runs_enabled() && ctx.cpu.eip != last_instruction_addr {
+            ctx.cpu.prefixes = 0;
+            if ctx.cpu.asize_32() {
+                let run = x87_run_scan(ctx.cpu.eip, last_instruction_addr);
+                if run.len() >= 2 {
+                    ctx.x87_run_left = run.len() as u32;
+                    codegen::gen_x87_run(ctx, &run);
+                }
+            }
+        }
+
         let wasm_length_before = ctx.builder.instruction_body_length();
 
         ctx.start_of_current_instruction = ctx.cpu.eip;
@@ -6990,6 +7026,12 @@ fn jit_generate_basic_block(
             codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
         }
         ctx.builder.gg.in_insn = false;
+        if ctx.x87_run_left > 0 {
+            ctx.x87_run_left -= 1;
+            if ctx.x87_run_left == 0 {
+                codegen::gen_x87_run_join(ctx);
+            }
+        }
 
         let instruction_length = end_eip - start_eip;
         let was_block_boundary = instruction_flags & JIT_INSTR_BLOCK_BOUNDARY_FLAG != 0;
@@ -7038,6 +7080,121 @@ fn jit_generate_basic_block(
 
         ctx.previous_instruction = mem::replace(&mut ctx.current_instruction, Instruction::Other);
     }
+}
+
+fn x87_run_modrm_length(addr: u32) -> u32 {
+    let modrm = read_jit_u8(addr);
+    if modrm >= 0xC0 {
+        return 1;
+    }
+    let mode = modrm >> 6;
+    let rm = modrm & 7;
+    let mut len = 1;
+    if rm == 4 {
+        let sib = read_jit_u8(addr + 1);
+        len += 1;
+        if mode == 0 && sib & 7 == 5 {
+            len += 4;
+        }
+    }
+    else if mode == 0 && rm == 5 {
+        len += 4;
+    }
+    match mode {
+        1 => len + 1,
+        2 => len + 4,
+        _ => len,
+    }
+}
+
+fn x87_run_decode(addr: u32) -> Option<codegen::X87RunOp> {
+    use codegen::{FpuFastBinOp as B, X87RunMem as M, X87RunOp as O};
+    let opcode = read_jit_u8(addr);
+    let modrm = read_jit_u8(addr + 1);
+    let reg = (modrm >> 3 & 7) as u32;
+    let rm = (modrm & 7) as u32;
+    let is_mem = modrm < 0xC0;
+    let binop = |r: u32| match r {
+        0 => Some(B::Add),
+        1 => Some(B::Mul),
+        4 => Some(B::Sub),
+        5 => Some(B::SubR),
+        6 => Some(B::Div),
+        7 => Some(B::DivR),
+        _ => None,
+    };
+    match (opcode, is_mem, reg) {
+        (0xD8, true, r) => binop(r).map(|op| O::BinMem(op, M::M32)),
+        (0xD8, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: 0, pop: false }),
+        (0xD9, true, 0) => Some(O::PushMem(M::M32)),
+        (0xD9, false, 0) => Some(O::PushSti(rm)),
+        (0xD9, false, 1) => Some(O::Fxch(rm)),
+        (0xD9, true, 2) => Some(O::StoreMem { m64: false, pop: false }),
+        (0xD9, true, 3) => Some(O::StoreMem { m64: false, pop: true }),
+        (0xD9, false, 4) if rm == 0 => Some(O::Chs),
+        (0xD9, false, 4) if rm == 1 => Some(O::Abs),
+        (0xD9, false, 5) if rm == 0 => Some(O::PushConst(1.0)),
+        (0xD9, false, 5) if rm == 6 => Some(O::PushConst(0.0)),
+        (0xDA, true, r) => binop(r).map(|op| O::BinMem(op, M::I32)),
+        (0xDB, true, 0) => Some(O::PushMem(M::I32)),
+        (0xDB, true, 5)
+            if crate::cpu::fpu::get_fpu_fld80_exact_fast() != 0
+                && crate::cpu::fpu::get_fpu_fld80_relaxed() == 0 =>
+        {
+            Some(O::PushMem(M::M80))
+        },
+        (0xDC, true, r) => binop(r).map(|op| O::BinMem(op, M::M64)),
+        (0xDC, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: rm, pop: false }),
+        (0xDD, true, 0) => Some(O::PushMem(M::M64)),
+        (0xDD, true, 2) => Some(O::StoreMem { m64: true, pop: false }),
+        (0xDD, true, 3) => Some(O::StoreMem { m64: true, pop: true }),
+        (0xDD, false, 2) => Some(O::StoreSti { i: rm, pop: false }),
+        (0xDD, false, 3) => Some(O::StoreSti { i: rm, pop: true }),
+        (0xDE, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: rm, pop: true }),
+        _ => None,
+    }
+}
+
+fn x87_run_scan(start: u32, last_instruction_addr: u32) -> Vec<codegen::X87RunInsn> {
+    let mut run = Vec::new();
+    let mut model = codegen::X87RunModel::new();
+    let mut addr = start;
+    let mut stored = false;
+    let mut ops = 0;
+    while addr != last_instruction_addr && run.len() < 16 {
+        if read_jit_u8(addr) == 0x9B && fwait_inline_enabled() && !run.is_empty() {
+            run.push(codegen::X87RunInsn { addr, op: codegen::X87RunOp::Wait });
+            addr += 1;
+            continue;
+        }
+        if !(0xD8..=0xDF).contains(&read_jit_u8(addr)) {
+            break;
+        }
+        let op = match x87_run_decode(addr) {
+            Some(op) => op,
+            None => break,
+        };
+        let len = 1 + x87_run_modrm_length(addr + 1);
+        if Page::page_of(addr) != Page::page_of(addr + len - 1)
+            || addr + len > last_instruction_addr
+        {
+            break;
+        }
+        if stored && matches!(op, codegen::X87RunOp::PushMem(codegen::X87RunMem::M80)) {
+            break;
+        }
+        if !model.step(&op) {
+            break;
+        }
+        stored |= matches!(op, codegen::X87RunOp::StoreMem { .. });
+        ops += 1;
+        run.push(codegen::X87RunInsn { addr, op });
+        addr += len;
+    }
+    if ops < 2 {
+        run.clear();
+    }
+    run
 }
 
 pub fn jit_increase_hotness_and_maybe_compile(
@@ -7616,6 +7773,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_X87_TOP_LOCAL {
             add(0x7A11_000A);
+        }
+        if JIT_X87_RUNS {
+            add(0x7A11_000B);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

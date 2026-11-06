@@ -5962,3 +5962,661 @@ pub fn gen_debug_track_jit_exit(builder: &mut WasmBuilder, address: u32) {
         gen_fn1_const(builder, "track_jit_exit", address);
     }
 }
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum X87RunMem {
+    M32,
+    M64,
+    I32,
+    M80,
+}
+
+#[derive(Clone, Copy)]
+pub enum X87RunOp {
+    PushMem(X87RunMem),
+    PushSti(u32),
+    PushConst(f64),
+    BinMem(FpuFastBinOp, X87RunMem),
+    BinSti { op: FpuFastBinOp, sti: u32, target: u32, pop: bool },
+    StoreMem { m64: bool, pop: bool },
+    StoreSti { i: u32, pop: bool },
+    Fxch(u32),
+    Chs,
+    Abs,
+    Wait,
+}
+
+pub struct X87RunInsn {
+    pub addr: u32,
+    pub op: X87RunOp,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum X87RunSlot {
+    Unknown,
+    Valid,
+    Empty,
+}
+
+pub struct X87RunModel {
+    state: [X87RunSlot; 8],
+    top: i32,
+    need_valid: u8,
+    need_empty: u8,
+    written: u8,
+    pushed: bool,
+}
+
+impl X87RunModel {
+    pub fn new() -> Self {
+        X87RunModel {
+            state: [X87RunSlot::Unknown; 8],
+            top: 0,
+            need_valid: 0,
+            need_empty: 0,
+            written: 0,
+            pushed: false,
+        }
+    }
+
+    fn slot(&self, i: u32) -> usize { (self.top + i as i32 & 7) as usize }
+
+    fn read(&mut self, i: u32) -> bool {
+        let s = self.slot(i);
+        match self.state[s] {
+            X87RunSlot::Valid => true,
+            X87RunSlot::Empty => false,
+            X87RunSlot::Unknown => {
+                self.need_valid |= 1 << s;
+                self.state[s] = X87RunSlot::Valid;
+                true
+            },
+        }
+    }
+
+    fn write(&mut self, i: u32) {
+        let s = self.slot(i);
+        self.state[s] = X87RunSlot::Valid;
+        self.written |= 1 << s;
+    }
+
+    fn push(&mut self) -> bool {
+        let s = (self.top - 1 & 7) as usize;
+        match self.state[s] {
+            X87RunSlot::Valid => return false,
+            X87RunSlot::Unknown => self.need_empty |= 1 << s,
+            X87RunSlot::Empty => {},
+        }
+        self.top -= 1;
+        self.write(0);
+        self.pushed = true;
+        true
+    }
+
+    fn pop(&mut self) {
+        let s = self.slot(0);
+        self.state[s] = X87RunSlot::Empty;
+        self.top += 1;
+    }
+
+    pub fn step(&mut self, op: &X87RunOp) -> bool {
+        match *op {
+            X87RunOp::Wait => true,
+            X87RunOp::PushMem(_) | X87RunOp::PushConst(_) => self.push(),
+            X87RunOp::PushSti(i) => self.read(i) && self.push(),
+            X87RunOp::BinMem(..) | X87RunOp::Chs | X87RunOp::Abs => {
+                if !self.read(0) {
+                    return false;
+                }
+                self.write(0);
+                true
+            },
+            X87RunOp::BinSti { sti, target, pop, .. } => {
+                if !(self.read(0) && self.read(sti)) {
+                    return false;
+                }
+                self.write(target);
+                if pop {
+                    self.pop();
+                }
+                true
+            },
+            X87RunOp::StoreMem { pop, .. } => {
+                if !self.read(0) {
+                    return false;
+                }
+                if pop {
+                    self.pop();
+                }
+                true
+            },
+            X87RunOp::StoreSti { i, pop } => {
+                if !self.read(0) {
+                    return false;
+                }
+                self.write(i);
+                if pop {
+                    self.pop();
+                }
+                true
+            },
+            X87RunOp::Fxch(i) => {
+                if !(self.read(0) && self.read(i)) {
+                    return false;
+                }
+                self.write(0);
+                self.write(i);
+                true
+            },
+        }
+    }
+}
+
+fn gen_x87_run_slot_addr(ctx: &mut JitContext, top: &WasmLocal, s: usize) {
+    ctx.builder.get_local(top);
+    ctx.builder.const_i32(s as i32);
+    ctx.builder.add_i32();
+    ctx.builder.const_i32(7);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(16);
+    ctx.builder.mul_i32();
+    ctx.builder.const_i32(global_pointers::fpu_st as i32);
+    ctx.builder.add_i32();
+}
+
+fn gen_x87_run_rotate(ctx: &mut JitContext, value: &WasmLocal, top: &WasmLocal, right: bool) {
+    ctx.builder.get_local(value);
+    ctx.builder.get_local(top);
+    if right {
+        ctx.builder.shr_u_i32();
+    }
+    else {
+        ctx.builder.shl_i32();
+    }
+    ctx.builder.get_local(value);
+    ctx.builder.const_i32(8);
+    ctx.builder.get_local(top);
+    ctx.builder.sub_i32();
+    if right {
+        ctx.builder.shl_i32();
+    }
+    else {
+        ctx.builder.shr_u_i32();
+    }
+    ctx.builder.or_i32();
+    ctx.builder.const_i32(0xFF);
+    ctx.builder.and_i32();
+}
+
+fn gen_x87_run_mem_f64(ctx: &mut JitContext, host: &WasmLocal, mem: X87RunMem) {
+    ctx.builder.get_local(host);
+    match mem {
+        X87RunMem::M32 => {
+            ctx.builder.load_unaligned_i32(0);
+            ctx.builder.reinterpret_i32_as_f32();
+            ctx.builder.promote_f32_to_f64();
+        },
+        X87RunMem::M64 => {
+            ctx.builder.load_unaligned_i64(0);
+            ctx.builder.reinterpret_i64_as_f64();
+        },
+        X87RunMem::I32 => {
+            ctx.builder.load_unaligned_i32(0);
+            ctx.builder.convert_i32_to_f64();
+        },
+        X87RunMem::M80 => {
+            dbg_assert!(false);
+        },
+    }
+}
+
+fn gen_x87_run_m80_bits(
+    ctx: &mut JitContext,
+    host: &WasmLocal,
+    slow: crate::wasmgen::wasm_builder::Label,
+) -> WasmLocalI64 {
+    ctx.builder.get_local(host);
+    ctx.builder.load_unaligned_i64(0);
+    let mant = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(host);
+    ctx.builder.load_unaligned_u16(8);
+    let se = ctx.builder.set_new_local();
+    ctx.builder.get_local(&se);
+    ctx.builder.const_i32(0x7FFF);
+    ctx.builder.and_i32();
+    let exp = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&se);
+    ctx.builder.const_i32(FPU_RELAXED_TAG);
+    ctx.builder.eq_i32();
+    let tagged = ctx.builder.set_new_local();
+
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.const_i64(63);
+    ctx.builder.shr_u_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0x7FF);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&exp);
+    ctx.builder.const_i32(16383 - 1022);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(2045);
+    ctx.builder.leu_i32();
+    ctx.builder.and_i32();
+    let normal = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&exp);
+    ctx.builder.const_i32(0x7FFF);
+    ctx.builder.eq_i32();
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.const_i64(1 << 63);
+    ctx.builder.eq_i64();
+    ctx.builder.and_i32();
+    let inf = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&tagged);
+    ctx.builder.get_local(&normal);
+    ctx.builder.or_i32();
+    ctx.builder.get_local(&inf);
+    ctx.builder.or_i32();
+    ctx.builder.get_local(&exp);
+    ctx.builder.eqz_i32();
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.const_i64(0);
+    ctx.builder.eq_i64();
+    ctx.builder.and_i32();
+    ctx.builder.or_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.br_if(slow);
+
+    ctx.builder.get_local_i64(&mant);
+
+    ctx.builder.get_local(&se);
+    ctx.builder.const_i32(15);
+    ctx.builder.shr_u_i32();
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i64(63);
+    ctx.builder.shl_i64();
+    ctx.builder.get_local(&exp);
+    ctx.builder.const_i32(16383 - 1023);
+    ctx.builder.sub_i32();
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i64(52);
+    ctx.builder.shl_i64();
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.const_i64(1);
+    ctx.builder.shl_i64();
+    ctx.builder.const_i64(12);
+    ctx.builder.shr_u_i64();
+    ctx.builder.or_i64();
+    ctx.builder.const_i64(0x7FF0_0000_0000_0000);
+    ctx.builder.const_i64(0);
+    ctx.builder.get_local(&inf);
+    ctx.builder.select();
+    ctx.builder.get_local(&normal);
+    ctx.builder.select();
+    ctx.builder.or_i64();
+
+    ctx.builder.get_local(&tagged);
+    ctx.builder.select();
+    let bits = ctx.builder.set_new_local_i64();
+
+    ctx.builder.free_local(inf);
+    ctx.builder.free_local(normal);
+    ctx.builder.free_local(tagged);
+    ctx.builder.free_local(exp);
+    ctx.builder.free_local(se);
+    ctx.builder.free_local_i64(mant);
+    bits
+}
+
+pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
+    let start = run[0].addr;
+    let mut model = X87RunModel::new();
+    for insn in run {
+        let ok = model.step(&insn.op);
+        dbg_assert!(ok);
+    }
+
+    crate::jit::x87_runs_note_compiled();
+    ctx.start_of_current_instruction = start;
+    gen_task_switch_test(ctx);
+    gen_mark_fpu_simd_dirty_once(ctx);
+    gen_fpu_pc_cache_prepare(ctx);
+    if ctx.builder.gg.active {
+        ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
+    }
+
+    let join = ctx.builder.block_void();
+    let slow = ctx.builder.block_void();
+
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    let top = ctx.builder.set_new_local();
+    ctx.builder
+        .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
+    let empty = ctx.builder.set_new_local();
+    gen_x87_run_rotate(ctx, &empty, &top, true);
+    let rot = ctx.builder.set_new_local();
+
+    if model.need_valid != 0 {
+        ctx.builder.get_local(&rot);
+        ctx.builder.const_i32(model.need_valid as i32);
+        ctx.builder.and_i32();
+        ctx.builder.br_if(slow);
+    }
+    if model.need_empty != 0 {
+        ctx.builder.get_local(&rot);
+        ctx.builder.const_i32(model.need_empty as i32);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(model.need_empty as i32);
+        ctx.builder.ne_i32();
+        ctx.builder.br_if(slow);
+    }
+    for s in 0..8 {
+        if model.need_valid & 1 << s != 0 {
+            gen_x87_run_slot_addr(ctx, &top, s);
+            ctx.builder.load_unaligned_u16(8);
+            ctx.builder.const_i32(FPU_RELAXED_TAG);
+            ctx.builder.ne_i32();
+            ctx.builder.br_if(slow);
+        }
+    }
+
+    let mut hosts: Vec<Option<WasmLocal>> = Vec::with_capacity(run.len());
+    for insn in run {
+        let access = match insn.op {
+            X87RunOp::PushMem(X87RunMem::M80) => Some((10, false)),
+            X87RunOp::PushMem(m) | X87RunOp::BinMem(_, m) => {
+                Some((if m == X87RunMem::M64 { 8 } else { 4 }, false))
+            },
+            X87RunOp::StoreMem { m64, .. } => Some((if m64 { 8 } else { 4 }, true)),
+            _ => None,
+        };
+        let (bytes, write) = match access {
+            Some(a) => a,
+            None => {
+                hosts.push(None);
+                continue;
+            },
+        };
+        ctx.cpu.eip = insn.addr;
+        ctx.cpu.prefixes = 0;
+        ctx.cpu.read_imm8();
+        let modrm_byte = ctx.cpu.read_imm8();
+        let modrm = crate::modrm::decode(ctx.cpu, modrm_byte);
+        gen_modrm_resolve(ctx, modrm);
+        let address = ctx.builder.set_new_local();
+        ctx.builder.get_local(&address);
+        ctx.builder.const_i32(12);
+        ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(2);
+        ctx.builder.shl_i32();
+        ctx.builder
+            .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
+        let entry = ctx.builder.tee_new_local();
+        ctx.builder.const_i32(if write { gg_tlb_mask_write(ctx) } else { gg_tlb_mask_read(ctx) });
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(TLB_VALID as i32);
+        ctx.builder.ne_i32();
+        ctx.builder.get_local(&address);
+        ctx.builder.const_i32(0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(0x1000 - bytes);
+        ctx.builder.gt_i32();
+        ctx.builder.or_i32();
+        ctx.builder.br_if(slow);
+        ctx.builder.get_local(&entry);
+        ctx.builder.const_i32(!0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.get_local(&address);
+        ctx.builder.xor_i32();
+        ctx.builder.set_local(&address);
+        ctx.builder.free_local(entry);
+        hosts.push(Some(address));
+    }
+    ctx.cpu.eip = start;
+
+    let mut m80: Vec<Option<WasmLocalI64>> = Vec::with_capacity(run.len());
+    for (k, insn) in run.iter().enumerate() {
+        m80.push(match insn.op {
+            X87RunOp::PushMem(X87RunMem::M80) => {
+                Some(gen_x87_run_m80_bits(ctx, hosts[k].as_ref().unwrap(), slow))
+            },
+            _ => None,
+        });
+    }
+
+    let mut owned: Vec<WasmLocalI64> = Vec::new();
+    let mut vals: [Option<WasmLocalI64>; 8] = std::array::from_fn(|_| None);
+    let mut sim = X87RunModel::new();
+
+    fn value(
+        ctx: &mut JitContext,
+        sim: &X87RunModel,
+        vals: &mut [Option<WasmLocalI64>; 8],
+        owned: &mut Vec<WasmLocalI64>,
+        top: &WasmLocal,
+        i: u32,
+    ) -> WasmLocalI64 {
+        let s = sim.slot(i);
+        if vals[s].is_none() {
+            gen_x87_run_slot_addr(ctx, top, s);
+            ctx.builder.load_unaligned_i64(0);
+            let l = ctx.builder.set_new_local_i64();
+            vals[s] = Some(l.unsafe_clone());
+            owned.push(l);
+        }
+        vals[s].as_ref().unwrap().unsafe_clone()
+    }
+
+    fn fresh(ctx: &mut JitContext, owned: &mut Vec<WasmLocalI64>) -> WasmLocalI64 {
+        ctx.builder.reinterpret_f64_as_i64();
+        let l = ctx.builder.set_new_local_i64();
+        owned.push(l.unsafe_clone());
+        l
+    }
+
+    for (k, insn) in run.iter().enumerate() {
+        match insn.op {
+            X87RunOp::Wait => {},
+            X87RunOp::PushMem(X87RunMem::M80) => {
+                let v = m80[k].as_ref().unwrap().unsafe_clone();
+                sim.push();
+                vals[sim.slot(0)] = Some(v);
+            },
+            X87RunOp::PushMem(m) => {
+                gen_x87_run_mem_f64(ctx, hosts[k].as_ref().unwrap(), m);
+                let v = fresh(ctx, &mut owned);
+                sim.push();
+                vals[sim.slot(0)] = Some(v);
+            },
+            X87RunOp::PushConst(c) => {
+                ctx.builder.const_f64(c);
+                let v = fresh(ctx, &mut owned);
+                sim.push();
+                vals[sim.slot(0)] = Some(v);
+            },
+            X87RunOp::PushSti(i) => {
+                let v = value(ctx, &sim, &mut vals, &mut owned, &top, i);
+                sim.read(i);
+                sim.push();
+                vals[sim.slot(0)] = Some(v);
+            },
+            X87RunOp::BinMem(op, m) => {
+                let a = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                sim.read(0);
+                let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
+                if reversed {
+                    gen_x87_run_mem_f64(ctx, hosts[k].as_ref().unwrap(), m);
+                    ctx.builder.get_local_i64(&a);
+                    ctx.builder.reinterpret_i64_as_f64();
+                }
+                else {
+                    ctx.builder.get_local_i64(&a);
+                    ctx.builder.reinterpret_i64_as_f64();
+                    gen_x87_run_mem_f64(ctx, hosts[k].as_ref().unwrap(), m);
+                }
+                gen_fpu_apply_f64_binop(ctx, op);
+                let v = fresh(ctx, &mut owned);
+                sim.write(0);
+                vals[sim.slot(0)] = Some(v);
+            },
+            X87RunOp::BinSti { op, sti, target, pop } => {
+                let x = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                let y = value(ctx, &sim, &mut vals, &mut owned, &top, sti);
+                sim.read(0);
+                sim.read(sti);
+                let reversed = matches!(op, FpuFastBinOp::SubR | FpuFastBinOp::DivR);
+                let (first, second) = if reversed { (&y, &x) } else { (&x, &y) };
+                ctx.builder.get_local_i64(first);
+                ctx.builder.reinterpret_i64_as_f64();
+                ctx.builder.get_local_i64(second);
+                ctx.builder.reinterpret_i64_as_f64();
+                gen_fpu_apply_f64_binop(ctx, op);
+                let v = fresh(ctx, &mut owned);
+                sim.write(target);
+                vals[sim.slot(target)] = Some(v);
+                if pop {
+                    sim.pop();
+                }
+            },
+            X87RunOp::StoreMem { m64, pop } => {
+                let v = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                sim.read(0);
+                ctx.builder.get_local(hosts[k].as_ref().unwrap());
+                ctx.builder.get_local_i64(&v);
+                if m64 {
+                    ctx.builder.store_unaligned_i64(0);
+                }
+                else {
+                    ctx.builder.reinterpret_i64_as_f64();
+                    ctx.builder.demote_f64_to_f32();
+                    ctx.builder.reinterpret_f32_as_i32();
+                    ctx.builder.store_unaligned_i32(0);
+                }
+                if pop {
+                    sim.pop();
+                }
+            },
+            X87RunOp::StoreSti { i, pop } => {
+                let v = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                sim.read(0);
+                sim.write(i);
+                vals[sim.slot(i)] = Some(v);
+                if pop {
+                    sim.pop();
+                }
+            },
+            X87RunOp::Fxch(i) => {
+                let a = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                let b = value(ctx, &sim, &mut vals, &mut owned, &top, i);
+                sim.read(0);
+                sim.read(i);
+                sim.write(0);
+                sim.write(i);
+                vals[sim.slot(0)] = Some(b);
+                vals[sim.slot(i)] = Some(a);
+            },
+            X87RunOp::Chs | X87RunOp::Abs => {
+                let a = value(ctx, &sim, &mut vals, &mut owned, &top, 0);
+                sim.read(0);
+                ctx.builder.get_local_i64(&a);
+                ctx.builder.reinterpret_i64_as_f64();
+                if matches!(insn.op, X87RunOp::Chs) {
+                    ctx.builder.neg_f64();
+                }
+                else {
+                    ctx.builder.abs_f64();
+                }
+                let v = fresh(ctx, &mut owned);
+                sim.write(0);
+                vals[sim.slot(0)] = Some(v);
+            },
+        }
+    }
+
+    for s in 0..8 {
+        if sim.written & 1 << s == 0 {
+            continue;
+        }
+        gen_x87_run_slot_addr(ctx, &top, s);
+        let addr = ctx.builder.tee_new_local();
+        ctx.builder.get_local_i64(vals[s].as_ref().unwrap());
+        ctx.builder.store_unaligned_i64(0);
+        ctx.builder.get_local(&addr);
+        ctx.builder.const_i32(FPU_RELAXED_TAG);
+        ctx.builder.store_unaligned_u16(8);
+        ctx.builder.free_local(addr);
+    }
+
+    let mut set = 0u8;
+    let mut clear = 0u8;
+    for s in 0..8 {
+        match sim.state[s] {
+            X87RunSlot::Empty => set |= 1 << s,
+            X87RunSlot::Valid if sim.written & 1 << s != 0 => clear |= 1 << s,
+            _ => {},
+        }
+    }
+    if set | clear != 0 {
+        ctx.builder.get_local(&rot);
+        ctx.builder.const_i32(!(clear as i32));
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(set as i32);
+        ctx.builder.or_i32();
+        ctx.builder.set_local(&rot);
+        ctx.builder
+            .const_i32(global_pointers::fpu_stack_empty as i32);
+        gen_x87_run_rotate(ctx, &rot, &top, false);
+        ctx.builder.store_u8(0);
+    }
+    if sim.top & 7 != 0 {
+        ctx.builder
+            .const_i32(global_pointers::fpu_stack_ptr as i32);
+        ctx.builder.get_local(&top);
+        ctx.builder.const_i32(sim.top);
+        ctx.builder.add_i32();
+        ctx.builder.const_i32(7);
+        ctx.builder.and_i32();
+        ctx.builder.store_u8(0);
+    }
+    if sim.pushed {
+        ctx.builder
+            .const_i32(global_pointers::fpu_status_word as i32);
+        ctx.builder
+            .load_fixed_u16(global_pointers::fpu_status_word as u32);
+        ctx.builder.const_i32(!FPU_C1);
+        ctx.builder.and_i32();
+        ctx.builder.store_aligned_u16(0);
+    }
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::X87_RUN_FAST);
+    ctx.builder.br(join);
+    ctx.builder.block_end();
+    gen_dispatch_stat_increment(ctx.builder, profiler::stat::X87_RUN_SLOW);
+
+    for l in owned {
+        ctx.builder.free_local_i64(l);
+    }
+    for l in m80.into_iter().flatten() {
+        ctx.builder.free_local_i64(l);
+    }
+    for h in hosts.into_iter().flatten() {
+        ctx.builder.free_local(h);
+    }
+    ctx.builder.free_local(rot);
+    ctx.builder.free_local(empty);
+    ctx.builder.free_local(top);
+}
+
+pub fn gen_x87_run_join(ctx: &mut JitContext) {
+    ctx.builder.block_end();
+    gen_fpu_pc_cache_free(ctx);
+    if ctx.builder.gg.active {
+        ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
+    }
+}

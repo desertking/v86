@@ -3468,6 +3468,15 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
         dbg_assert!(*prefixes == 0);
 
         if jit_block_boundary
+            && opcode == 0x9B
+            && *instruction_pointer == start_eip + 1
+            && jit::fwait_inline_enabled()
+            && jit::get_jit_x87_runs() != 0
+        {
+            jit_block_boundary = false;
+        }
+
+        if jit_block_boundary
             || Page::page_of(start_eip as u32) != Page::page_of(*instruction_pointer as u32)
                 // Limit the number of iterations, as jumps within the same page are not counted as
                 // block boundaries for the interpreter, but only on the next backwards jump
