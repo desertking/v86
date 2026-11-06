@@ -4085,8 +4085,7 @@ pub fn gen_fpu_get_sti(ctx: &mut JitContext, i: u32) {
     if crate::softfloat::is_fpu_relaxed() {
         // Relaxed mode: directly read from fpu_st array, skipping scratch register round-trip.
         // addr = fpu_st + ((fpu_stack_ptr + i) & 7) * 16
-        ctx.builder
-            .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+        ctx.builder.x87_top_get();
         ctx.builder.const_i32(i as i32);
         ctx.builder.add_i32();
         ctx.builder.const_i32(7);
@@ -4449,8 +4448,7 @@ fn gen_fpu_store_relaxed_f64_st(ctx: &mut JitContext, i: u32, addr: &WasmLocal) 
 }
 
 fn gen_fpu_st_addr(ctx: &mut JitContext, i: u32) -> WasmLocal {
-    ctx.builder
-        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.x87_top_get();
     ctx.builder.const_i32(i as i32);
     ctx.builder.add_i32();
     ctx.builder.const_i32(7);
@@ -5139,7 +5137,7 @@ pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
         return;
     }
     gen_x87_local_cache_invalidate_all_runtime(ctx);
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.x87_top_get();
     let ptr_local = ctx.builder.set_new_local();
     ctx.builder.const_i32(1);
     ctx.builder.get_local(&ptr_local);
@@ -5151,7 +5149,7 @@ pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
     ctx.builder.get_local(&new_empty);
     ctx.builder.store_u8(0);
 
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.x87_top_get();
     ctx.builder.const_i32(1);
     ctx.builder.add_i32();
     ctx.builder.const_i32(7);
@@ -5160,6 +5158,7 @@ pub fn gen_fpu_relaxed_pop(ctx: &mut JitContext) {
     ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
     ctx.builder.get_local(&new_ptr);
     ctx.builder.store_u8(0);
+    ctx.builder.x87_top_assign(&new_ptr);
     ctx.builder.free_local(ptr_local);
     ctx.builder.free_local(new_ptr);
     ctx.builder.free_local(new_empty);
@@ -5176,7 +5175,7 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
     let mantissa = ctx.builder.set_new_local_i64();
     gen_x87_local_cache_invalidate_all_runtime(ctx);
 
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.x87_top_get();
     ctx.builder.const_i32(1);
     ctx.builder.sub_i32();
     ctx.builder.const_i32(7);
@@ -5202,6 +5201,7 @@ pub fn gen_fpu_relaxed_push_loaded(ctx: &mut JitContext) {
     ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
     ctx.builder.get_local(&new_ptr);
     ctx.builder.store_u8(0);
+    ctx.builder.x87_top_assign(&new_ptr);
 
     ctx.builder.const_i32(1);
     ctx.builder.get_local(&new_ptr);
@@ -5303,7 +5303,7 @@ fn gen_fpu_clear_stack_empty_sti(ctx: &mut JitContext, i: u32) {
     ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
     ctx.builder.load_fixed_u8(global_pointers::fpu_stack_empty as u32);
     ctx.builder.const_i32(1);
-    ctx.builder.load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.x87_top_get();
     ctx.builder.const_i32(i as i32);
     ctx.builder.add_i32();
     ctx.builder.const_i32(7);
@@ -5328,8 +5328,7 @@ pub fn gen_fpu_relaxed_fst(ctx: &mut JitContext, i: u32, pop: bool) {
     // instead resurrect the freed slot's stale bytes.
     ctx.builder
         .load_fixed_u8(global_pointers::fpu_stack_empty as u32);
-    ctx.builder
-        .load_fixed_u8(global_pointers::fpu_stack_ptr as u32);
+    ctx.builder.x87_top_get();
     ctx.builder.shr_u_i32();
     ctx.builder.const_i32(1);
     ctx.builder.and_i32();

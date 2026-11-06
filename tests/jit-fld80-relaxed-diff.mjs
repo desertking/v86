@@ -107,6 +107,7 @@ function run(img, cfg) {
                 for (const [i, v] of [[5, 1], [11, 1], [12, 1], [13, 1], [22, 1]]) cpu.set_jit_config(i, v);
                 w.set_jit_page_tails?.(1); w.set_jit_guard_groups?.(1);
                 w.set_fpu_relaxed_stats?.(1);
+                if (cfg.top) w.set_jit_x87_top_local(1);
                 if (cfg.lean) { w.set_jit_x87_lean?.(1); w.set_jit_fwait_inline?.(1); w.set_jit_multi_entry_loop_safety?.(1); }
                 cpu.jit_clear_cache?.();
             }
@@ -127,11 +128,12 @@ for (let seed = SEED_START; seed < SEED_START + SEED_COUNT; seed++) {
     const r = {};
     for (const [name, cfg] of [["interp-off", { jit: false, on: false }], ["jit-off", { jit: true, on: false }],
                                ["interp-on", { jit: false, on: true }], ["jit-on", { jit: true, on: true }],
-                               ["jit-on-lean", { jit: true, on: true, lean: true }]]) r[name] = await run(img, cfg);
+                               ["jit-on-lean", { jit: true, on: true, lean: true }], ["jit-on-top", { jit: true, on: true, lean: true, top: true }]]) r[name] = await run(img, cfg);
     if (Object.values(r).some(x => x.status === "NO-SWITCH")) { fail(`seed ${seed}: engine has no set_fpu_fld80_relaxed`); continue; }
     if (Object.values(r).some(x => x.status !== "done")) { fail(`seed ${seed}: ${Object.entries(r).map(([k, x]) => k + "=" + x.status).join(" ")}`); continue; }
     if (r["jit-off"].out !== r["interp-off"].out) fail(`seed ${seed}: switch off, JIT diverges from the interpreter`);
     if (r["jit-on"].out !== r["interp-on"].out) fail(`seed ${seed}: switch on, JIT diverges from the interpreter`);
+    if (r["jit-on-top"].out !== r["interp-on"].out) fail(`seed ${seed}: switch on + lean + top, JIT diverges from the interpreter`);
     if (r["jit-on-lean"].out !== r["interp-on"].out) fail(`seed ${seed}: switch on + lean, JIT diverges from the interpreter`);
     if (r["interp-on"].out === r["interp-off"].out) fail(`seed ${seed}: switch on changed nothing — the feature was not exercised`);
     console.log(`seed ${seed}: checked`);

@@ -115,6 +115,8 @@ function run(img, cfg) {
                 w.set_jit_multi_entry_loop_safety?.(cfg.on ? 1 : 0);
                 if (cfg.lean && !w.set_jit_x87_lean) { resolve({ status: "NO-SWITCH" }); return; }
                 w.set_jit_x87_lean?.(cfg.lean ? 1 : 0);
+                if (cfg.top && !w.set_jit_x87_top_local) { resolve({ status: "NO-SWITCH" }); return; }
+                w.set_jit_x87_top_local?.(cfg.top ? 1 : 0);
                 cpu.jit_clear_cache?.();
             }
             cpu.load_multiboot(img.buffer);
@@ -132,7 +134,7 @@ console.log(`engine ${ENGINE}`);
 for (let seed = SEED_START; seed < SEED_START + SEED_COUNT; seed++) {
     const img = buildImage(seed);
     const interp = await run(img, { jit: false });
-    const arms = [["off", { jit: true, on: false }], ["on", { jit: true, on: true }], ["on+x87locals", { jit: true, on: true, x87: true }], ["on+lean", { jit: true, on: true, lean: true }], ["lean", { jit: true, on: false, lean: true }]];
+    const arms = [["off", { jit: true, on: false }], ["on", { jit: true, on: true }], ["on+x87locals", { jit: true, on: true, x87: true }], ["on+lean", { jit: true, on: true, lean: true }], ["lean", { jit: true, on: false, lean: true }], ["on+lean+top", { jit: true, on: true, lean: true, top: true }], ["top+x87locals", { jit: true, on: true, x87: true, top: true }]];
     const res = [];
     for (const [name, cfg] of arms) res.push([name, await run(img, cfg)]);
     if (interp.status !== "done") { failures++; console.error(`FAIL seed ${seed}: interpreter ${interp.status}`); continue; }

@@ -121,6 +121,8 @@ pub struct WasmBuilder {
     // (unknown helper = spilled = safe; covers arith flag-protocol helpers AND
     // OUT/hypercall thunks whose context switches read cpu.get_eflags()).
     pub flag_locals: Option<[(u8, u32); 5]>,
+    pub x87_top_local: Option<u8>,
+    pub x87_top_ready: bool,
     /// Which flag locals may differ from their memory globals at this point in the emission.
     ///
     /// A word nothing has written since the last sync is already in memory, so the spill before a
@@ -366,6 +368,8 @@ impl WasmBuilder {
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
             flag_locals: None,
+            x87_top_local: None,
+            x87_top_ready: false,
             flag_dirty: 0,
 
             branch_hints: Vec::new(),
@@ -405,6 +409,8 @@ impl WasmBuilder {
         self.free_locals_i64.clear();
         self.local_count = 0;
         self.flag_locals = None;
+        self.x87_top_local = None;
+        self.x87_top_ready = false;
         self.flag_dirty = 0;
         self.branch_hints.clear();
         self.function_name.clear();
@@ -1517,6 +1523,7 @@ impl WasmBuilder {
             let i = self.get_fn_idx(name, function);
             self.instruction_body.push(op::OP_CALL);
             write_leb_u32(&mut self.instruction_body, i as u32);
+            self.x87_top_resync();
             return;
         }
         let dry = self.gg.dry_run;
@@ -1553,6 +1560,46 @@ impl WasmBuilder {
         self.instruction_body.push(op::OP_CALL);
         write_leb_u32(&mut self.instruction_body, i as u32);
         self.emit_flag_reload_masked(reload_mask);
+        self.x87_top_resync();
+    }
+
+    pub fn x87_top_get(&mut self) {
+        match self.x87_top_local {
+            Some(idx) if self.x87_top_ready => {
+                self.instruction_body.push(op::OP_GETLOCAL);
+                write_leb_u32(&mut self.instruction_body, idx as u32);
+            },
+            _ => self.load_fixed_u8(crate::cpu::global_pointers::fpu_stack_ptr as u32),
+        }
+    }
+
+    pub fn x87_top_init(&mut self) {
+        if let Some(idx) = self.x87_top_local {
+            self.load_fixed_u8(crate::cpu::global_pointers::fpu_stack_ptr as u32);
+            self.instruction_body.push(op::OP_SETLOCAL);
+            write_leb_u32(&mut self.instruction_body, idx as u32);
+            self.x87_top_ready = true;
+        }
+    }
+
+    fn x87_top_resync(&mut self) {
+        if let Some(idx) = self.x87_top_local {
+            if self.x87_top_ready {
+                self.load_fixed_u8(crate::cpu::global_pointers::fpu_stack_ptr as u32);
+                self.instruction_body.push(op::OP_SETLOCAL);
+                write_leb_u32(&mut self.instruction_body, idx as u32);
+            }
+        }
+    }
+
+    pub fn x87_top_assign(&mut self, value: &WasmLocal) {
+        if let Some(idx) = self.x87_top_local {
+            if self.x87_top_ready {
+                self.get_local(value);
+                self.instruction_body.push(op::OP_SETLOCAL);
+                write_leb_u32(&mut self.instruction_body, idx as u32);
+            }
+        }
     }
 
     /// Stores the dirty words selected by `mask`; words outside it stay dirty in their locals.

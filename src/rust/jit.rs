@@ -1130,6 +1130,11 @@ static mut JIT_FWAIT_INLINE: bool = false;
 static mut JIT_MULTI_ENTRY_LOOP_SAFETY: bool = false;
 static mut JIT_SSE_SCALAR_INLINE: bool = false;
 static mut JIT_X87_LEAN: bool = false;
+static mut JIT_X87_TOP_LOCAL: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_top_local(on: u32) { unsafe { JIT_X87_TOP_LOCAL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_top_local() -> u32 { unsafe { JIT_X87_TOP_LOCAL as u32 } }
 #[no_mangle]
 pub fn set_jit_x87_lean(on: u32) { unsafe { JIT_X87_LEAN = on != 0 } }
 #[no_mangle]
@@ -5651,6 +5656,14 @@ fn jit_generate_module(
         }
     }
 
+    if unsafe { JIT_X87_TOP_LOCAL } && crate::softfloat::is_fpu_relaxed() {
+        builder.const_i32(0);
+        let l = builder.set_new_local();
+        builder.x87_top_local = Some(l.idx());
+        builder.x87_top_ready = false;
+        std::mem::forget(l);
+    }
+
     // Flag-locals (idx 21): lazy-flag tuple lives in wasm locals for the whole
     // module — initialized from the memory globals here, spilled back at every
     // exit epilogue and around every non-whitelisted helper call (builder funnel).
@@ -6824,6 +6837,7 @@ fn jit_generate_basic_block(
 
     profiler::stat_increment(stat::COMPILE_BASIC_BLOCK);
     ctx.cr0_fpu_ok = false;
+    ctx.builder.x87_top_ready = false;
 
     let start_addr = block.addr;
     let last_instruction_addr = block.last_instruction_addr;
@@ -6942,6 +6956,9 @@ fn jit_generate_basic_block(
             if analysis::gg_insn_is_kill_all(start_eip, &|a| read_jit_u8(a)) {
                 ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
             }
+        }
+        if ctx.builder.x87_top_local.is_some() && !ctx.builder.x87_top_ready && opcode_is_x87(ctx.cpu.eip) {
+            ctx.builder.x87_top_init();
         }
         if fwait_inline_enabled() && read_jit_u8(ctx.cpu.eip) == 0x9B {
             ctx.cpu.prefixes = 0;
@@ -7596,6 +7613,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_X87_LEAN {
             add(0x7A11_0009);
+        }
+        if JIT_X87_TOP_LOCAL {
+            add(0x7A11_000A);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
