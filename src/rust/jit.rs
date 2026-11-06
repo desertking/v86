@@ -1141,6 +1141,12 @@ pub fn set_jit_fist64_inline(on: u32) { unsafe { JIT_FIST64_INLINE = on != 0 } }
 #[no_mangle]
 pub fn get_jit_fist64_inline() -> u32 { unsafe { JIT_FIST64_INLINE as u32 } }
 pub fn fist64_inline_enabled() -> bool { unsafe { JIT_FIST64_INLINE } }
+static mut JIT_FLAG_LOCALS_AUTO: bool = false;
+#[no_mangle]
+pub fn set_jit_flag_locals_auto(on: u32) { unsafe { JIT_FLAG_LOCALS_AUTO = on != 0 } }
+#[no_mangle]
+pub fn get_jit_flag_locals_auto() -> u32 { unsafe { JIT_FLAG_LOCALS_AUTO as u32 } }
+pub fn flag_locals_auto_enabled() -> bool { unsafe { JIT_FLAG_LOCALS_AUTO } }
 #[no_mangle]
 pub fn set_jit_page_fallthrough(on: u32) { unsafe { JIT_PAGE_FALLTHROUGH = on != 0 } }
 #[no_mangle]
@@ -5740,7 +5746,7 @@ fn jit_generate_module(
     // Flag-locals (idx 21): lazy-flag tuple lives in wasm locals for the whole
     // module — initialized from the memory globals here, spilled back at every
     // exit epilogue and around every non-whitelisted helper call (builder funnel).
-    if flag_locals_enabled() {
+    if flag_locals_enabled() || flag_locals_auto_enabled() && !module_has_x87(basic_blocks, &cpu) {
         let addrs: [u32; 5] = [
             global_pointers::last_op1 as u32,
             global_pointers::last_result as u32,
@@ -6859,6 +6865,27 @@ fn opcode_may_write_cr0(eip: u32) -> bool {
     true
 }
 
+fn module_has_x87(basic_blocks: &HashMap<u32, BasicBlock>, cpu: &CpuContext) -> bool {
+    let mut total = 0u32;
+    let mut x87 = 0u32;
+    for block in basic_blocks.values() {
+        let mut addr = block.addr;
+        while addr < block.end_addr {
+            total += 1;
+            if opcode_is_x87(addr) || read_jit_u8(addr) == 0x9B {
+                x87 += 1;
+            }
+            let mut next = CpuContext { eip: addr, ..*cpu };
+            analysis::analyze_step(&mut next);
+            if next.eip <= addr {
+                break;
+            }
+            addr = next.eip;
+        }
+    }
+    x87 * 20 > total
+}
+
 fn opcode_is_x87(eip: u32) -> bool {
     let mut addr = eip;
     for _ in 0..4 {
@@ -7854,6 +7881,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_FIST64_INLINE {
             add(0x7A11_000F);
+        }
+        if JIT_FLAG_LOCALS_AUTO {
+            add(0x7A11_0010);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

@@ -105,6 +105,7 @@ function run(img, cfg) {
                 for (const n of SHIPPING_SWITCHES) w["set_" + n]?.(1);
                 if (!w.set_jit_carry8_inline) { resolve({ status: "NO-SWITCH" }); return; }
                 w.set_jit_carry8_inline(cfg.on ? 1 : 0);
+                w.set_jit_flag_locals_auto?.(cfg.auto ? 1 : 0);
                 cpu.jit_clear_cache?.();
             }
             cpu.load_multiboot(img.buffer);
@@ -122,7 +123,7 @@ console.log(`engine ${ENGINE}`);
 for (let seed = SEED_START; seed < SEED_START + SEED_COUNT; seed++) {
     const img = buildImage(seed);
     const interp = await run(img, { jit: false });
-    const arms = [["off", { jit: true, on: false }], ["on", { jit: true, on: true }], ["on+flaglocals", { jit: true, on: true, flagLocals: true }]];
+    const arms = [["off", { jit: true, on: false }], ["on", { jit: true, on: true }], ["on+flaglocals", { jit: true, on: true, flagLocals: true }], ["on+auto", { jit: true, on: true, auto: true }]];
     const res = [];
     for (const [name, cfg] of arms) res.push([name, await run(img, cfg)]);
     if (res.some(([, r]) => r.status === "NO-SWITCH")) { failures++; console.error(`FAIL seed ${seed}: engine has no set_jit_carry8_inline`); continue; }

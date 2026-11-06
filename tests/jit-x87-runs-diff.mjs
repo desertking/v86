@@ -249,6 +249,7 @@ function run(img, cfg) {
                 if (cfg.lean === 0) w.set_jit_x87_lean(0);
                 if (!w.set_jit_x87_runs) { resolve({ status: "NO-SWITCH" }); return; }
                 w.set_jit_x87_runs(cfg.on ? 1 : 0);
+                w.set_jit_flag_locals_auto?.(cfg.auto ? 1 : 0);
                 if (cfg.stats) w.set_dispatch_stats(1);
                 cpu.jit_clear_cache?.();
             }
@@ -268,7 +269,7 @@ for (let seed = SEED_START; seed < SEED_START + SEED_COUNT; seed++) {
     const img = buildImage(seed);
     const interp = await run(img, { jit: false });
     const arms = [["off", { jit: true, on: false }], ["on", { jit: true, on: true }], ["on+stats", { jit: true, on: true, stats: true }],
-        ["on-lean", { jit: true, on: true, lean: 0 }], ["on-pclocal", { jit: true, on: true, pc: 0 }]];
+        ["on-lean", { jit: true, on: true, lean: 0 }], ["on-pclocal", { jit: true, on: true, pc: 0 }], ["on+auto", { jit: true, on: true, auto: true }]];
     const res = [];
     for (const [name, cfg] of arms) res.push([name, await run(img, cfg)]);
     if (interp.status !== "done") { failures++; console.error(`FAIL seed ${seed}: interpreter ${interp.status}`); continue; }
