@@ -13,7 +13,7 @@ const SEED_COUNT = parseInt(positional[1] ?? "6", 10);
 const ENGINE = opt("--engine") ? path.resolve(opt("--engine")) : path.join(__dirname, "../build/v86.wasm");
 
 const BASE = 0x100000, ENTRY = 0x40, HANDLER = 0x2000, GDT = 0x3000, GDTR = 0x3040, IDT = 0x3800;
-const DATA = BASE + 0x6000, OUT = BASE + 0x7000, CHK = BASE + 0x7F00, NMCNT = BASE + 0x7F04, CTR = BASE + 0x7F08;
+const CWTAB = BASE + 0x7E00, DATA = BASE + 0x6000, OUT = BASE + 0x7000, CHK = BASE + 0x7F00, NMCNT = BASE + 0x7F04, CTR = BASE + 0x7F08;
 const IMG = 0x9000, STACK_TOP = BASE + 0x8F00, DONE = 0x9999, OUTER = 20000;
 
 function mulberry32(a) {
@@ -43,6 +43,7 @@ function buildImage(seed) {
     img[IDT + 7 * 8 + 5] = 0x8E; dv.setUint16(IDT + 7 * 8 + 6, h >>> 16, true);
     for (let i = 0; i < 64; i++) dv.setFloat32(DATA - BASE + 4 * i, (rnd() - 0.5) * 8 + (i % 3 ? 1 : 0.25), true);
     for (let i = 0; i < 0x100; i++) img[0x7F00 + i] = 0;
+    [0x37F, 0x7F, 0x27F, 0x7F].forEach((v, i) => dv.setUint16(0x7E00 + 2 * i, v, true));
 
     let o = HANDLER;
     const emit = (...x) => { for (const v of x) img[o++] = v & 255; };
@@ -58,6 +59,7 @@ function buildImage(seed) {
     emit(0xDB, 0xE3);
     emit(0xC7, 0x05, ...d32(CTR), ...d32(OUTER));
     const loop = o;
+    emit(0xA1, ...d32(CTR), 0x83, 0xE0, 0x03, 0xD9, 0x2C, 0x45, ...d32(CWTAB));
     const mem = (op, reg, a) => emit(op, 0x05 | reg << 3, ...d32(a));
     const FW = () => emit(0x9B);
     const setTs = () => {
@@ -111,6 +113,8 @@ function run(img, cfg) {
                 if (!w.set_jit_fwait_inline) { resolve({ status: "NO-SWITCH" }); return; }
                 w.set_jit_fwait_inline(cfg.on ? 1 : 0);
                 w.set_jit_multi_entry_loop_safety?.(cfg.on ? 1 : 0);
+                if (cfg.lean && !w.set_jit_x87_lean) { resolve({ status: "NO-SWITCH" }); return; }
+                w.set_jit_x87_lean?.(cfg.lean ? 1 : 0);
                 cpu.jit_clear_cache?.();
             }
             cpu.load_multiboot(img.buffer);
@@ -128,7 +132,7 @@ console.log(`engine ${ENGINE}`);
 for (let seed = SEED_START; seed < SEED_START + SEED_COUNT; seed++) {
     const img = buildImage(seed);
     const interp = await run(img, { jit: false });
-    const arms = [["off", { jit: true, on: false }], ["on", { jit: true, on: true }], ["on+x87locals", { jit: true, on: true, x87: true }]];
+    const arms = [["off", { jit: true, on: false }], ["on", { jit: true, on: true }], ["on+x87locals", { jit: true, on: true, x87: true }], ["on+lean", { jit: true, on: true, lean: true }], ["lean", { jit: true, on: false, lean: true }]];
     const res = [];
     for (const [name, cfg] of arms) res.push([name, await run(img, cfg)]);
     if (interp.status !== "done") { failures++; console.error(`FAIL seed ${seed}: interpreter ${interp.status}`); continue; }

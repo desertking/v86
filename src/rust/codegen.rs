@@ -2914,6 +2914,9 @@ pub fn gen_leave(ctx: &mut JitContext, os32: bool) {
 }
 
 pub fn gen_task_switch_test(ctx: &mut JitContext) {
+    if crate::jit::x87_lean_enabled() && ctx.cr0_fpu_ok {
+        return;
+    }
     // generate if(cr[0] & (CR0_EM | CR0_TS)) { task_switch_test_jit(); goto exit_with_fault; }
     let cr0_offset = global_pointers::get_creg_offset(0);
 
@@ -2933,6 +2936,9 @@ pub fn gen_task_switch_test(ctx: &mut JitContext) {
         ctx.builder.br(ctx.exit_with_fault_label);
     }
     ctx.builder.block_end();
+    if crate::jit::x87_lean_enabled() {
+        ctx.cr0_fpu_ok = true;
+    }
 }
 
 pub fn gen_sse_compare_flags(builder: &mut WasmBuilder, d: &WasmLocalI64, s: &WasmLocalI64) {
@@ -2975,6 +2981,9 @@ pub fn gen_sse_compare_flags(builder: &mut WasmBuilder, d: &WasmLocalI64, s: &Wa
 }
 
 pub fn gen_fwait_inline(ctx: &mut JitContext) {
+    if crate::jit::x87_lean_enabled() && ctx.cr0_fpu_ok {
+        return;
+    }
     let cr0_offset = global_pointers::get_creg_offset(0);
     ctx.builder.load_fixed_u8(cr0_offset);
     ctx.builder.const_i32((crate::cpu::cpu::CR0_MP as u32 | regs::CR0_TS) as i32);
@@ -2995,6 +3004,9 @@ pub fn gen_fwait_inline(ctx: &mut JitContext) {
 }
 
 pub fn gen_task_switch_test_mmx(ctx: &mut JitContext) {
+    if crate::jit::x87_lean_enabled() && ctx.cr0_fpu_ok {
+        return;
+    }
     // generate if(cr[0] & (CR0_EM | CR0_TS)) { task_switch_test_mmx_jit(); goto exit_with_fault; }
     let cr0_offset = global_pointers::get_creg_offset(0);
 
@@ -3014,6 +3026,9 @@ pub fn gen_task_switch_test_mmx(ctx: &mut JitContext) {
         ctx.builder.br(ctx.exit_with_fault_label);
     }
     ctx.builder.block_end();
+    if crate::jit::x87_lean_enabled() {
+        ctx.cr0_fpu_ok = true;
+    }
 }
 
 pub fn gen_push16(ctx: &mut JitContext, value_local: &WasmLocal) {
@@ -4771,6 +4786,10 @@ fn gen_fpu_pc_cache_prepare(ctx: &mut JitContext) {
 }
 
 fn gen_fpu_round_f64_by_precision_control(ctx: &mut JitContext) {
+    if crate::jit::x87_lean_enabled() {
+        gen_fpu_round_f64_by_precision_control_branch(ctx);
+        return;
+    }
     ctx.builder.reinterpret_f64_as_i64();
     let raw = ctx.builder.tee_new_local_i64();
     ctx.builder.reinterpret_i64_as_f64();
@@ -4821,6 +4840,58 @@ fn gen_fpu_round_f64_by_precision_control(ctx: &mut JitContext) {
         ctx.builder.eqz_i32();
     }
     ctx.builder.select();
+    ctx.builder.free_local_i64(raw);
+}
+
+fn gen_fpu_round_f64_by_precision_control_branch(ctx: &mut JitContext) {
+    ctx.builder.reinterpret_f64_as_i64();
+    let raw = ctx.builder.set_new_local_i64();
+    if crate::jit::x87_pc_local_enabled() {
+        ctx.fpu_pc_cache_kept = true;
+        ctx.builder.get_local(ctx.fpu_pc_cache.as_ref().unwrap());
+    }
+    else {
+        ctx.builder
+            .load_fixed_u16(global_pointers::fpu_control_word as u32);
+        ctx.builder.const_i32(0x300);
+        ctx.builder.and_i32();
+        ctx.builder.eqz_i32();
+    }
+    ctx.builder.if_i64();
+    ctx.builder.get_local_i64(&raw);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.demote_f64_to_f32();
+    ctx.builder.promote_f32_to_f64();
+    ctx.builder.reinterpret_f64_as_i64();
+    let rounded = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local_i64(&rounded);
+    ctx.builder.const_i64(32);
+    ctx.builder.shr_u_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0x7fff_ffff);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(0x3810_0000);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(0x0fe0_0000);
+    ctx.builder.geu_i32();
+    ctx.builder.get_local_i64(&raw);
+    ctx.builder.const_i64(1);
+    ctx.builder.shl_i64();
+    ctx.builder.const_i64(0);
+    ctx.builder.ne_i64();
+    ctx.builder.and_i32();
+    ctx.builder.if_i64();
+    ctx.builder.get_local_i64(&raw);
+    ctx.builder.const_i32(24);
+    ctx.builder.call_fn2_i64_i32_ret_i64("fpu_round_significand");
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&rounded);
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(rounded);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&raw);
+    ctx.builder.block_end();
+    ctx.builder.reinterpret_i64_as_f64();
     ctx.builder.free_local_i64(raw);
 }
 

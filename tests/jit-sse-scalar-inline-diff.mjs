@@ -14,7 +14,7 @@ const ENGINE = opt("--engine") ? path.resolve(opt("--engine")) : path.join(__dir
 
 const BASE = 0x100000, ENTRY = 0x40, IMG = 0x9000;
 const DATA = BASE + 0x6000, OUT = BASE + 0x7000, CHK = BASE + 0x7F00, CTR = BASE + 0x7F08;
-const STACK_TOP = BASE + 0x8F00, DONE = 0x9999, OUTER = 3000;
+const STACK_TOP = BASE + 0x8F00, DONE = 0x9999, OUTER = 30000;
 
 function mulberry32(a) {
     return () => {

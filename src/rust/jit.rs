@@ -1129,6 +1129,12 @@ static mut JIT_RET_MEMO_INLINE: bool = false;
 static mut JIT_FWAIT_INLINE: bool = false;
 static mut JIT_MULTI_ENTRY_LOOP_SAFETY: bool = false;
 static mut JIT_SSE_SCALAR_INLINE: bool = false;
+static mut JIT_X87_LEAN: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_lean(on: u32) { unsafe { JIT_X87_LEAN = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_lean() -> u32 { unsafe { JIT_X87_LEAN as u32 } }
+pub fn x87_lean_enabled() -> bool { unsafe { JIT_X87_LEAN } }
 #[no_mangle]
 pub fn set_jit_sse_scalar_inline(on: u32) { unsafe { JIT_SSE_SCALAR_INLINE = on != 0 } }
 #[no_mangle]
@@ -2954,6 +2960,7 @@ pub struct JitContext<'a> {
     /// consecutive guest instruction is relaxed x87 arithmetic.
     pub fpu_pc_cache: Option<WasmLocal>,
     pub fpu_pc_cache_kept: bool,
+    pub cr0_fpu_ok: bool,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -5704,6 +5711,7 @@ fn jit_generate_module(
         perm_map_off: None,
         fpu_pc_cache: None,
         fpu_pc_cache_kept: false,
+        cr0_fpu_ok: false,
         x87_cache_kept: false,
         gg,
     };
@@ -6744,6 +6752,26 @@ fn jit_generate_module(
 }
 
 /// True if the instruction at `eip` is an x87 escape, after prefixes.
+fn opcode_may_write_cr0(eip: u32) -> bool {
+    let mut addr = eip;
+    for _ in 0..4 {
+        match read_jit_u8(addr) {
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                addr = addr.wrapping_add(1);
+            },
+            0x0F => {
+                return match read_jit_u8(addr.wrapping_add(1)) {
+                    0x01 | 0x06 | 0x22 => true,
+                    _ => false,
+                }
+            },
+            0x9A | 0xCC | 0xCD | 0xCE | 0xCF | 0xEA | 0xFF => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
 fn opcode_is_x87(eip: u32) -> bool {
     let mut addr = eip;
     for _ in 0..4 {
@@ -6795,6 +6823,7 @@ fn jit_generate_basic_block(
     };
 
     profiler::stat_increment(stat::COMPILE_BASIC_BLOCK);
+    ctx.cr0_fpu_ok = false;
 
     let start_addr = block.addr;
     let last_instruction_addr = block.last_instruction_addr;
@@ -6924,6 +6953,9 @@ fn jit_generate_basic_block(
             jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         }
         let end_eip = ctx.cpu.eip;
+        if ctx.cr0_fpu_ok && opcode_may_write_cr0(start_eip) {
+            ctx.cr0_fpu_ok = false;
+        }
 
         // The PC predicate is deliberately narrower than the generic ST cache:
         // it survives only through an uninterrupted run of relaxed arithmetic.
@@ -7561,6 +7593,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_SSE_SCALAR_INLINE {
             add(0x7A11_0008);
+        }
+        if JIT_X87_LEAN {
+            add(0x7A11_0009);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

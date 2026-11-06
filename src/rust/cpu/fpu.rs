@@ -458,9 +458,24 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
 
 pub unsafe fn fpu_fldm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m32(addr))); }
 pub unsafe fn fpu_fldm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m64(addr))); }
-pub unsafe fn fpu_fldm80(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m80(addr))); }
+pub unsafe fn fpu_fldm80(addr: i32) { fpu_push(fld80_value(return_on_pagefault!(fpu_load_m80(addr)))); }
 #[no_mangle]
-pub unsafe fn fpu_fldm80_without_fault(addr: i32) { fpu_push(fpu_load_m80(addr).unwrap()); }
+pub unsafe fn fpu_fldm80_without_fault(addr: i32) { fpu_push(fld80_value(fpu_load_m80(addr).unwrap())); }
+
+static mut FPU_FLD80_RELAXED: bool = false;
+#[no_mangle]
+pub fn set_fpu_fld80_relaxed(on: u32) { unsafe { FPU_FLD80_RELAXED = on != 0 } }
+#[no_mangle]
+pub fn get_fpu_fld80_relaxed() -> u32 { unsafe { FPU_FLD80_RELAXED as u32 } }
+
+unsafe fn fld80_value(v: F80) -> F80 {
+    if FPU_FLD80_RELAXED && crate::softfloat::is_fpu_relaxed() && v.sign_exponent != crate::softfloat::RELAXED_TAG {
+        F80::of_f64(v.to_f64_strict())
+    }
+    else {
+        v
+    }
+}
 
 #[no_mangle]
 pub unsafe fn fpu_fmul(target_index: i32, val: F80) {
