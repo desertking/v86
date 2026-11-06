@@ -80,12 +80,18 @@ for (const k of ["log", "error", "warn"]) {
     console[k] = (...a) => { if (a.some(x => String(x).includes("JIT module failed"))) moduleFailures++; orig(...a); };
 }
 
+let currentFinish = null;
+process.on("uncaughtException", e => {
+    if (currentFinish) currentFinish("THREW " + String(e.message ?? e).slice(0, 60));
+    else { console.error(e); process.exit(2); }
+});
+
 function run(img, cfg) {
     return new Promise(resolve => {
         const emulator = new V86({ autostart: false, memory_size: 32 << 20, disable_jit: cfg.jit ? 0 : 1, log_level: 0, wasm_path: ENGINE });
         let done = false, timer, cpu, w;
         const finish = status => {
-            if (done) return; done = true; clearTimeout(timer);
+            if (done) return; done = true; currentFinish = null; clearTimeout(timer);
             try { emulator.stop(); } catch { }
             const b = emulator.read_memory(CHK, 4);
             resolve({ status, chk: (b[0] | b[1] << 8 | b[2] << 16 | b[3] << 24) >>> 0, regs: Array.from({ length: 8 }, (_, i) => cpu.reg32[i] >>> 0),
@@ -104,6 +110,7 @@ function run(img, cfg) {
             cpu.load_multiboot(img.buffer);
             cpu.io.register_write(DONE, cpu, () => finish("done"));
             timer = setTimeout(() => finish("TIMEOUT"), 120000);
+            currentFinish = finish;
             emulator.run();
         });
     });

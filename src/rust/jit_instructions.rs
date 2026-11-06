@@ -145,6 +145,56 @@ pub fn instr_F3_jit(ctx: &mut JitContext, instr_flags: &mut u32) {
 }
 
 fn sse_inline() -> bool { crate::jit::sse_scalar_inline_enabled() }
+fn sse_convert_inline() -> bool { crate::jit::sse_convert_inline_enabled() }
+
+fn sse_truncate_f64_on_stack_to_i32(ctx: &mut JitContext) {
+    ctx.builder.reinterpret_f64_as_i64();
+    let bits = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.const_f64(-2147483648.0);
+    ctx.builder.ge_f64();
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.const_f64(2147483648.0);
+    ctx.builder.lt_f64();
+    ctx.builder.and_i32();
+    ctx.builder.if_i32();
+    ctx.builder.get_local_i64(&bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.trunc_s_f64_to_i32();
+    ctx.builder.else_();
+    ctx.builder.const_i32(i32::MIN);
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(bits);
+}
+
+fn sse_cvtpd2ps_reg_inline(ctx: &mut JitContext, r1: u32, r2: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let src = global_pointers::get_reg_xmm_offset(r1) as i32;
+    let dst = global_pointers::get_reg_xmm_offset(r2) as i32;
+    ctx.builder.const_i32(src);
+    ctx.builder.load_aligned_f64(0);
+    ctx.builder.demote_f64_to_f32();
+    ctx.builder.reinterpret_f32_as_i32();
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i32(src);
+    ctx.builder.load_aligned_f64(8);
+    ctx.builder.demote_f64_to_f32();
+    ctx.builder.reinterpret_f32_as_i32();
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i64(32);
+    ctx.builder.shl_i64();
+    ctx.builder.or_i64();
+    let packed = ctx.builder.set_new_local_i64();
+    ctx.builder.const_i32(dst);
+    ctx.builder.get_local_i64(&packed);
+    ctx.builder.store_aligned_i64(0);
+    ctx.builder.const_i32(dst);
+    ctx.builder.const_i64(0);
+    ctx.builder.store_aligned_i64(8);
+    ctx.builder.free_local_i64(packed);
+}
 
 fn sse_scalar_xmm_mem(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, op: SseScalarOp, f64_op: bool) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
@@ -6626,31 +6676,53 @@ pub fn instr_660F2B_reg_jit(ctx: &mut JitContext, _r1: u32, _r2: u32) {
 pub fn instr_F20F2C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
     ctx.builder.reinterpret_i64_as_f64();
-    ctx.builder
-        .call_fn1_f64_ret("sse_convert_with_truncation_f64_to_i32");
+    if sse_convert_inline() {
+        sse_truncate_f64_on_stack_to_i32(ctx);
+    }
+    else {
+        ctx.builder
+            .call_fn1_f64_ret("sse_convert_with_truncation_f64_to_i32");
+    }
     codegen::gen_set_reg32(ctx, r);
 }
 pub fn instr_F20F2C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     ctx.builder
         .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
     ctx.builder.load_aligned_f64(0);
-    ctx.builder
-        .call_fn1_f64_ret("sse_convert_with_truncation_f64_to_i32");
+    if sse_convert_inline() {
+        sse_truncate_f64_on_stack_to_i32(ctx);
+    }
+    else {
+        ctx.builder
+            .call_fn1_f64_ret("sse_convert_with_truncation_f64_to_i32");
+    }
     codegen::gen_set_reg32(ctx, r2);
 }
 pub fn instr_F30F2C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
     ctx.builder.reinterpret_i32_as_f32();
-    ctx.builder
-        .call_fn1_f32_ret("sse_convert_with_truncation_f32_to_i32");
+    if sse_convert_inline() {
+        ctx.builder.promote_f32_to_f64();
+        sse_truncate_f64_on_stack_to_i32(ctx);
+    }
+    else {
+        ctx.builder
+            .call_fn1_f32_ret("sse_convert_with_truncation_f32_to_i32");
+    }
     codegen::gen_set_reg32(ctx, r);
 }
 pub fn instr_F30F2C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
     ctx.builder
         .const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
     ctx.builder.load_aligned_f32(0);
-    ctx.builder
-        .call_fn1_f32_ret("sse_convert_with_truncation_f32_to_i32");
+    if sse_convert_inline() {
+        ctx.builder.promote_f32_to_f64();
+        sse_truncate_f64_on_stack_to_i32(ctx);
+    }
+    else {
+        ctx.builder
+            .call_fn1_f32_ret("sse_convert_with_truncation_f32_to_i32");
+    }
     codegen::gen_set_reg32(ctx, r2);
 }
 
@@ -6973,6 +7045,10 @@ pub fn instr_660F5A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32)
     sse_read128_xmm_mem(ctx, "instr_660F5A", modrm_byte, r);
 }
 pub fn instr_660F5A_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_convert_inline() {
+        sse_cvtpd2ps_reg_inline(ctx, r1, r2);
+        return;
+    }
     sse_read128_xmm_xmm(ctx, "instr_660F5A", r1, r2);
 }
 pub fn instr_F20F5A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
