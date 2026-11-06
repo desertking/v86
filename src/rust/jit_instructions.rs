@@ -1563,14 +1563,128 @@ fn gen_cmp32(ctx: &mut JitContext, dest: &WasmLocal, source: &LocalOrImmediate) 
     gen_cmp(ctx, dest, source, OPSIZE_32)
 }
 
-fn gen_adc8(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
+fn gen_adc_sbb8_inline(
+    ctx: &mut JitContext,
+    dest_operand: &WasmLocal,
+    source_operand: &LocalOrImmediate,
+    sub: bool,
+) {
     ctx.builder.get_local(dest_operand);
     ctx.builder.const_i32(0xFF);
     ctx.builder.and_i32();
+    let d = ctx.builder.set_new_local();
     source_operand.gen_get_mask255(ctx.builder);
-    ctx.builder.call_fn2_ret("adc8");
+    let src = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&d);
+    ctx.builder.get_local(&src);
+    if sub {
+        ctx.builder.sub_i32();
+    }
+    else {
+        ctx.builder.add_i32();
+    }
+    codegen::gen_getcf(ctx, ConditionNegate::False);
+    if sub {
+        ctx.builder.sub_i32();
+    }
+    else {
+        ctx.builder.add_i32();
+    }
     ctx.builder.const_i32(0xFF);
     ctx.builder.and_i32();
+    let res = ctx.builder.set_new_local();
+
+    codegen::gen_set_last_op1(ctx.builder, &d);
+    codegen::gen_set_last_result(ctx.builder, &res);
+    codegen::gen_set_last_op_size_and_flags_changed(
+        ctx.builder,
+        OPSIZE_8,
+        FLAGS_ALL & !FLAG_CARRY & !FLAG_OVERFLOW & !FLAG_ADJUST | if sub { FLAG_SUB } else { 0 },
+    );
+
+    ctx.builder.const_i32(global_pointers::flags as i32);
+    codegen::gen_get_flags(ctx.builder);
+    ctx.builder
+        .const_i32(!FLAG_CARRY & !FLAG_ADJUST & !FLAG_OVERFLOW);
+    ctx.builder.and_i32();
+
+    if sub {
+        ctx.builder.get_local(&res);
+        ctx.builder.get_local(&res);
+        ctx.builder.get_local(&src);
+        ctx.builder.xor_i32();
+        ctx.builder.get_local(&src);
+        ctx.builder.get_local(&d);
+    }
+    else {
+        ctx.builder.get_local(&d);
+        ctx.builder.get_local(&d);
+        ctx.builder.get_local(&src);
+        ctx.builder.xor_i32();
+        ctx.builder.get_local(&src);
+        ctx.builder.get_local(&res);
+    }
+    ctx.builder.xor_i32();
+    ctx.builder.and_i32();
+    ctx.builder.xor_i32();
+    ctx.builder.const_i32(7);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(FLAG_CARRY);
+    ctx.builder.and_i32();
+    ctx.builder.or_i32();
+
+    ctx.builder.get_local(&d);
+    ctx.builder.get_local(&src);
+    ctx.builder.get_local(&res);
+    ctx.builder.xor_i32();
+    ctx.builder.xor_i32();
+    ctx.builder.const_i32(FLAG_ADJUST);
+    ctx.builder.and_i32();
+    ctx.builder.or_i32();
+
+    if sub {
+        ctx.builder.get_local(&src);
+        ctx.builder.get_local(&d);
+        ctx.builder.xor_i32();
+        ctx.builder.get_local(&res);
+        ctx.builder.get_local(&d);
+    }
+    else {
+        ctx.builder.get_local(&src);
+        ctx.builder.get_local(&res);
+        ctx.builder.xor_i32();
+        ctx.builder.get_local(&d);
+        ctx.builder.get_local(&res);
+    }
+    ctx.builder.xor_i32();
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(4);
+    ctx.builder.shl_i32();
+    ctx.builder.const_i32(FLAG_OVERFLOW);
+    ctx.builder.and_i32();
+    ctx.builder.or_i32();
+
+    ctx.builder.flag_store_i32(4);
+
+    ctx.builder.get_local(&res);
+    ctx.builder.free_local(res);
+    ctx.builder.free_local(src);
+    ctx.builder.free_local(d);
+}
+fn gen_adc8(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
+    if crate::jit::carry8_inline_enabled() {
+        gen_adc_sbb8_inline(ctx, dest_operand, source_operand, false);
+    }
+    else {
+        ctx.builder.get_local(dest_operand);
+        ctx.builder.const_i32(0xFF);
+        ctx.builder.and_i32();
+        source_operand.gen_get_mask255(ctx.builder);
+        ctx.builder.call_fn2_ret("adc8");
+        ctx.builder.const_i32(0xFF);
+        ctx.builder.and_i32();
+    }
 
     ctx.current_instruction = Instruction::AdcSbb {
         opsize: OPSIZE_8,
@@ -1663,13 +1777,18 @@ fn gen_adc32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
 }
 
 fn gen_sbb8(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
-    ctx.builder.get_local(dest_operand);
-    ctx.builder.const_i32(0xFF);
-    ctx.builder.and_i32();
-    source_operand.gen_get_mask255(ctx.builder);
-    ctx.builder.call_fn2_ret("sbb8");
-    ctx.builder.const_i32(0xFF);
-    ctx.builder.and_i32();
+    if crate::jit::carry8_inline_enabled() {
+        gen_adc_sbb8_inline(ctx, dest_operand, source_operand, true);
+    }
+    else {
+        ctx.builder.get_local(dest_operand);
+        ctx.builder.const_i32(0xFF);
+        ctx.builder.and_i32();
+        source_operand.gen_get_mask255(ctx.builder);
+        ctx.builder.call_fn2_ret("sbb8");
+        ctx.builder.const_i32(0xFF);
+        ctx.builder.and_i32();
+    }
 
     ctx.current_instruction = Instruction::AdcSbb {
         opsize: OPSIZE_8,

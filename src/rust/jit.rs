@@ -1132,6 +1132,12 @@ static mut JIT_SSE_SCALAR_INLINE: bool = false;
 static mut JIT_X87_LEAN: bool = false;
 static mut JIT_X87_TOP_LOCAL: bool = false;
 static mut JIT_X87_RUNS: bool = false;
+static mut JIT_CARRY8_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_carry8_inline(on: u32) { unsafe { JIT_CARRY8_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_carry8_inline() -> u32 { unsafe { JIT_CARRY8_INLINE as u32 } }
+pub fn carry8_inline_enabled() -> bool { unsafe { JIT_CARRY8_INLINE } }
 #[no_mangle]
 pub fn set_jit_x87_runs(on: u32) { unsafe { JIT_X87_RUNS = on != 0 } }
 #[no_mangle]
@@ -7793,6 +7799,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_X87_RUNS {
             add(0x7A11_000B);
+        }
+        if JIT_CARRY8_INLINE {
+            add(0x7A11_000C);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
