@@ -1273,6 +1273,21 @@ pub fn set_jit_fist64_inline(on: u32) { unsafe { JIT_FIST64_INLINE = on != 0 } }
 pub fn get_jit_fist64_inline() -> u32 { unsafe { JIT_FIST64_INLINE as u32 } }
 pub fn fist64_inline_enabled() -> bool { unsafe { JIT_FIST64_INLINE } }
 static mut JIT_FLAG_LOCALS_AUTO: bool = false;
+static mut JIT_SMC_EXIT: bool = false;
+static mut SMC_EXIT_PENDING: u8 = 0;
+static mut SMC_EXITS: u64 = 0;
+static mut SMC_PENDING_SET: u32 = 0;
+#[no_mangle]
+pub fn jit_smc_exits() -> u32 { unsafe { SMC_EXITS as u32 } }
+#[no_mangle]
+pub fn jit_smc_pending_set() -> u32 { unsafe { SMC_PENDING_SET } }
+pub fn smc_exits_addr() -> u32 { std::ptr::addr_of!(SMC_EXITS) as u32 }
+#[no_mangle]
+pub fn set_jit_smc_exit(on: u32) { unsafe { JIT_SMC_EXIT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_smc_exit() -> u32 { unsafe { JIT_SMC_EXIT as u32 } }
+pub fn smc_exit_enabled() -> bool { unsafe { JIT_SMC_EXIT } }
+pub fn smc_exit_pending_addr() -> u32 { std::ptr::addr_of!(SMC_EXIT_PENDING) as u32 }
 #[no_mangle]
 pub fn set_jit_flag_locals_auto(on: u32) { unsafe { JIT_FLAG_LOCALS_AUTO = on != 0 } }
 #[no_mangle]
@@ -7104,6 +7119,7 @@ fn jit_generate_basic_block(
 
     profiler::stat_increment(stat::COMPILE_BASIC_BLOCK);
     ctx.cr0_fpu_ok = false;
+    let mut instructions_done = 0u32;
     ctx.builder.x87_top_ready = false;
 
     let start_addr = block.addr;
@@ -7218,6 +7234,7 @@ fn jit_generate_basic_block(
         }
 
         let wasm_length_before = ctx.builder.instruction_body_length();
+        ctx.builder.code_write_call_seen = false;
 
         ctx.start_of_current_instruction = ctx.cpu.eip;
         let start_eip = ctx.cpu.eip;
@@ -7273,6 +7290,19 @@ fn jit_generate_basic_block(
             if ctx.x87_run_left == 0 {
                 codegen::gen_x87_run_join(ctx);
             }
+        }
+        instructions_done += 1;
+        if smc_exit_enabled()
+            && ctx.builder.code_write_call_seen
+            && ctx.x87_run_left == 0
+            && (start_eip != last_instruction_addr
+                || matches!(block.ty, BasicBlockType::Normal { jump_offset: 0, .. }))
+        {
+            codegen::gen_smc_exit_check(
+                ctx,
+                page_offset_of_end(start_addr, end_eip),
+                block.number_of_instructions - instructions_done,
+            );
         }
 
         let instruction_length = end_eip - start_eip;
@@ -7693,6 +7723,10 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     {
         profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_CODE);
         did_have_code = true;
+        unsafe {
+            SMC_EXIT_PENDING = 1;
+            SMC_PENDING_SET = SMC_PENDING_SET.wrapping_add(1);
+        }
 
         // ONE forest walk for primary + hidden: the captured hidden list and the
         // primary's tree overlap (see free_wasm_module_forest) — separate walks
@@ -8053,6 +8087,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if FTOL_CALL_FUSION {
             add(0x7A11_0011);
+        }
+        if JIT_SMC_EXIT {
+            add(0x7A11_0012);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

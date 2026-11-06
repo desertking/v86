@@ -6850,3 +6850,22 @@ pub fn gen_x87_run_join(ctx: &mut JitContext) {
         ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
     }
 }
+
+pub fn gen_smc_exit_check(ctx: &mut JitContext, eip_offset: i32, remaining: u32) {
+    let pending = crate::jit::smc_exit_pending_addr();
+    ctx.builder.load_fixed_u8(pending);
+    ctx.builder.if_void();
+    ctx.builder.const_i32(pending as i32);
+    ctx.builder.const_i32(0);
+    ctx.builder.store_u8(0);
+    ctx.builder.increment_fixed_i64(crate::jit::smc_exits_addr(), 1);
+    gen_set_eip_low_bits(ctx.builder, eip_offset);
+    if remaining != 0 {
+        ctx.builder.get_local(&ctx.instruction_counter);
+        ctx.builder.const_i32(remaining as i32);
+        ctx.builder.sub_i32();
+        ctx.builder.set_local(&ctx.instruction_counter);
+    }
+    ctx.builder.br(ctx.exit_label);
+    ctx.builder.block_end();
+}

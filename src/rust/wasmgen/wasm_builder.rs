@@ -89,6 +89,7 @@ pub const HINT_GROUP_MEM: u32 = 1;
 pub const HINT_GROUP_X87: u32 = 2;
 
 pub struct WasmBuilder {
+    pub code_write_call_seen: bool,
     output: Vec<u8>,
     instruction_body: Vec<u8>,
 
@@ -345,6 +346,7 @@ impl Label {
 impl WasmBuilder {
     pub fn new() -> Self {
         let mut b = WasmBuilder {
+            code_write_call_seen: false,
             output: Vec::with_capacity(256),
             instruction_body: Vec::with_capacity(256),
 
@@ -1510,6 +1512,9 @@ impl WasmBuilder {
     }
 
     fn call_fn(&mut self, name: &str, function: FunctionType) {
+        if name.starts_with("safe_write") || name.starts_with("safe_read_write") {
+            self.code_write_call_seen = true;
+        }
         if self.gg.active && self.gg.in_insn && !crate::analysis::gg_call_is_transparent(name) {
             self.gg.log.push(crate::analysis::GgEvent::Barrier);
             crate::jit::gg_note_barrier_name(name);
