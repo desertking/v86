@@ -4739,6 +4739,79 @@ fn gen_fpu_round_f64_bits_to_i32(ctx: &mut JitContext, bits: &WasmLocalI64, trun
     ctx.builder.free_local_i64(rounded_bits);
 }
 
+fn gen_fpu_round_f64_bits_to_i64(ctx: &mut JitContext, bits: &WasmLocalI64, truncate: bool) {
+    if truncate {
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.trunc_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+    }
+    else {
+        ctx.builder.load_fixed_u16(global_pointers::fpu_control_word as u32);
+        ctx.builder.const_i32(10);
+        ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(3);
+        ctx.builder.and_i32();
+        let rc = ctx.builder.set_new_local();
+        ctx.builder.get_local(&rc);
+        ctx.builder.const_i32(1);
+        ctx.builder.eq_i32();
+        ctx.builder.if_i64();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.floor_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.else_();
+        ctx.builder.get_local(&rc);
+        ctx.builder.const_i32(2);
+        ctx.builder.eq_i32();
+        ctx.builder.if_i64();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.ceil_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.else_();
+        ctx.builder.get_local(&rc);
+        ctx.builder.const_i32(3);
+        ctx.builder.eq_i32();
+        ctx.builder.if_i64();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.trunc_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.else_();
+        ctx.builder.get_local_i64(bits);
+        ctx.builder.reinterpret_i64_as_f64();
+        ctx.builder.nearest_f64();
+        ctx.builder.reinterpret_f64_as_i64();
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+        ctx.builder.block_end();
+        ctx.builder.free_local(rc);
+    }
+
+    let rounded_bits = ctx.builder.set_new_local_i64();
+    gen_f64_is_nan(ctx, &rounded_bits);
+    ctx.builder.get_local_i64(&rounded_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.const_f64(9223372036854775808.0);
+    ctx.builder.ge_f64();
+    ctx.builder.or_i32();
+    ctx.builder.get_local_i64(&rounded_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.const_f64(-9223372036854775808.0);
+    ctx.builder.lt_f64();
+    ctx.builder.or_i32();
+    ctx.builder.if_i64();
+    ctx.builder.const_i64(i64::MIN);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&rounded_bits);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.trunc_s_f64_to_i64();
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(rounded_bits);
+}
+
 fn gen_fpu_clamp_i32_to_i16(ctx: &mut JitContext, value: &WasmLocal) {
     ctx.builder.get_local(value);
     ctx.builder.const_i32(-0x8000);
@@ -5518,6 +5591,34 @@ pub fn gen_fpu_relaxed_fist_m32(
     if pop {
         gen_fpu_relaxed_pop(ctx);
     }
+    ctx.builder.free_local(st0_addr);
+    ctx.builder.free_local(address_local);
+}
+
+pub fn gen_fpu_relaxed_fist_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, truncate: bool) {
+    let helper = if truncate { "fpu_truncate_to_i64" } else { "fpu_convert_to_i64" };
+    let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fpu_get_sti(ctx, 0);
+    ctx.builder.call_fn2_i64_i32_ret_i64(helper);
+    let slow_value = ctx.builder.set_new_local_i64();
+    gen_safe_write64(ctx, &address_local, &slow_value);
+    ctx.builder.free_local_i64(slow_value);
+    gen_x87_local_cache_invalidate_all_runtime(ctx);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    let bits = gen_fpu_load_relaxed_st_bits(ctx, 0, &st0_addr);
+    gen_fpu_round_f64_bits_to_i64(ctx, &bits.local, truncate);
+    let fast_value = ctx.builder.set_new_local_i64();
+    gen_safe_write64(ctx, &address_local, &fast_value);
+    ctx.builder.free_local_i64(fast_value);
+    gen_free_fpu_bits(ctx, bits);
+    ctx.builder.block_end();
+    gen_fpu_relaxed_pop(ctx);
     ctx.builder.free_local(st0_addr);
     ctx.builder.free_local(address_local);
 }

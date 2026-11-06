@@ -1135,6 +1135,12 @@ static mut JIT_X87_RUNS: bool = false;
 static mut JIT_CARRY8_INLINE: bool = false;
 static mut JIT_SSE_CONVERT_INLINE: bool = false;
 static mut JIT_PAGE_FALLTHROUGH: bool = false;
+static mut JIT_FIST64_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_fist64_inline(on: u32) { unsafe { JIT_FIST64_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_fist64_inline() -> u32 { unsafe { JIT_FIST64_INLINE as u32 } }
+pub fn fist64_inline_enabled() -> bool { unsafe { JIT_FIST64_INLINE } }
 #[no_mangle]
 pub fn set_jit_page_fallthrough(on: u32) { unsafe { JIT_PAGE_FALLTHROUGH = on != 0 } }
 #[no_mangle]
@@ -7845,6 +7851,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_PAGE_FALLTHROUGH {
             add(0x7A11_000E);
+        }
+        if JIT_FIST64_INLINE {
+            add(0x7A11_000F);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

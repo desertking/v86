@@ -4460,6 +4460,10 @@ pub fn instr32_DD_0_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 
 pub fn instr16_DD_1_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if crate::jit::fist64_inline_enabled() && crate::softfloat::is_fpu_relaxed() {
+        codegen::gen_fpu_relaxed_fist_m64(ctx, modrm_byte, true);
+        return;
+    }
     let address_local = codegen::gen_modrm_resolve_into_local(ctx, modrm_byte);
     codegen::gen_fpu_get_sti(ctx, 0);
     ctx.builder.call_fn2_i64_i32_ret_i64("fpu_truncate_to_i64");
@@ -4653,6 +4657,10 @@ pub fn instr_DF_6_reg_jit(ctx: &mut JitContext, r: u32) {
 
 pub fn instr_DF_7_reg_jit(ctx: &mut JitContext, _r: u32) { codegen::gen_trigger_ud(ctx); }
 pub fn instr_DF_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if crate::jit::fist64_inline_enabled() && crate::softfloat::is_fpu_relaxed() {
+        codegen::gen_fpu_relaxed_fist_m64(ctx, modrm_byte, false);
+        return;
+    }
     let address_local = codegen::gen_modrm_resolve_into_local(ctx, modrm_byte);
     codegen::gen_fpu_get_sti(ctx, 0);
     ctx.builder.call_fn2_i64_i32_ret_i64("fpu_convert_to_i64");

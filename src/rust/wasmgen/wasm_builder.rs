@@ -1360,6 +1360,7 @@ impl WasmBuilder {
     pub fn sqrt_f64(&mut self) { self.instruction_body.push(op::OP_F64SQRT); }
     pub fn convert_i64_to_f64(&mut self) { self.instruction_body.push(op::OP_F64CONVERTSI64); }
     pub fn trunc_s_f64_to_i32(&mut self) { self.instruction_body.push(op::OP_I32TRUNCSF64); }
+    pub fn trunc_s_f64_to_i64(&mut self) { self.instruction_body.push(op::OP_I64TRUNCSF64); }
     pub fn extend_unsigned_i32_to_i64(&mut self) {
         self.instruction_body.push(op::OP_I64EXTENDUI32);
     }
