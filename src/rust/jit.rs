@@ -1134,6 +1134,12 @@ static mut JIT_X87_TOP_LOCAL: bool = false;
 static mut JIT_X87_RUNS: bool = false;
 static mut JIT_CARRY8_INLINE: bool = false;
 static mut JIT_SSE_CONVERT_INLINE: bool = false;
+static mut JIT_PAGE_FALLTHROUGH: bool = false;
+#[no_mangle]
+pub fn set_jit_page_fallthrough(on: u32) { unsafe { JIT_PAGE_FALLTHROUGH = on != 0 } }
+#[no_mangle]
+pub fn get_jit_page_fallthrough() -> u32 { unsafe { JIT_PAGE_FALLTHROUGH as u32 } }
+pub fn page_fallthrough_enabled() -> bool { unsafe { JIT_PAGE_FALLTHROUGH } }
 #[no_mangle]
 pub fn set_jit_sse_convert_inline(on: u32) { unsafe { JIT_SSE_CONVERT_INLINE = on != 0 } }
 #[no_mangle]
@@ -4144,6 +4150,31 @@ fn jit_find_basic_blocks(
 
                     break;
                 },
+            }
+
+            if !next_on_page
+                && tails
+                && page_fallthrough_enabled()
+                && has_next_instruction
+                && cpu.state_flags.is_32()
+                && matches!(analysis.ty, AnalysisType::Normal)
+            {
+                current_block.ty = BasicBlockType::Normal {
+                    next_block_addr: follow_jump(
+                        current_virt_addr,
+                        ctx,
+                        &mut pages,
+                        &mut page_blacklist,
+                        max_pages,
+                        &mut marked_as_entry,
+                        &mut to_visit_stack,
+                        Some(Page::page_of(phys_addr)),
+                        &mut join,
+                    ),
+                    jump_offset: 0,
+                    jump_offset_is_32: true,
+                };
+                break;
             }
 
             if !next_on_page || !tails && is_near_end_of_page(current_address) {
@@ -7811,6 +7842,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_SSE_CONVERT_INLINE {
             add(0x7A11_000D);
+        }
+        if JIT_PAGE_FALLTHROUGH {
+            add(0x7A11_000E);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
