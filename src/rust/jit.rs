@@ -1274,6 +1274,12 @@ pub fn get_jit_fist64_inline() -> u32 { unsafe { JIT_FIST64_INLINE as u32 } }
 pub fn fist64_inline_enabled() -> bool { unsafe { JIT_FIST64_INLINE } }
 static mut JIT_FLAG_LOCALS_AUTO: bool = false;
 static mut JIT_SMC_EXIT: bool = false;
+static mut JIT_FLAG_CARRY_NEUTRAL: bool = false;
+#[no_mangle]
+pub fn set_jit_flag_carry_neutral(on: u32) { unsafe { JIT_FLAG_CARRY_NEUTRAL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_flag_carry_neutral() -> u32 { unsafe { JIT_FLAG_CARRY_NEUTRAL as u32 } }
+pub fn flag_carry_neutral_enabled() -> bool { unsafe { JIT_FLAG_CARRY_NEUTRAL } }
 static mut SMC_EXIT_PENDING: u8 = 0;
 static mut SMC_EXITS: u64 = 0;
 static mut SMC_PENDING_SET: u32 = 0;
@@ -3084,6 +3090,33 @@ pub enum InstructionOperand {
     Immediate(i32),
     Other,
 }
+impl Instruction {
+    fn through_neutral(self) -> Instruction {
+        let dest = |_: InstructionOperandDest| InstructionOperandDest::Other;
+        let source = |s: InstructionOperand| match s {
+            InstructionOperand::Immediate(i) => InstructionOperand::Immediate(i),
+            _ => InstructionOperand::Other,
+        };
+        match self {
+            Instruction::Cmp { dest: d, source: s, opsize } => {
+                Instruction::Cmp { dest: dest(d), source: source(s), opsize }
+            },
+            Instruction::Sub { dest: d, source: s, opsize, is_dec } => {
+                Instruction::Sub { dest: dest(d), source: source(s), opsize, is_dec }
+            },
+            Instruction::Add { dest: d, source: s, opsize, is_inc } => {
+                Instruction::Add { dest: dest(d), source: source(s), opsize, is_inc }
+            },
+            Instruction::AdcSbb { dest: d, source: s, opsize } => {
+                Instruction::AdcSbb { dest: dest(d), source: source(s), opsize }
+            },
+            Instruction::NonZeroShift { dest: d, opsize } => Instruction::NonZeroShift { dest: dest(d), opsize },
+            Instruction::Bitwise { dest: d, opsize } => Instruction::Bitwise { dest: dest(d), opsize },
+            Instruction::Other => Instruction::Other,
+        }
+    }
+}
+
 impl InstructionOperand {
     pub fn is_zero(&self) -> bool {
         match self {
@@ -3241,6 +3274,13 @@ fn skip_instruction_prefixes(mut addr: u32) -> u32 {
             _ => return addr,
         }
     }
+}
+
+fn opcode_is_flag_neutral(addr: u32) -> bool {
+    matches!(
+        decode_jit_opcode(addr).0,
+        0x88..=0x8B | 0x8D | 0xB0..=0xBF | 0xC6 | 0xC7 | 0x90 | 0x1B6 | 0x1B7 | 0x1BE | 0x1BF
+    )
 }
 
 fn decode_jit_opcode(addr: u32) -> (u32, u32) {
@@ -7350,7 +7390,17 @@ fn jit_generate_basic_block(
             break;
         }
 
-        ctx.previous_instruction = mem::replace(&mut ctx.current_instruction, Instruction::Other);
+        let produced = mem::replace(&mut ctx.current_instruction, Instruction::Other);
+        if flag_carry_neutral_enabled()
+            && matches!(produced, Instruction::Other)
+            && opcode_is_flag_neutral(start_eip)
+        {
+            let carried = mem::replace(&mut ctx.previous_instruction, Instruction::Other);
+            ctx.previous_instruction = carried.through_neutral();
+        }
+        else {
+            ctx.previous_instruction = produced;
+        }
     }
 }
 
@@ -8090,6 +8140,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_SMC_EXIT {
             add(0x7A11_0012);
+        }
+        if JIT_FLAG_CARRY_NEUTRAL {
+            add(0x7A11_0013);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
