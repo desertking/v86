@@ -950,7 +950,7 @@ fn gen_safe_read_grouped(
     // failed (a page crossing or a page without the needed permission), where an inline TLB
     // check would fail too, and it keeps every member small.
     let has_entry = gg_prelude(ctx, analysis::GG_R, role, address_local, &entry_local, cont, None);
-    if !matches!(role, analysis::GgRole::Member { .. }) {
+    if !matches!(role, analysis::GgRole::Member { .. }) || jit::gg_member_inline_fallback_enabled() {
         if !has_entry {
             gg_load_entry(ctx, address_local, &entry_local);
         }
@@ -1029,7 +1029,7 @@ fn gen_safe_write_grouped(
     // failed (a page crossing or a page without the needed permission), where an inline TLB
     // check would fail too, and it keeps every member small.
     let has_entry = gg_prelude(ctx, analysis::GG_W, role, address_local, &entry_local, cont, None);
-    if !matches!(role, analysis::GgRole::Member { .. }) {
+    if !matches!(role, analysis::GgRole::Member { .. }) || jit::gg_member_inline_fallback_enabled() {
         if !has_entry {
             gg_load_entry(ctx, address_local, &entry_local);
         }
@@ -1119,7 +1119,7 @@ fn gen_safe_read_write_grouped(
     // failed (a page crossing or a page without the needed permission), where an inline TLB
     // check would fail too, and it keeps every member small.
     let has_entry = gg_prelude(ctx, analysis::GG_RMW, role, address_local, &entry_local, cont, Some(&can_use_fast_path_local));
-    if !matches!(role, analysis::GgRole::Member { .. }) {
+    if !matches!(role, analysis::GgRole::Member { .. }) || jit::gg_member_inline_fallback_enabled() {
         if !has_entry {
             gg_load_entry(ctx, address_local, &entry_local);
         }
