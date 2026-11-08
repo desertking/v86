@@ -1431,6 +1431,12 @@ pub fn set_jit_rmw_misc_inline(on: u32) { unsafe { JIT_RMW_MISC_INLINE = on != 0
 #[no_mangle]
 pub fn get_jit_rmw_misc_inline() -> u32 { unsafe { JIT_RMW_MISC_INLINE as u32 } }
 pub fn rmw_misc_inline_enabled() -> bool { unsafe { JIT_RMW_MISC_INLINE } }
+static mut JIT_OUT_DIRECT: bool = false;
+#[no_mangle]
+pub fn set_jit_out_direct(on: u32) { unsafe { JIT_OUT_DIRECT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_out_direct() -> u32 { unsafe { JIT_OUT_DIRECT as u32 } }
+pub fn out_direct_enabled() -> bool { unsafe { JIT_OUT_DIRECT && JIT_SMC_EXIT } }
 static mut JIT_GG_MEMBER_INLINE_FALLBACK: bool = false;
 #[no_mangle]
 pub fn set_jit_gg_member_inline_fallback(on: u32) { unsafe { JIT_GG_MEMBER_INLINE_FALLBACK = on != 0 } }
@@ -4794,6 +4800,24 @@ fn jit_find_basic_blocks(
                         jump_offset_is_32: is_32,
                     };
 
+                    break;
+                },
+                AnalysisType::BlockBoundary
+                    if out_direct_enabled()
+                        && has_next_instruction
+                        && next_on_page
+                        && !analysis.absolute_jump
+                        && (tails || !is_near_end_of_page(current_address))
+                        && read_jit_u8(addr_before_instruction) == 0xEF
+                        && cpu.state_flags.is_32() =>
+                {
+                    marked_as_entry.insert(current_virt_addr);
+                    to_visit_stack.push(current_virt_addr);
+                    current_block.ty = BasicBlockType::Normal {
+                        next_block_addr: Some(current_address),
+                        jump_offset: 0,
+                        jump_offset_is_32: true,
+                    };
                     break;
                 },
                 AnalysisType::BlockBoundary => {
@@ -8853,6 +8877,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_RMW_MISC_INLINE {
             add(0x7A11_0033);
+        }
+        if JIT_OUT_DIRECT {
+            add(0x7A11_0035);
         }
         if JIT_THRESHOLD != JIT_THRESHOLD_DEFAULT {
             add(0x7A11_0034);

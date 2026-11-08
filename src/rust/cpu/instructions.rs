@@ -2133,6 +2133,28 @@ pub unsafe fn instr32_EF() {
         io_port_write32(port, read_reg32(EAX));
     }
 }
+pub static mut OUT_DIRECT_CONTINUES: u32 = 0;
+pub static mut OUT_DIRECT_EXITS: u32 = 0;
+#[no_mangle]
+pub unsafe fn jit_out_direct_get_continues() -> u32 { OUT_DIRECT_CONTINUES }
+#[no_mangle]
+pub unsafe fn jit_out_direct_get_exits() -> u32 { OUT_DIRECT_EXITS }
+#[no_mangle]
+pub unsafe fn instr32_EF_direct() -> i32 {
+    let eip = *instruction_pointer;
+    instr32_EF();
+    let stay = *instruction_pointer == eip
+        && !*in_hlt
+        && crate::cpu::hypercall::read_cycle_limit() != 0
+        && !crate::cpu::hypercall::eip_at_park(eip as u32);
+    if stay {
+        OUT_DIRECT_CONTINUES = OUT_DIRECT_CONTINUES.wrapping_add(1);
+    }
+    else {
+        OUT_DIRECT_EXITS = OUT_DIRECT_EXITS.wrapping_add(1);
+    }
+    stay as i32
+}
 
 pub unsafe fn instr_F0() {
     // lock

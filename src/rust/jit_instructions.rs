@@ -5606,6 +5606,38 @@ pub fn instr16_FF_2_reg_jit(ctx: &mut JitContext, r: u32) {
         .store_aligned_i32(global_pointers::instruction_pointer as u32);
 }
 
+pub fn instr16_EF_jit(ctx: &mut JitContext) {
+    codegen::gen_move_registers_from_locals_to_memory(ctx);
+    codegen::gen_fn0_const(ctx.builder, "instr16_EF");
+    codegen::gen_move_registers_from_memory_to_locals(ctx);
+}
+pub fn instr32_EF_jit(ctx: &mut JitContext) {
+    if !crate::jit::out_direct_enabled() {
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+        codegen::gen_fn0_const(ctx.builder, "instr32_EF");
+        codegen::gen_move_registers_from_memory_to_locals(ctx);
+        return;
+    }
+    codegen::gen_set_previous_eip_offset_from_eip_with_low_bits(
+        ctx.builder,
+        ctx.start_of_current_instruction as i32 & 0xFFF,
+    );
+    codegen::gen_set_eip_to_after_current_instruction(ctx);
+    codegen::gen_update_instruction_counter(ctx);
+    ctx.builder.const_i32(0);
+    ctx.builder.set_local(&ctx.instruction_counter);
+    codegen::gen_move_registers_from_locals_to_memory(ctx);
+    ctx.builder.call_fn0_ret("instr32_EF_direct");
+    let stay = ctx.builder.set_new_local();
+    codegen::gen_move_registers_from_memory_to_locals(ctx);
+    ctx.builder.code_write_call_seen = true;
+    ctx.builder.smc_local_note();
+    ctx.builder.get_local(&stay);
+    ctx.builder.eqz_i32();
+    ctx.builder.br_if(ctx.exit_label);
+    ctx.builder.free_local(stay);
+}
+
 fn gen_indirect_call32(ctx: &mut JitContext, new_eip: WasmLocal) {
     crate::jit::wbuf_intrinsic_note_call32(ctx.cpu.ssize_32());
     // Win32 WBUF intrinsic: only 32-bit stacks are eligible. The normal path below

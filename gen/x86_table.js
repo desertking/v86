@@ -294,7 +294,7 @@ const encodings = [
     { opcode: 0xEC, block_boundary: 1, skip: 1 }, // in
     { opcode: 0xED, block_boundary: 1, os: 1, skip: 1 },
     { opcode: 0xEE, block_boundary: 1, skip: 1 }, // out
-    { opcode: 0xEF, block_boundary: 1, os: 1, skip: 1 },
+    { opcode: 0xEF, block_boundary: 1, os: 1, custom: 1, skip: 1 },
 
     { opcode: 0xF0, prefix: 1 },
     { opcode: 0xF1, skip: 1 },

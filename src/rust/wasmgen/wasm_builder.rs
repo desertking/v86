@@ -1622,7 +1622,7 @@ impl WasmBuilder {
         }
     }
 
-    fn smc_local_note(&mut self) {
+    pub fn smc_local_note(&mut self) {
         if let Some(idx) = self.smc_local {
             self.load_fixed_u8(crate::jit::smc_exit_pending_addr());
             self.set_local_raw(idx);
