@@ -1410,6 +1410,12 @@ pub fn set_jit_cvttps2pi_inline(on: u32) { unsafe { JIT_CVTTPS2PI_INLINE = on !=
 #[no_mangle]
 pub fn get_jit_cvttps2pi_inline() -> u32 { unsafe { JIT_CVTTPS2PI_INLINE as u32 } }
 pub fn cvttps2pi_inline_enabled() -> bool { unsafe { JIT_CVTTPS2PI_INLINE } }
+static mut JIT_FRNDINT_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_frndint_inline(on: u32) { unsafe { JIT_FRNDINT_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_frndint_inline() -> u32 { unsafe { JIT_FRNDINT_INLINE as u32 } }
+pub fn frndint_inline_enabled() -> bool { unsafe { JIT_FRNDINT_INLINE } }
 static mut JIT_SMC_EXIT_LOCAL: bool = false;
 #[no_mangle]
 pub fn set_jit_smc_exit_local(on: u32) { unsafe { JIT_SMC_EXIT_LOCAL = on != 0 } }
@@ -8779,6 +8785,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_CVTTPS2PI_INLINE {
             add(0x7A11_002C);
+        }
+        if JIT_FRNDINT_INLINE {
+            add(0x7A11_002D);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

@@ -4662,6 +4662,10 @@ pub fn instr16_D9_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder.free_local(value_local);
 }
 pub fn instr16_D9_7_reg_jit(ctx: &mut JitContext, r: u32) {
+    if r == 4 {
+        codegen::gen_fpu_relaxed_frndint(ctx);
+        return;
+    }
     codegen::gen_fn1_const(ctx.builder, "instr16_D9_7_reg", r);
 }
 pub fn instr32_D9_7_reg_jit(ctx: &mut JitContext, r: u32) { instr16_D9_7_reg_jit(ctx, r) }

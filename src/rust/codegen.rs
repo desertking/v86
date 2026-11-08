@@ -5480,6 +5480,59 @@ pub fn gen_fpu_relaxed_fchs_or_fabs(ctx: &mut JitContext, r: u32) {
     ctx.builder.free_local(st0_addr);
 }
 
+pub fn gen_fpu_relaxed_frndint(ctx: &mut JitContext) {
+    if !crate::softfloat::is_fpu_relaxed() || !jit::frndint_inline_enabled() {
+        gen_fn1_const(ctx.builder, "instr16_D9_7_reg", 4);
+        return;
+    }
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_fallback(ctx);
+    gen_fn1_const(ctx.builder, "instr16_D9_7_reg", 4);
+    gen_x87_local_cache_invalidate_all_runtime(ctx);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_hit(ctx);
+    gen_fpu_load_relaxed_st_f64(ctx, 0, &st0_addr);
+    ctx.builder.reinterpret_f64_as_i64();
+    let v = ctx.builder.set_new_local_i64();
+    ctx.builder.load_fixed_u16(global_pointers::fpu_control_word as u32);
+    ctx.builder.const_i32(10);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(3);
+    ctx.builder.and_i32();
+    let rc = ctx.builder.set_new_local();
+    let val = |ctx: &mut JitContext| {
+        ctx.builder.get_local_i64(&v);
+        ctx.builder.reinterpret_i64_as_f64();
+    };
+    val(ctx);
+    ctx.builder.nearest_f64();
+    val(ctx);
+    ctx.builder.floor_f64();
+    val(ctx);
+    ctx.builder.ceil_f64();
+    val(ctx);
+    ctx.builder.trunc_f64();
+    ctx.builder.get_local(&rc);
+    ctx.builder.const_i32(2);
+    ctx.builder.eq_i32();
+    ctx.builder.select();
+    ctx.builder.get_local(&rc);
+    ctx.builder.const_i32(1);
+    ctx.builder.eq_i32();
+    ctx.builder.select();
+    ctx.builder.get_local(&rc);
+    ctx.builder.eqz_i32();
+    ctx.builder.select();
+    ctx.builder.free_local(rc);
+    ctx.builder.free_local_i64(v);
+    gen_fpu_store_relaxed_f64_st(ctx, 0, &st0_addr);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
 pub fn gen_fpu_relaxed_push_const_f64(ctx: &mut JitContext, value: f64, slow_r: u32) {
     if !crate::softfloat::is_fpu_relaxed() {
         gen_fn1_const(ctx.builder, "instr16_D9_5_reg", slow_r);

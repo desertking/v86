@@ -579,25 +579,10 @@ impl F80 {
 
 fn round_ties_even(f: f64) -> f64 {
     let rounded = f.round();
-    // Check for tie case: fractional part is exactly 0.5
-    let diff = (f - rounded).abs();
-    if diff == 0.0 {
-        // Not a tie, or already rounded correctly
-        return rounded;
+    if (f - f.trunc()).abs() == 0.5 {
+        2.0 * (f / 2.0).round()
     }
-    // f.round() rounds ties away from zero in Rust.
-    // For ties-to-even, check if we need to adjust.
-    let frac = f.abs() % 1.0;
-    if (frac - 0.5).abs() < 1e-15 {
-        // It's a tie - round to even
-        let candidate = f.round();
-        if (candidate as i64) % 2 != 0 {
-            // Rounded to odd, go the other way
-            if f > 0.0 { candidate - 1.0 } else { candidate + 1.0 }
-        } else {
-            candidate
-        }
-    } else {
+    else {
         rounded
     }
 }
