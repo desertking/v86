@@ -1645,6 +1645,44 @@ fn gen_adc_sbb8_inline(
     ctx.builder.and_i32();
     let res = ctx.builder.set_new_local();
 
+    if crate::jit::adc_cf_only_enabled() && crate::jit::next_overwrites_all_but_cf(ctx) {
+        codegen::gen_set_last_op_size_and_flags_changed(ctx.builder, OPSIZE_8, 0);
+        ctx.builder.const_i32(global_pointers::flags as i32);
+        codegen::gen_get_flags(ctx.builder);
+        ctx.builder.const_i32(!FLAG_CARRY);
+        ctx.builder.and_i32();
+        if sub {
+            ctx.builder.get_local(&res);
+            ctx.builder.get_local(&res);
+            ctx.builder.get_local(&src);
+            ctx.builder.xor_i32();
+            ctx.builder.get_local(&src);
+            ctx.builder.get_local(&d);
+        }
+        else {
+            ctx.builder.get_local(&d);
+            ctx.builder.get_local(&d);
+            ctx.builder.get_local(&src);
+            ctx.builder.xor_i32();
+            ctx.builder.get_local(&src);
+            ctx.builder.get_local(&res);
+        }
+        ctx.builder.xor_i32();
+        ctx.builder.and_i32();
+        ctx.builder.xor_i32();
+        ctx.builder.const_i32(7);
+        ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(FLAG_CARRY);
+        ctx.builder.and_i32();
+        ctx.builder.or_i32();
+        ctx.builder.flag_store_i32(4);
+        ctx.builder.get_local(&res);
+        ctx.builder.free_local(res);
+        ctx.builder.free_local(src);
+        ctx.builder.free_local(d);
+        return;
+    }
+
     codegen::gen_set_last_op1(ctx.builder, &d);
     codegen::gen_set_last_result(ctx.builder, &res);
     codegen::gen_set_last_op_size_and_flags_changed(

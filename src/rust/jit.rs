@@ -1329,6 +1329,30 @@ pub fn set_jit_gg_through_runs(on: u32) { unsafe { JIT_GG_THROUGH_RUNS = on != 0
 #[no_mangle]
 pub fn get_jit_gg_through_runs() -> u32 { unsafe { JIT_GG_THROUGH_RUNS as u32 } }
 pub fn gg_through_runs_enabled() -> bool { unsafe { JIT_GG_THROUGH_RUNS } }
+static mut JIT_ADC_CF_ONLY: bool = false;
+#[no_mangle]
+pub fn set_jit_adc_cf_only(on: u32) { unsafe { JIT_ADC_CF_ONLY = on != 0 } }
+#[no_mangle]
+pub fn get_jit_adc_cf_only() -> u32 { unsafe { JIT_ADC_CF_ONLY as u32 } }
+pub fn adc_cf_only_enabled() -> bool { unsafe { JIT_ADC_CF_ONLY } }
+pub fn next_overwrites_all_but_cf(ctx: &JitContext) -> bool {
+    let addr = ctx.cpu.eip;
+    if addr > ctx.block_last_instruction || !ctx.cpu.state_flags.is_32() {
+        return false;
+    }
+    let mut a = addr;
+    if read_jit_u8(a) == 0x66 {
+        a += 1;
+    }
+    match read_jit_u8(a) {
+        0x40..=0x4F => true,
+        0xFE | 0xFF => {
+            let modrm = read_jit_u8(a + 1);
+            modrm >= 0xC0 && (modrm >> 3) & 7 <= 1
+        },
+        _ => false,
+    }
+}
 static mut STRADDLES_COMPILED: u32 = 0;
 #[no_mangle]
 pub fn jit_straddles_compiled() -> u32 { unsafe { STRADDLES_COMPILED } }
@@ -3338,6 +3362,7 @@ pub struct JitContext<'a> {
     pub fpu_pc_cache_kept: bool,
     pub cr0_fpu_ok: bool,
     pub cr0_killed: bool,
+    pub block_last_instruction: u32,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -6235,6 +6260,7 @@ fn jit_generate_module(
         fpu_pc_cache_kept: false,
         cr0_fpu_ok: false,
         cr0_killed: false,
+        block_last_instruction: 0,
         x87_cache_kept: false,
         x87_run_left: 0,
         gg,
@@ -7369,6 +7395,7 @@ fn jit_generate_basic_block(
 
     profiler::stat_increment(stat::COMPILE_BASIC_BLOCK);
     let (cr0_in, dirty_in) = x87_entry_in(block.addr);
+    ctx.block_last_instruction = block.last_instruction_addr;
     ctx.cr0_fpu_ok = cr0_in;
     ctx.cr0_killed = false;
     let mut instructions_done = 0u32;
@@ -8437,6 +8464,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_GG_THROUGH_RUNS {
             add(0x7A11_0018);
+        }
+        if JIT_ADC_CF_ONLY {
+            add(0x7A11_0019);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
