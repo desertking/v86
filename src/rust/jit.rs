@@ -1323,6 +1323,12 @@ pub fn set_jit_x87_cmp_lean(on: u32) { unsafe { JIT_X87_CMP_LEAN = on != 0 } }
 #[no_mangle]
 pub fn get_jit_x87_cmp_lean() -> u32 { unsafe { JIT_X87_CMP_LEAN as u32 } }
 pub fn x87_cmp_lean_enabled() -> bool { unsafe { JIT_X87_CMP_LEAN } }
+static mut JIT_GG_THROUGH_RUNS: bool = false;
+#[no_mangle]
+pub fn set_jit_gg_through_runs(on: u32) { unsafe { JIT_GG_THROUGH_RUNS = on != 0 } }
+#[no_mangle]
+pub fn get_jit_gg_through_runs() -> u32 { unsafe { JIT_GG_THROUGH_RUNS as u32 } }
+pub fn gg_through_runs_enabled() -> bool { unsafe { JIT_GG_THROUGH_RUNS } }
 static mut STRADDLES_COMPILED: u32 = 0;
 #[no_mangle]
 pub fn jit_straddles_compiled() -> u32 { unsafe { STRADDLES_COMPILED } }
@@ -8428,6 +8434,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_X87_CMP_LEAN {
             add(0x7A11_0017);
+        }
+        if JIT_GG_THROUGH_RUNS {
+            add(0x7A11_0018);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

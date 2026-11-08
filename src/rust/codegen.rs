@@ -6470,7 +6470,7 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
     gen_task_switch_test(ctx);
     gen_mark_fpu_simd_dirty_once(ctx);
     gen_fpu_pc_cache_prepare(ctx);
-    if ctx.builder.gg.active {
+    if ctx.builder.gg.active && !crate::jit::gg_through_runs_enabled() {
         ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
     }
 
@@ -6907,7 +6907,7 @@ fn gen_x87_run_compare(ctx: &mut JitContext, status: &WasmLocal, x: &WasmLocalI6
 pub fn gen_x87_run_join(ctx: &mut JitContext) {
     ctx.builder.block_end();
     gen_fpu_pc_cache_free(ctx);
-    if ctx.builder.gg.active {
+    if ctx.builder.gg.active && !crate::jit::gg_through_runs_enabled() {
         ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
     }
 }
