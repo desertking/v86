@@ -1368,6 +1368,12 @@ pub fn set_jit_adc8_cf_direct(on: u32) { unsafe { JIT_ADC8_CF_DIRECT = on != 0 }
 #[no_mangle]
 pub fn get_jit_adc8_cf_direct() -> u32 { unsafe { JIT_ADC8_CF_DIRECT as u32 } }
 pub fn adc8_cf_direct_enabled() -> bool { unsafe { JIT_ADC8_CF_DIRECT } }
+static mut JIT_PF_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_pf_inline(on: u32) { unsafe { JIT_PF_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_pf_inline() -> u32 { unsafe { JIT_PF_INLINE as u32 } }
+pub fn pf_inline_enabled() -> bool { unsafe { JIT_PF_INLINE } }
 static mut JIT_SMC_EXIT_LOCAL: bool = false;
 #[no_mangle]
 pub fn set_jit_smc_exit_local(on: u32) { unsafe { JIT_SMC_EXIT_LOCAL = on != 0 } }
@@ -8716,6 +8722,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_ADC8_CF_DIRECT {
             add(0x7A11_0025);
+        }
+        if JIT_PF_INLINE {
+            add(0x7A11_0026);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

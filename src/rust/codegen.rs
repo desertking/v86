@@ -5924,6 +5924,35 @@ pub fn gen_trigger_gp(ctx: &mut JitContext, error_code: u32) {
     ctx.builder.br(ctx.exit_with_fault_label);
 }
 
+fn gen_getpf_inline(ctx: &mut JitContext, negate: bool) {
+    gen_get_flags_changed(ctx.builder);
+    ctx.builder.const_i32(FLAG_PARITY);
+    ctx.builder.and_i32();
+    ctx.builder.if_i32();
+    ctx.builder.const_i32(0x9669 << 2);
+    gen_get_last_result(ctx.builder, &Instruction::Other);
+    let r = ctx.builder.tee_new_local();
+    ctx.builder.get_local(&r);
+    ctx.builder.const_i32(4);
+    ctx.builder.shr_u_i32();
+    ctx.builder.xor_i32();
+    ctx.builder.const_i32(15);
+    ctx.builder.and_i32();
+    ctx.builder.shr_u_i32();
+    ctx.builder.free_local(r);
+    ctx.builder.else_();
+    gen_get_flags(ctx.builder);
+    ctx.builder.block_end();
+    ctx.builder.const_i32(2);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(1);
+    ctx.builder.and_i32();
+    if negate {
+        ctx.builder.const_i32(1);
+        ctx.builder.xor_i32();
+    }
+}
+
 pub fn gen_condition_fn_negated(ctx: &mut JitContext, condition: u8) {
     gen_condition_fn(ctx, condition ^ 1)
 }
@@ -6052,6 +6081,12 @@ pub fn gen_condition_fn(ctx: &mut JitContext, condition: u8) {
             },
             0x9 => {
                 gen_getsf(ctx, ConditionNegate::True);
+            },
+            0xA if jit::pf_inline_enabled() => {
+                gen_getpf_inline(ctx, false);
+            },
+            0xB if jit::pf_inline_enabled() => {
+                gen_getpf_inline(ctx, true);
             },
             0xA => {
                 gen_profiler_stat_increment(ctx.builder, profiler::stat::CONDITION_UNOPTIMISED);
