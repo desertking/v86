@@ -765,9 +765,119 @@ fn sse_bitwise_xmm_xmm_v128(ctx: &mut JitContext, r1: u32, r2: u32, op: SseBitOp
     ctx.builder.store_aligned_v128(0);
 }
 
+
+const SIMD_I64X2_SPLAT: u32 = 0x12;
+const SIMD_I64X2_EXTRACT_LANE: u32 = 0x1D;
+const SIMD_I8X16_NARROW_I16X8_U: u32 = 0x66;
+const SIMD_I16X8_SHL: u32 = 0x8B;
+const SIMD_I16X8_SHR_S: u32 = 0x8C;
+const SIMD_I16X8_SHR_U: u32 = 0x8D;
+const SIMD_I16X8_ADD: u32 = 0x8E;
+
+fn mmx_inline() -> bool { crate::jit::mmx_inline_enabled() }
+
+fn mmx_inline_kind(name: &str) -> Option<u8> {
+    match name {
+        "instr_0FFD" => Some(0),
+        "instr_0F60" => Some(1),
+        "instr_0F68" => Some(2),
+        "instr_0F67" => Some(3),
+        _ => None,
+    }
+}
+
+fn mmx_write_and_transition(ctx: &mut JitContext, r: u32, value: &WasmLocalI64) {
+    let off = global_pointers::get_reg_mmx_offset(r);
+    ctx.builder.const_i32(off as i32);
+    ctx.builder.get_local_i64(value);
+    ctx.builder.store_aligned_i64(0);
+    ctx.builder.const_i32(off as i32 + 8);
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.store_aligned_u16(0);
+    mmx_transition_inline(ctx);
+}
+
+fn mmx_transition_inline(ctx: &mut JitContext) {
+    ctx.builder.const_i32(global_pointers::fpu_stack_empty as i32);
+    ctx.builder.const_i32(0);
+    ctx.builder.store_u8(0);
+    ctx.builder.const_i32(global_pointers::fpu_stack_ptr as i32);
+    ctx.builder.const_i32(0);
+    ctx.builder.store_u8(0);
+    codegen::gen_mark_fpu_simd_dirty(ctx.builder);
+    ctx.builder.x87_top_ready = false;
+}
+
+fn mmx_get(ctx: &mut JitContext, r: u32) {
+    ctx.builder.const_i32(global_pointers::get_reg_mmx_offset(r) as i32);
+    ctx.builder.load_aligned_i64(0);
+}
+
+fn mmx_binop_inline(ctx: &mut JitContext, kind: u8, r: u32) {
+    let s = ctx.builder.set_new_local_i64();
+    match kind {
+        3 => {
+            mmx_get(ctx, r);
+            ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
+            mmx_get(ctx, r);
+            ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
+            ctx.builder.simd_op_u32(SIMD_I8X16_NARROW_I16X8_U);
+            ctx.builder.simd_op_lane(SIMD_I64X2_EXTRACT_LANE, 0);
+            ctx.builder.const_i64(0xFFFF_FFFF);
+            ctx.builder.and_i64();
+            ctx.builder.get_local_i64(&s);
+            ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
+            ctx.builder.get_local_i64(&s);
+            ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
+            ctx.builder.simd_op_u32(SIMD_I8X16_NARROW_I16X8_U);
+            ctx.builder.simd_op_lane(SIMD_I64X2_EXTRACT_LANE, 0);
+            ctx.builder.const_i64(32);
+            ctx.builder.shl_i64();
+            ctx.builder.or_i64();
+        },
+        _ => {
+            mmx_get(ctx, r);
+            ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
+            ctx.builder.get_local_i64(&s);
+            ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
+            match kind {
+                0 => ctx.builder.simd_op_u32(SIMD_I16X8_ADD),
+                1 => ctx.builder.simd_shuffle([0, 16, 1, 17, 2, 18, 3, 19, 0, 0, 0, 0, 0, 0, 0, 0]),
+                _ => ctx.builder.simd_shuffle([4, 20, 5, 21, 6, 22, 7, 23, 0, 0, 0, 0, 0, 0, 0, 0]),
+            }
+            ctx.builder.simd_op_lane(SIMD_I64X2_EXTRACT_LANE, 0);
+        },
+    }
+    let res = ctx.builder.set_new_local_i64();
+    mmx_write_and_transition(ctx, r, &res);
+    ctx.builder.free_local_i64(res);
+    ctx.builder.free_local_i64(s);
+}
+
+fn mmx_shift_imm_inline(ctx: &mut JitContext, r: u32, imm8: u32, op: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    if imm8 > 15 && op != SIMD_I16X8_SHR_S {
+        ctx.builder.const_i64(0);
+    }
+    else {
+        mmx_get(ctx, r);
+        ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
+        ctx.builder.const_i32(imm8.min(15) as i32);
+        ctx.builder.simd_op_u32(op);
+        ctx.builder.simd_op_lane(SIMD_I64X2_EXTRACT_LANE, 0);
+    }
+    let res = ctx.builder.set_new_local_i64();
+    mmx_write_and_transition(ctx, r, &res);
+    ctx.builder.free_local_i64(res);
+}
 fn mmx_read64_mm_mem32(ctx: &mut JitContext, name: &str, modrm_byte: ModrmByte, r: u32) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    if let (true, Some(kind)) = (mmx_inline(), mmx_inline_kind(name)) {
+        ctx.builder.extend_unsigned_i32_to_i64();
+        mmx_binop_inline(ctx, kind, r);
+        return;
+    }
     ctx.builder.const_i32(r as i32);
     ctx.builder.call_fn2(name)
 }
@@ -776,12 +886,21 @@ fn mmx_read64_mm_mm32(ctx: &mut JitContext, name: &str, r1: u32, r2: u32) {
     ctx.builder
         .const_i32(global_pointers::get_reg_mmx_offset(r1) as i32);
     ctx.builder.load_aligned_i32(0);
+    if let (true, Some(kind)) = (mmx_inline(), mmx_inline_kind(name)) {
+        ctx.builder.extend_unsigned_i32_to_i64();
+        mmx_binop_inline(ctx, kind, r2);
+        return;
+    }
     ctx.builder.const_i32(r2 as i32);
     ctx.builder.call_fn2(name);
 }
 fn mmx_read64_mm_mem(ctx: &mut JitContext, name: &str, modrm_byte: ModrmByte, r: u32) {
     codegen::gen_mark_fpu_simd_dirty_once(ctx);
     codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    if let (true, Some(kind)) = (mmx_inline(), mmx_inline_kind(name)) {
+        mmx_binop_inline(ctx, kind, r);
+        return;
+    }
     ctx.builder.const_i32(r as i32);
     ctx.builder.call_fn2_i64_i32(name)
 }
@@ -790,6 +909,10 @@ fn mmx_read64_mm_mm(ctx: &mut JitContext, name: &str, r1: u32, r2: u32) {
     ctx.builder
         .const_i32(global_pointers::get_reg_mmx_offset(r1) as i32);
     ctx.builder.load_aligned_i64(0);
+    if let (true, Some(kind)) = (mmx_inline(), mmx_inline_kind(name)) {
+        mmx_binop_inline(ctx, kind, r2);
+        return;
+    }
     ctx.builder.const_i32(r2 as i32);
     ctx.builder.call_fn2_i64_i32(name);
 }
@@ -7731,10 +7854,23 @@ pub fn instr_660F6E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 pub fn instr_0F6F_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     // XXX: Aligned read or #gp
     codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    if mmx_inline() {
+        let v = ctx.builder.set_new_local_i64();
+        mmx_write_and_transition(ctx, r, &v);
+        ctx.builder.free_local_i64(v);
+        return;
+    }
     ctx.builder.const_i32(r as i32);
     ctx.builder.call_fn2_i64_i32("instr_0F6F")
 }
 pub fn instr_0F6F_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if mmx_inline() {
+        mmx_get(ctx, r1);
+        let v = ctx.builder.set_new_local_i64();
+        mmx_write_and_transition(ctx, r2, &v);
+        ctx.builder.free_local_i64(v);
+        return;
+    }
     ctx.builder.const_i32(r1 as i32);
     ctx.builder.const_i32(r2 as i32);
     ctx.builder.call_fn2("instr_0F6F_reg")
@@ -7808,6 +7944,10 @@ pub fn instr_0F71_2_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: 
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_0F71_2_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
+    if mmx_inline() {
+        mmx_shift_imm_inline(ctx, r, imm8, SIMD_I16X8_SHR_U);
+        return;
+    }
     ctx.builder.const_i32(r as i32);
     ctx.builder.const_i32(imm8 as i32);
     ctx.builder.call_fn2("instr_0F71_2_reg");
@@ -7816,6 +7956,10 @@ pub fn instr_0F71_4_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: 
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_0F71_4_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
+    if mmx_inline() {
+        mmx_shift_imm_inline(ctx, r, imm8, SIMD_I16X8_SHR_S);
+        return;
+    }
     ctx.builder.const_i32(r as i32);
     ctx.builder.const_i32(imm8 as i32);
     ctx.builder.call_fn2("instr_0F71_4_reg");
@@ -7824,6 +7968,10 @@ pub fn instr_0F71_6_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte, _imm: 
     codegen::gen_trigger_ud(ctx);
 }
 pub fn instr_0F71_6_reg_jit(ctx: &mut JitContext, r: u32, imm8: u32) {
+    if mmx_inline() {
+        mmx_shift_imm_inline(ctx, r, imm8, SIMD_I16X8_SHL);
+        return;
+    }
     ctx.builder.const_i32(r as i32);
     ctx.builder.const_i32(imm8 as i32);
     ctx.builder.call_fn2("instr_0F71_6_reg");
@@ -8080,15 +8228,31 @@ pub fn instr_660F7E_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 
 pub fn instr_0F7F_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     let address_local = codegen::gen_modrm_resolve_into_local(ctx, modrm_byte);
-    ctx.builder.const_i32(r as i32);
-    ctx.builder.call_fn1_ret_i64("instr_0F7F");
+    if mmx_inline() {
+        mmx_get(ctx, r);
+    }
+    else {
+        ctx.builder.const_i32(r as i32);
+        ctx.builder.call_fn1_ret_i64("instr_0F7F");
+    }
     let value_local = ctx.builder.set_new_local_i64();
     codegen::gen_safe_write64(ctx, &address_local, &value_local);
     ctx.builder.free_local(address_local);
     ctx.builder.free_local_i64(value_local);
+    if mmx_inline() {
+        mmx_transition_inline(ctx);
+        return;
+    }
     ctx.builder.call_fn0("transition_fpu_to_mmx");
 }
 pub fn instr_0F7F_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if mmx_inline() {
+        mmx_get(ctx, r2);
+        let v = ctx.builder.set_new_local_i64();
+        mmx_write_and_transition(ctx, r1, &v);
+        ctx.builder.free_local_i64(v);
+        return;
+    }
     ctx.builder.const_i32(r1 as i32);
     ctx.builder.const_i32(r2 as i32);
     ctx.builder.call_fn2("instr_0F7F_reg")

@@ -1230,6 +1230,18 @@ impl WasmBuilder {
         self.instruction_body.push(op::MEM_NO_ALIGN);
         write_leb_u32(&mut self.instruction_body, byte_offset);
     }
+    pub fn simd_op_u32(&mut self, sub: u32) {
+        self.instruction_body.push(op::OP_SIMD_PREFIX);
+        write_leb_u32(&mut self.instruction_body, sub);
+    }
+    pub fn simd_op_lane(&mut self, sub: u32, lane: u8) {
+        self.simd_op_u32(sub);
+        self.instruction_body.push(lane);
+    }
+    pub fn simd_shuffle(&mut self, lanes: [u8; 16]) {
+        self.simd_op_u32(0x0D);
+        self.instruction_body.extend_from_slice(&lanes);
+    }
     pub fn and_v128(&mut self) {
         self.instruction_body.push(op::OP_SIMD_PREFIX);
         self.instruction_body.push(op::SIMD_V128_AND);
@@ -1337,6 +1349,7 @@ impl WasmBuilder {
     pub fn and_i32(&mut self) { self.instruction_body.push(op::OP_I32AND); }
     pub fn or_i32(&mut self) { self.instruction_body.push(op::OP_I32OR); }
     pub fn or_i64(&mut self) { self.instruction_body.push(op::OP_I64OR); }
+    pub fn and_i64(&mut self) { self.instruction_body.push(op::OP_I64AND); }
     pub fn xor_i32(&mut self) { self.instruction_body.push(op::OP_I32XOR); }
     pub fn mul_i32(&mut self) { self.instruction_body.push(op::OP_I32MUL); }
     pub fn mul_i64(&mut self) { self.instruction_body.push(op::OP_I64MUL); }
