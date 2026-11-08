@@ -298,8 +298,10 @@ pub fn gen_set_reg8_unmasked(ctx: &mut JitContext, r: u32) {
             // reg32[r] = stack_value << 8 | reg32[r] & ~0xFF00
             ctx.builder.const_i32(8);
             ctx.builder.shl_i32();
-            ctx.builder.const_i32(0xFF00);
-            ctx.builder.and_i32();
+            if !jit::reg8_lean_enabled() {
+                ctx.builder.const_i32(0xFF00);
+                ctx.builder.and_i32();
+            }
 
             ctx.builder
                 .get_local(&ctx.register_locals[(r - 4) as usize]);
@@ -807,7 +809,9 @@ fn gg_note_access(ctx: &mut JitContext, kind: u8, bits: BitSize, address_local: 
         return GgRole::None;
     }
     let desc = gg_lookup(ctx, address_local);
-    let top = ctx.builder.gg.in_insn && ctx.builder.depth() == ctx.builder.gg.insn_depth;
+    let top = ctx.builder.gg.in_insn
+        && ctx.builder.depth() == ctx.builder.gg.insn_depth
+        && !(ctx.x87_run_left > 0 && jit::gg_through_runs_enabled());
     let ev = GgEvent::Access { at: ctx.start_of_current_instruction, kind, width: bits.bytes() as u8, desc, top };
     ctx.builder.gg.log.push(ev);
     let ord = ctx.gg.ord;
@@ -1167,6 +1171,9 @@ fn gen_safe_read_write_grouped(
         BitSize::DWORD => ctx.builder.load_unaligned_i32(0),
         BitSize::QWORD => ctx.builder.load_unaligned_i64(0),
         BitSize::DQWORD => assert!(false),
+    }
+    if ctx.flags_mat_until == ctx.start_of_current_instruction {
+        ctx.builder.pending_flags = None;
     }
     f(ctx);
     let value_local = if bits == BitSize::QWORD {
@@ -2612,6 +2619,9 @@ pub fn gen_safe_read_write(
 
     // value is now on stack
 
+    if ctx.flags_mat_until == ctx.start_of_current_instruction {
+        ctx.builder.pending_flags = None;
+    }
     f(ctx);
 
     // TODO: Could get rid of this local by returning one from f
@@ -6914,13 +6924,17 @@ pub fn gen_x87_run_join(ctx: &mut JitContext) {
 
 pub fn gen_smc_exit_check(ctx: &mut JitContext, eip_offset: i32, remaining: u32) {
     let pending = crate::jit::smc_exit_pending_addr();
-    ctx.builder.load_fixed_u8(pending);
+    match ctx.builder.smc_local {
+        Some(idx) => ctx.builder.get_local_raw(idx),
+        None => ctx.builder.load_fixed_u8(pending),
+    }
     ctx.builder.if_void();
     ctx.builder.const_i32(pending as i32);
     ctx.builder.const_i32(0);
     ctx.builder.store_u8(0);
     ctx.builder.increment_fixed_i64(crate::jit::smc_exits_addr(), 1);
     gen_set_eip_low_bits(ctx.builder, eip_offset);
+    ctx.builder.materialize_pending_flags();
     if remaining != 0 {
         ctx.builder.get_local(&ctx.instruction_counter);
         ctx.builder.const_i32(remaining as i32);

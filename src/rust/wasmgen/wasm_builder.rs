@@ -122,6 +122,8 @@ pub struct WasmBuilder {
     // (unknown helper = spilled = safe; covers arith flag-protocol helpers AND
     // OUT/hypercall thunks whose context switches read cpu.get_eflags()).
     pub flag_locals: Option<[(u8, u32); 5]>,
+    pub pending_flags: Option<PendingFlags>,
+    pub smc_local: Option<u8>,
     pub x87_top_local: Option<u8>,
     pub x87_top_ready: bool,
     /// Which flag locals may differ from their memory globals at this point in the emission.
@@ -322,6 +324,26 @@ fn flag_sync_stat_addr(i: usize) -> u32 { unsafe { (&raw mut FLAG_SYNC_STATS[i])
 
 #[derive(Eq, PartialEq)]
 pub struct WasmLocal(u8);
+
+#[derive(Clone, Copy)]
+pub struct FlagRecon {
+    pub a: u8,
+    pub b: Option<(u8, u8)>,
+    pub k: Option<(i32, u8)>,
+}
+
+#[derive(Clone, Copy)]
+pub struct PendingFlags {
+    pub op1: Option<FlagRecon>,
+    pub result: FlagRecon,
+    pub size: i32,
+    pub changed: i32,
+    pub clear: i32,
+}
+
+pub const RECON_ADD: u8 = 0;
+pub const RECON_SUB: u8 = 1;
+pub const RECON_AND: u8 = 2;
 impl WasmLocal {
     pub fn idx(&self) -> u8 { self.0 }
     /// Unsafe: Can result in multiple free's. Should only be used for locals that are used during
@@ -370,6 +392,8 @@ impl WasmBuilder {
             local_count: 0,
             arg_local_initial_state: WasmLocal(0),
             flag_locals: None,
+            pending_flags: None,
+            smc_local: None,
             x87_top_local: None,
             x87_top_ready: false,
             flag_dirty: 0,
@@ -411,6 +435,8 @@ impl WasmBuilder {
         self.free_locals_i64.clear();
         self.local_count = 0;
         self.flag_locals = None;
+        self.pending_flags = None;
+        self.smc_local = None;
         self.x87_top_local = None;
         self.x87_top_ready = false;
         self.flag_dirty = 0;
@@ -1512,7 +1538,11 @@ impl WasmBuilder {
     }
 
     fn call_fn(&mut self, name: &str, function: FunctionType) {
-        if name.starts_with("safe_write") || name.starts_with("safe_read_write") {
+        if self.pending_flags.is_some() {
+            self.materialize_pending_flags();
+        }
+        let code_write = name.starts_with("safe_write") || name.starts_with("safe_read_write");
+        if code_write {
             self.code_write_call_seen = true;
         }
         if self.gg.active && self.gg.in_insn && !crate::analysis::gg_call_is_transparent(name) {
@@ -1530,6 +1560,9 @@ impl WasmBuilder {
             self.instruction_body.push(op::OP_CALL);
             write_leb_u32(&mut self.instruction_body, i as u32);
             self.x87_top_resync();
+            if code_write {
+                self.smc_local_note();
+            }
             return;
         }
         let dry = self.gg.dry_run;
@@ -1567,6 +1600,91 @@ impl WasmBuilder {
         write_leb_u32(&mut self.instruction_body, i as u32);
         self.emit_flag_reload_masked(reload_mask);
         self.x87_top_resync();
+        if code_write {
+            self.smc_local_note();
+        }
+    }
+
+    fn smc_local_note(&mut self) {
+        if let Some(idx) = self.smc_local {
+            self.load_fixed_u8(crate::jit::smc_exit_pending_addr());
+            self.set_local_raw(idx);
+        }
+    }
+
+    fn emit_recon_op(&mut self, op: u8) {
+        match op {
+            RECON_ADD => self.add_i32(),
+            RECON_SUB => self.sub_i32(),
+            _ => self.and_i32(),
+        }
+    }
+
+    fn emit_recon(&mut self, r: FlagRecon) {
+        self.get_local_raw(r.a);
+        if let Some((b, op)) = r.b {
+            self.get_local_raw(b);
+            self.emit_recon_op(op);
+        }
+        if let Some((k, op)) = r.k {
+            self.const_i32(k);
+            self.emit_recon_op(op);
+        }
+    }
+
+    pub fn materialize_pending_flags(&mut self) {
+        let p = match self.pending_flags.take() {
+            Some(p) => p,
+            None => return,
+        };
+        let gp = crate::cpu::global_pointers::last_op1 as i32;
+        let gr = crate::cpu::global_pointers::last_result as i32;
+        let gs = crate::cpu::global_pointers::last_op_size as i32;
+        let gf = crate::cpu::global_pointers::flags as u32;
+        let locals = self.flag_locals.is_some();
+        if let Some(op1) = p.op1 {
+            if locals {
+                self.emit_recon(op1);
+                self.flag_local_set(0);
+            }
+            else {
+                self.const_i32(gp);
+                self.emit_recon(op1);
+                self.store_aligned_i32(0);
+            }
+        }
+        if locals {
+            self.emit_recon(p.result);
+            self.flag_local_set(1);
+            self.const_i32(p.size);
+            self.flag_local_set(2);
+            self.const_i32(p.changed);
+            self.flag_local_set(3);
+        }
+        else {
+            self.const_i32(gr);
+            self.emit_recon(p.result);
+            self.store_aligned_i32(0);
+            self.const_i32(gs);
+            self.const_i64(p.size as u32 as i64 | (p.changed as u32 as i64) << 32);
+            self.store_aligned_i64(0);
+        }
+        if p.clear != 0 {
+            if locals {
+                self.flag_local_get(4);
+                self.const_i32(!p.clear);
+                self.and_i32();
+                self.flag_local_set(4);
+            }
+            else {
+                self.const_i32(gf as i32);
+                self.load_fixed_i32(gf);
+                self.const_i32(!p.clear);
+                self.and_i32();
+                self.store_aligned_i32(0);
+            }
+        }
+        self.pending_flags = Some(p);
     }
 
     pub fn x87_top_get(&mut self) {

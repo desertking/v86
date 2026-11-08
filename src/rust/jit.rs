@@ -21,7 +21,7 @@ use crate::profiler;
 use crate::profiler::stat;
 use crate::state_flags::CachedStateFlags;
 use crate::trace_profiler;
-use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal, WasmLocalI64};
+use crate::wasmgen::wasm_builder::{Label, PendingFlags, WasmBuilder, WasmLocal, WasmLocalI64};
 
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
 #[repr(transparent)]
@@ -1341,6 +1341,32 @@ pub fn set_jit_incdec_cf_keep(on: u32) { unsafe { JIT_INCDEC_CF_KEEP = on != 0 }
 #[no_mangle]
 pub fn get_jit_incdec_cf_keep() -> u32 { unsafe { JIT_INCDEC_CF_KEEP as u32 } }
 pub fn incdec_cf_keep_enabled() -> bool { unsafe { JIT_INCDEC_CF_KEEP } }
+static mut JIT_LOOP_EIP_LAZY: bool = false;
+#[no_mangle]
+pub fn set_jit_loop_eip_lazy(on: u32) { unsafe { JIT_LOOP_EIP_LAZY = on != 0 } }
+#[no_mangle]
+pub fn get_jit_loop_eip_lazy() -> u32 { unsafe { JIT_LOOP_EIP_LAZY as u32 } }
+pub fn loop_eip_lazy_enabled() -> bool { unsafe { JIT_LOOP_EIP_LAZY } }
+static mut JIT_FLAGS_FAULT_MAT: bool = false;
+#[no_mangle]
+pub fn set_jit_flags_fault_mat(on: u32) { unsafe { JIT_FLAGS_FAULT_MAT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_flags_fault_mat() -> u32 { unsafe { JIT_FLAGS_FAULT_MAT as u32 } }
+pub fn flags_fault_mat_enabled() -> bool { unsafe { JIT_FLAGS_FAULT_MAT } }
+static mut FLAGS_FAULT_MAT_COMPILED: u32 = 0;
+#[no_mangle]
+pub fn jit_flags_fault_mat_compiled() -> u32 { unsafe { FLAGS_FAULT_MAT_COMPILED } }
+static mut JIT_REG8_LEAN: bool = false;
+#[no_mangle]
+pub fn set_jit_reg8_lean(on: u32) { unsafe { JIT_REG8_LEAN = on != 0 } }
+#[no_mangle]
+pub fn get_jit_reg8_lean() -> u32 { unsafe { JIT_REG8_LEAN as u32 } }
+pub fn reg8_lean_enabled() -> bool { unsafe { JIT_REG8_LEAN } }
+static mut JIT_SMC_EXIT_LOCAL: bool = false;
+#[no_mangle]
+pub fn set_jit_smc_exit_local(on: u32) { unsafe { JIT_SMC_EXIT_LOCAL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_smc_exit_local() -> u32 { unsafe { JIT_SMC_EXIT_LOCAL as u32 } }
 pub fn next_overwrites_all_but_cf(ctx: &JitContext) -> bool {
     let addr = ctx.cpu.eip;
     if addr > ctx.block_last_instruction || !ctx.cpu.state_flags.is_32() {
@@ -3371,6 +3397,7 @@ pub struct JitContext<'a> {
     pub block_last_instruction: u32,
     pub cf_in_flags: bool,
     pub cf_in_flags_next: bool,
+    pub flags_mat_until: u32,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -3633,6 +3660,145 @@ fn flags_dead_from_addr(
         // original single-block behavior.
         _ => false,
     }
+}
+
+fn fault_mat_step(addr: u32) -> Option<(bool, u8)> {
+    let (opcode, operand_addr) = decode_jit_opcode(addr);
+    let modrm = read_jit_u8(operand_addr);
+    let reg_only = modrm & 0xC0 == 0xC0;
+    let r = modrm >> 3 & 7;
+    let rm = modrm & 7;
+    let b8 = |x: u8| 1u8 << (x & 3);
+    let b32 = |x: u8| 1u8 << x;
+    match opcode {
+        0x88 => Some((!reg_only, if reg_only { b8(rm) } else { 0 })),
+        0x89 => Some((!reg_only, if reg_only { b32(rm) } else { 0 })),
+        0x8A => Some((!reg_only, b8(r))),
+        0x8B => Some((!reg_only, b32(r))),
+        0x8D if !reg_only => Some((false, b32(r))),
+        0xB0..=0xB7 => Some((false, b8(opcode as u8 & 7))),
+        0xB8..=0xBF => Some((false, b32(opcode as u8 & 7))),
+        0xC6 if r == 0 => Some((!reg_only, if reg_only { b8(rm) } else { 0 })),
+        0xC7 if r == 0 => Some((!reg_only, if reg_only { b32(rm) } else { 0 })),
+        0x90 => Some((false, 0)),
+        0x1B6 | 0x1B7 | 0x1BE | 0x1BF => Some((!reg_only, b32(r))),
+        _ => None,
+    }
+}
+
+fn flags_dead_through_faults(cpu: &CpuContext, current_addr: u32, block: &BasicBlock) -> Option<(u32, u8)> {
+    if !matches!(classify_flag_class(current_addr), FlagClass::Overwrite { .. }) {
+        return None;
+    }
+    let mut addr = instruction_end(cpu, current_addr);
+    let mut clobber = 0u8;
+    let mut faults = false;
+    let mut steps = 0;
+    while addr > current_addr && addr < block.end_addr && steps < FLAG_LIVENESS_WALK_LIMIT {
+        if let FlagClass::Overwrite { non_faulting } = classify_flag_class(addr) {
+            return if faults || !non_faulting { Some((addr, clobber)) } else { None };
+        }
+        let (f, w) = fault_mat_step(addr)?;
+        faults |= f;
+        clobber |= w;
+        addr = instruction_end(cpu, addr);
+        steps += 1;
+    }
+    None
+}
+
+fn read_jit_u32(addr: u32) -> u32 {
+    read_jit_u8(addr) as u32
+        | (read_jit_u8(addr + 1) as u32) << 8
+        | (read_jit_u8(addr + 2) as u32) << 16
+        | (read_jit_u8(addr + 3) as u32) << 24
+}
+
+fn flags_mat_recipe(ctx: &JitContext, addr: u32, clobber: u8) -> Option<PendingFlags> {
+    use crate::wasmgen::wasm_builder::{FlagRecon, RECON_ADD, RECON_AND, RECON_SUB};
+    if !ctx.cpu.state_flags.is_32() {
+        return None;
+    }
+    #[derive(PartialEq, Clone, Copy)]
+    enum K {
+        Add,
+        Sub,
+        Cmp,
+        Logic,
+        Test,
+    }
+    let alu = |g: u8| match g {
+        0 => Some(K::Add),
+        1 | 4 | 6 => Some(K::Logic),
+        5 => Some(K::Sub),
+        7 => Some(K::Cmp),
+        _ => None,
+    };
+    let op = read_jit_u8(addr);
+    let modrm = read_jit_u8(addr + 1);
+    let reg_only = modrm & 0xC0 == 0xC0;
+    let (k, d, s_reg, imm): (K, u8, Option<u8>, i32) = match op {
+        0x01 | 0x09 | 0x21 | 0x29 | 0x31 | 0x39 if reg_only => {
+            (alu(op >> 3)?, modrm & 7, Some(modrm >> 3 & 7), 0)
+        },
+        0x85 if reg_only => (K::Test, modrm & 7, Some(modrm >> 3 & 7), 0),
+        0x03 | 0x0B | 0x23 | 0x2B | 0x33 | 0x3B if reg_only => {
+            (alu(op >> 3)?, modrm >> 3 & 7, Some(modrm & 7), 0)
+        },
+        0x05 | 0x0D | 0x25 | 0x2D | 0x35 | 0x3D => (alu(op >> 3)?, 0, None, read_jit_u32(addr + 1) as i32),
+        0xA9 => (K::Test, 0, None, read_jit_u32(addr + 1) as i32),
+        0x81 if reg_only => (alu(modrm >> 3 & 7)?, modrm & 7, None, read_jit_u32(addr + 2) as i32),
+        0x83 if reg_only => (alu(modrm >> 3 & 7)?, modrm & 7, None, read_jit_u8(addr + 2) as i8 as i32),
+        0xF7 if reg_only && modrm >> 3 & 7 == 0 => (K::Test, modrm & 7, None, read_jit_u32(addr + 2) as i32),
+        _ => return None,
+    };
+    if clobber & (1 << d) != 0 {
+        return None;
+    }
+    if let Some(s) = s_reg {
+        if clobber & (1 << s) != 0 || s == d && (k == K::Add || k == K::Sub) {
+            return None;
+        }
+    }
+    let dl = ctx.register_locals[d as usize].idx();
+    let src = |op: u8| -> (Option<(u8, u8)>, Option<(i32, u8)>) {
+        match s_reg {
+            Some(s) => (Some((ctx.register_locals[s as usize].idx(), op)), None),
+            None => (None, Some((imm, op))),
+        }
+    };
+    let plain = FlagRecon { a: dl, b: None, k: None };
+    let with = |op: u8| {
+        let (b, kk) = src(op);
+        FlagRecon { a: dl, b, k: kk }
+    };
+    let logic_changed = cpu::FLAGS_ALL & !cpu::FLAG_CARRY & !cpu::FLAG_OVERFLOW & !cpu::FLAG_ADJUST;
+    let logic_clear = cpu::FLAG_CARRY | cpu::FLAG_OVERFLOW | cpu::FLAG_ADJUST;
+    Some(match k {
+        K::Add => PendingFlags { op1: Some(with(RECON_SUB)), result: plain, size: cpu::OPSIZE_32, changed: cpu::FLAGS_ALL, clear: 0 },
+        K::Sub => PendingFlags {
+            op1: Some(with(RECON_ADD)),
+            result: plain,
+            size: cpu::OPSIZE_32,
+            changed: cpu::FLAGS_ALL | cpu::FLAG_SUB,
+            clear: 0,
+        },
+        K::Cmp => PendingFlags {
+            op1: Some(plain),
+            result: with(RECON_SUB),
+            size: cpu::OPSIZE_32,
+            changed: cpu::FLAGS_ALL | cpu::FLAG_SUB,
+            clear: 0,
+        },
+        K::Logic => PendingFlags { op1: None, result: plain, size: cpu::OPSIZE_32, changed: logic_changed, clear: logic_clear },
+        K::Test => PendingFlags {
+            op1: None,
+            result: if s_reg == Some(d) { plain } else { with(RECON_AND) },
+            size: cpu::OPSIZE_32,
+            changed: logic_changed,
+            clear: logic_clear,
+        },
+    })
 }
 
 fn should_elide_current_flags(
@@ -6198,6 +6364,13 @@ fn jit_generate_module(
         }
     }
 
+    if unsafe { JIT_SMC_EXIT_LOCAL && JIT_SMC_EXIT } {
+        builder.const_i32(0);
+        let l = builder.set_new_local();
+        builder.smc_local = Some(l.idx());
+        std::mem::forget(l);
+    }
+
     if unsafe { JIT_X87_TOP_LOCAL } && crate::softfloat::is_fpu_relaxed() {
         builder.const_i32(0);
         let l = builder.set_new_local();
@@ -6271,6 +6444,7 @@ fn jit_generate_module(
         block_last_instruction: 0,
         cf_in_flags: false,
         cf_in_flags_next: false,
+        flags_mat_until: 0,
         x87_cache_kept: false,
         x87_run_left: 0,
         gg,
@@ -7092,7 +7266,20 @@ fn jit_generate_module(
                 let label = ctx.builder.loop_void();
                 codegen::gen_profiler_stat_increment(ctx.builder, stat::LOOP);
 
-                if entries.len() == 1 {
+                if entries.len() == 1 && loop_eip_lazy_enabled() && !cfg!(feature = "profiler") {
+                    let addr = entries[0];
+                    profiler::stat_increment(stat::COMPILE_WITH_LOOP_SAFETY);
+                    if unsafe { JIT_USE_LOOP_SAFETY } {
+                        ctx.builder.get_local(&ctx.instruction_counter);
+                        ctx.builder.const_i32(cpu::LOOP_COUNTER);
+                        ctx.builder.geu_i32();
+                        ctx.builder.if_void();
+                        codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
+                        ctx.builder.br(exit_label);
+                        ctx.builder.block_end();
+                    }
+                }
+                else if entries.len() == 1 {
                     let addr = entries[0];
                     codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
                     profiler::stat_increment(stat::COMPILE_WITH_LOOP_SAFETY);
@@ -7490,6 +7677,8 @@ fn jit_generate_basic_block(
     ctx.previous_instruction = Instruction::Other;
     ctx.fpu_simd_dirty_marked = dirty_in;
     ctx.elide_current_flags = false;
+    ctx.builder.pending_flags = None;
+    ctx.flags_mat_until = 0;
     let mut cond_skip_open: Option<(bool, bool)> = None;
 
     loop {
@@ -7565,6 +7754,22 @@ fn jit_generate_basic_block(
         let start_eip = ctx.cpu.eip;
         ctx.elide_current_flags =
             should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks, loop_heads);
+        let mut flags_mat: Option<(PendingFlags, u32)> = None;
+        if !ctx.elide_current_flags
+            && flags_fault_mat_enabled()
+            && dead_flag_elision_enabled()
+            && cond_skip_open.is_none()
+        {
+            if let Some((until, clobber)) = flags_dead_through_faults(&*ctx.cpu, start_eip, block) {
+                if let Some(p) = flags_mat_recipe(ctx, start_eip, clobber) {
+                    ctx.elide_current_flags = true;
+                    flags_mat = Some((p, until));
+                    if !codegen_dry_run() {
+                        unsafe { FLAGS_FAULT_MAT_COMPILED = FLAGS_FAULT_MAT_COMPILED.wrapping_add(1) }
+                    }
+                }
+            }
+        }
         // Relaxed x87 wrappers set this when they keep the st cache coherent.
         ctx.x87_cache_kept = false;
         ctx.fpu_pc_cache_kept = false;
@@ -7590,6 +7795,14 @@ fn jit_generate_basic_block(
             ctx.cf_in_flags = mem::replace(&mut ctx.cf_in_flags_next, false);
             jit_instructions::jit_instruction(ctx, &mut instruction_flags);
             ctx.cf_in_flags = false;
+        }
+        if ctx.flags_mat_until == start_eip {
+            ctx.builder.pending_flags = None;
+            ctx.flags_mat_until = 0;
+        }
+        if let Some((p, until)) = flags_mat {
+            ctx.builder.pending_flags = Some(p);
+            ctx.flags_mat_until = until;
         }
         let end_eip = ctx.cpu.eip;
         if ctx.cr0_fpu_ok && opcode_may_write_cr0(start_eip) {
@@ -8482,6 +8695,18 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_INCDEC_CF_KEEP {
             add(0x7A11_001B);
+        }
+        if JIT_LOOP_EIP_LAZY {
+            add(0x7A11_0021);
+        }
+        if JIT_FLAGS_FAULT_MAT {
+            add(0x7A11_0022);
+        }
+        if JIT_REG8_LEAN {
+            add(0x7A11_0023);
+        }
+        if JIT_SMC_EXIT_LOCAL && JIT_SMC_EXIT {
+            add(0x7A11_0024);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
