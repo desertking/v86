@@ -1646,6 +1646,7 @@ fn gen_adc_sbb8_inline(
     let res = ctx.builder.set_new_local();
 
     if crate::jit::adc_cf_only_enabled() && crate::jit::next_overwrites_all_but_cf(ctx) {
+        ctx.cf_in_flags_next = crate::jit::incdec_cf_keep_enabled();
         codegen::gen_set_last_op_size_and_flags_changed(ctx.builder, OPSIZE_8, 0);
         ctx.builder.const_i32(global_pointers::flags as i32);
         codegen::gen_get_flags(ctx.builder);
@@ -3055,13 +3056,15 @@ pub fn instr32_3D_jit(ctx: &mut JitContext, imm32: u32) {
 }
 
 fn gen_inc(ctx: &mut JitContext, dest_operand: &WasmLocal, size: i32) {
-    ctx.builder.const_i32(global_pointers::flags as i32);
-    codegen::gen_get_flags(ctx.builder);
-    ctx.builder.const_i32(!1);
-    ctx.builder.and_i32();
-    codegen::gen_getcf(ctx, ConditionNegate::False);
-    ctx.builder.or_i32();
-    ctx.builder.flag_store_i32(4);
+    if !ctx.cf_in_flags {
+        ctx.builder.const_i32(global_pointers::flags as i32);
+        codegen::gen_get_flags(ctx.builder);
+        ctx.builder.const_i32(!1);
+        ctx.builder.and_i32();
+        codegen::gen_getcf(ctx, ConditionNegate::False);
+        ctx.builder.or_i32();
+        ctx.builder.flag_store_i32(4);
+    }
 
     ctx.builder.const_i32(global_pointers::last_op1 as i32);
     ctx.builder.get_local(&dest_operand);
@@ -3108,13 +3111,15 @@ fn gen_inc32(ctx: &mut JitContext, dest_operand: &WasmLocal) {
 }
 
 fn gen_dec(ctx: &mut JitContext, dest_operand: &WasmLocal, size: i32) {
-    ctx.builder.const_i32(global_pointers::flags as i32);
-    codegen::gen_get_flags(ctx.builder);
-    ctx.builder.const_i32(!1);
-    ctx.builder.and_i32();
-    codegen::gen_getcf(ctx, ConditionNegate::False);
-    ctx.builder.or_i32();
-    ctx.builder.flag_store_i32(4);
+    if !ctx.cf_in_flags {
+        ctx.builder.const_i32(global_pointers::flags as i32);
+        codegen::gen_get_flags(ctx.builder);
+        ctx.builder.const_i32(!1);
+        ctx.builder.and_i32();
+        codegen::gen_getcf(ctx, ConditionNegate::False);
+        ctx.builder.or_i32();
+        ctx.builder.flag_store_i32(4);
+    }
 
     ctx.builder.const_i32(global_pointers::last_op1 as i32);
     ctx.builder.get_local(&dest_operand);

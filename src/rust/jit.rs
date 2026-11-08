@@ -1335,6 +1335,12 @@ pub fn set_jit_adc_cf_only(on: u32) { unsafe { JIT_ADC_CF_ONLY = on != 0 } }
 #[no_mangle]
 pub fn get_jit_adc_cf_only() -> u32 { unsafe { JIT_ADC_CF_ONLY as u32 } }
 pub fn adc_cf_only_enabled() -> bool { unsafe { JIT_ADC_CF_ONLY } }
+static mut JIT_INCDEC_CF_KEEP: bool = false;
+#[no_mangle]
+pub fn set_jit_incdec_cf_keep(on: u32) { unsafe { JIT_INCDEC_CF_KEEP = on != 0 } }
+#[no_mangle]
+pub fn get_jit_incdec_cf_keep() -> u32 { unsafe { JIT_INCDEC_CF_KEEP as u32 } }
+pub fn incdec_cf_keep_enabled() -> bool { unsafe { JIT_INCDEC_CF_KEEP } }
 pub fn next_overwrites_all_but_cf(ctx: &JitContext) -> bool {
     let addr = ctx.cpu.eip;
     if addr > ctx.block_last_instruction || !ctx.cpu.state_flags.is_32() {
@@ -3363,6 +3369,8 @@ pub struct JitContext<'a> {
     pub cr0_fpu_ok: bool,
     pub cr0_killed: bool,
     pub block_last_instruction: u32,
+    pub cf_in_flags: bool,
+    pub cf_in_flags_next: bool,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -6261,6 +6269,8 @@ fn jit_generate_module(
         cr0_fpu_ok: false,
         cr0_killed: false,
         block_last_instruction: 0,
+        cf_in_flags: false,
+        cf_in_flags_next: false,
         x87_cache_kept: false,
         x87_run_left: 0,
         gg,
@@ -7577,7 +7587,9 @@ fn jit_generate_basic_block(
             codegen::gen_fwait_inline(ctx);
         }
         else {
+            ctx.cf_in_flags = mem::replace(&mut ctx.cf_in_flags_next, false);
             jit_instructions::jit_instruction(ctx, &mut instruction_flags);
+            ctx.cf_in_flags = false;
         }
         let end_eip = ctx.cpu.eip;
         if ctx.cr0_fpu_ok && opcode_may_write_cr0(start_eip) {
@@ -8467,6 +8479,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_ADC_CF_ONLY {
             add(0x7A11_0019);
+        }
+        if JIT_INCDEC_CF_KEEP {
+            add(0x7A11_001B);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
