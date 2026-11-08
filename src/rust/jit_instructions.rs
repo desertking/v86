@@ -145,6 +145,89 @@ pub fn instr_F3_jit(ctx: &mut JitContext, instr_flags: &mut u32) {
 }
 
 fn sse_inline() -> bool { crate::jit::sse_scalar_inline_enabled() }
+fn sse_packed_inline() -> bool { crate::jit::sse_packed_inline_enabled() }
+
+#[derive(Clone, Copy)]
+enum PsOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+fn ps_arith_inline(ctx: &mut JitContext, src: u32, r: u32, op: PsOp) {
+    let dst = global_pointers::get_reg_xmm_offset(r);
+    for lane in 0..4 {
+        ctx.builder.const_i32((dst + 4 * lane) as i32);
+        match op {
+            PsOp::Sub => {
+                ctx.builder.const_i32((dst + 4 * lane) as i32);
+                ctx.builder.load_aligned_f32(0);
+                ctx.builder.const_i32((src + 4 * lane) as i32);
+                ctx.builder.load_aligned_f32(0);
+                ctx.builder.sub_f32();
+            },
+            _ => {
+                ctx.builder.const_i32((src + 4 * lane) as i32);
+                ctx.builder.load_aligned_f32(0);
+                ctx.builder.const_i32((dst + 4 * lane) as i32);
+                ctx.builder.load_aligned_f32(0);
+                if let PsOp::Add = op {
+                    ctx.builder.add_f32();
+                }
+                else {
+                    ctx.builder.mul_f32();
+                }
+            },
+        }
+        ctx.builder.store_aligned_f32(0);
+    }
+}
+
+fn ps_arith_reg(ctx: &mut JitContext, r1: u32, r2: u32, op: PsOp) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    ps_arith_inline(ctx, global_pointers::get_reg_xmm_offset(r1), r2, op);
+}
+
+fn ps_arith_mem(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, op: PsOp) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    let src = global_pointers::sse_scratch_register as u32;
+    codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, src);
+    ps_arith_inline(ctx, src, r, op);
+}
+
+fn ps_store_lanes(ctx: &mut JitContext, r: u32, lanes: [WasmLocal; 4]) {
+    let dst = global_pointers::get_reg_xmm_offset(r);
+    for (i, l) in lanes.into_iter().enumerate() {
+        ctx.builder.const_i32((dst + 4 * i as u32) as i32);
+        ctx.builder.get_local(&l);
+        ctx.builder.store_aligned_i32(0);
+        ctx.builder.free_local(l);
+    }
+}
+
+fn ps_load_lane(ctx: &mut JitContext, base: u32, lane: u32) -> WasmLocal {
+    ctx.builder.const_i32((base + 4 * lane) as i32);
+    ctx.builder.load_aligned_i32(0);
+    ctx.builder.set_new_local()
+}
+
+fn shufps_inline(ctx: &mut JitContext, src: u32, r: u32, imm8: u32) {
+    let dst = global_pointers::get_reg_xmm_offset(r);
+    let a = ps_load_lane(ctx, dst, imm8 & 3);
+    let b = ps_load_lane(ctx, dst, imm8 >> 2 & 3);
+    let c = ps_load_lane(ctx, src, imm8 >> 4 & 3);
+    let d = ps_load_lane(ctx, src, imm8 >> 6 & 3);
+    ps_store_lanes(ctx, r, [a, b, c, d]);
+}
+
+fn unpcklps_inline(ctx: &mut JitContext, src: u32, r: u32) {
+    let dst = global_pointers::get_reg_xmm_offset(r);
+    let a = ps_load_lane(ctx, dst, 0);
+    let b = ps_load_lane(ctx, src, 0);
+    let c = ps_load_lane(ctx, dst, 1);
+    let d = ps_load_lane(ctx, src, 1);
+    ps_store_lanes(ctx, r, [a, b, c, d]);
+}
 fn sse_convert_inline() -> bool { crate::jit::sse_convert_inline_enabled() }
 
 fn sse_truncate_f64_on_stack_to_i32(ctx: &mut JitContext) {
@@ -6273,9 +6356,21 @@ pub fn instr_F30FC2_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32,
 }
 
 pub fn instr_0FC6_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32, imm8: u32) {
+    if sse_packed_inline() {
+        codegen::gen_mark_fpu_simd_dirty_once(ctx);
+        shufps_inline(ctx, global_pointers::get_reg_xmm_offset(r1), r2, imm8);
+        return;
+    }
     sse_read128_xmm_xmm_imm(ctx, "instr_0FC6", r1, r2, imm8)
 }
 pub fn instr_0FC6_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32, imm8: u32) {
+    if sse_packed_inline() {
+        codegen::gen_mark_fpu_simd_dirty_once(ctx);
+        let src = global_pointers::sse_scratch_register as u32;
+        codegen::gen_modrm_resolve_safe_read128(ctx, modrm_byte, src);
+        shufps_inline(ctx, src, r, imm8);
+        return;
+    }
     sse_read128_xmm_mem_imm(ctx, "instr_0FC6", modrm_byte, r, imm8)
 }
 pub fn instr_660FC6_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32, imm8: u32) {
@@ -6584,9 +6679,26 @@ pub fn instr_660F13_reg_jit(ctx: &mut JitContext, _r1: u32, _r2: u32) {
 }
 
 pub fn instr_0F14_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_packed_inline() {
+        codegen::gen_mark_fpu_simd_dirty_once(ctx);
+        let src = global_pointers::sse_scratch_register as u32;
+        codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+        let v = ctx.builder.set_new_local_i64();
+        ctx.builder.const_i32(src as i32);
+        ctx.builder.get_local_i64(&v);
+        ctx.builder.store_aligned_i64(0);
+        ctx.builder.free_local_i64(v);
+        unpcklps_inline(ctx, src, r);
+        return;
+    }
     sse_read64_xmm_mem(ctx, "instr_0F14", modrm_byte, r);
 }
 pub fn instr_0F14_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_packed_inline() {
+        codegen::gen_mark_fpu_simd_dirty_once(ctx);
+        unpcklps_inline(ctx, global_pointers::get_reg_xmm_offset(r1), r2);
+        return;
+    }
     sse_read64_xmm_xmm(ctx, "instr_0F14", r1, r2);
 }
 pub fn instr_660F14_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -7021,9 +7133,17 @@ pub fn instr_660F57_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_packed_inline() {
+        ps_arith_mem(ctx, modrm_byte, r, PsOp::Add);
+        return;
+    }
     sse_read128_xmm_mem(ctx, "instr_0F58", modrm_byte, r);
 }
 pub fn instr_0F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_packed_inline() {
+        ps_arith_reg(ctx, r1, r2, PsOp::Add);
+        return;
+    }
     sse_read128_xmm_xmm(ctx, "instr_0F58", r1, r2);
 }
 pub fn instr_660F58_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -7056,9 +7176,17 @@ pub fn instr_F30F58_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_packed_inline() {
+        ps_arith_mem(ctx, modrm_byte, r, PsOp::Mul);
+        return;
+    }
     sse_read128_xmm_mem(ctx, "instr_0F59", modrm_byte, r);
 }
 pub fn instr_0F59_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_packed_inline() {
+        ps_arith_reg(ctx, r1, r2, PsOp::Mul);
+        return;
+    }
     sse_read128_xmm_xmm(ctx, "instr_0F59", r1, r2);
 }
 pub fn instr_660F59_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
@@ -7181,9 +7309,17 @@ pub fn instr_F30F5B_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
 }
 
 pub fn instr_0F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    if sse_packed_inline() {
+        ps_arith_mem(ctx, modrm_byte, r, PsOp::Sub);
+        return;
+    }
     sse_read128_xmm_mem(ctx, "instr_0F5C", modrm_byte, r);
 }
 pub fn instr_0F5C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    if sse_packed_inline() {
+        ps_arith_reg(ctx, r1, r2, PsOp::Sub);
+        return;
+    }
     sse_read128_xmm_xmm(ctx, "instr_0F5C", r1, r2);
 }
 pub fn instr_660F5C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
