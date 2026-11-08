@@ -62,7 +62,7 @@ function buildImage(seed) {
     for (let i = 0; i < n; i++) {
         const r = R(8), r1 = R(3) === 0 ? r : R(8), disp = 8 * R(60), useMem = R(2) === 0;
         const modrm = useMem ? MEM(r, disp) : [0xC0 | r << 3 | r1];
-        const kind = R(18);
+        const kind = R(20);
         if (kind < 2) emit(0x0F, 0xFD, ...modrm);
         else if (kind < 4) emit(0x0F, 0x60, ...modrm);
         else if (kind < 5) emit(0x0F, 0x68, ...modrm);
@@ -77,7 +77,8 @@ function buildImage(seed) {
         else if (kind < 15) emit(0x0F, 0x2A, ...modrm);
         else if (kind < 16) emit(0x0F, 0x6B, ...modrm);
         else if (kind < 17) emit(0x0F, 0x7E, 0xC0 | r << 3 | R(4), 0x31, 0x05, ...d32(CHK));
-        else emit(0x0F, 0x7E, ...MEM(r, 0x400 + 4 * R(64)));
+        else if (kind < 18) emit(0x0F, 0x7E, ...MEM(r, 0x400 + 4 * R(64)));
+        else emit(0x0F, 0x2C, ...modrm);
         if (R(8) === 0) { emit(0xA1, ...d32(CTR)); emit(0x69, 0xC0, ...d32(0x9E3779B1)); emit(0x89, 0xC1, 0x89, 0xC2, 0x89, 0xC3); }
     }
     emit(0xDD, ...MEM(6, 0x700));
@@ -117,6 +118,7 @@ function run(img, cfg) {
                 w.set_jit_sse_scalar_inline?.(1);
                 if (!w.set_jit_mmx_inline) { resolve({ status: "NO-SWITCH" }); return; }
                 w.set_jit_mmx_inline(cfg.on ? 1 : 0);
+                w.set_jit_cvttps2pi_inline?.(cfg.on ? 1 : 0);
                 cpu.jit_clear_cache?.();
             }
             cpu.load_multiboot(img.buffer);

@@ -7025,6 +7025,60 @@ pub fn instr_660F29_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32)
 }
 pub fn instr_660F29_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) { sse_mov_xmm_xmm(ctx, r2, r1) }
 
+fn cvttps2pi_inline(ctx: &mut JitContext, r: u32) {
+    let s = ctx.builder.set_new_local_i64();
+    let mut lanes = Vec::new();
+    for lane in 0..2 {
+        ctx.builder.get_local_i64(&s);
+        if lane == 1 {
+            ctx.builder.const_i64(32);
+            ctx.builder.shr_u_i64();
+        }
+        ctx.builder.wrap_i64_to_i32();
+        ctx.builder.reinterpret_i32_as_f32();
+        ctx.builder.promote_f32_to_f64();
+        sse_truncate_f64_on_stack_to_i32(ctx);
+        lanes.push(ctx.builder.set_new_local());
+    }
+    ctx.builder.free_local_i64(s);
+    ctx.builder.get_local(&lanes[0]);
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.get_local(&lanes[1]);
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i64(32);
+    ctx.builder.shl_i64();
+    ctx.builder.or_i64();
+    for l in lanes {
+        ctx.builder.free_local(l);
+    }
+    let v = ctx.builder.set_new_local_i64();
+    mmx_write_and_transition(ctx, r, &v);
+    ctx.builder.free_local_i64(v);
+}
+
+pub fn instr_0F2C_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    codegen::gen_modrm_resolve_safe_read64(ctx, modrm_byte);
+    if crate::jit::cvttps2pi_inline_enabled() {
+        cvttps2pi_inline(ctx, r);
+        return;
+    }
+    ctx.builder.const_i32(r as i32);
+    ctx.builder.call_fn2_i64_i32("instr_0F2C");
+}
+pub fn instr_0F2C_reg_jit(ctx: &mut JitContext, r1: u32, r2: u32) {
+    codegen::gen_mark_fpu_simd_dirty_once(ctx);
+    if crate::jit::cvttps2pi_inline_enabled() {
+        ctx.builder.const_i32(global_pointers::get_reg_xmm_offset(r1) as i32);
+        ctx.builder.load_aligned_i64(0);
+        cvttps2pi_inline(ctx, r2);
+        return;
+    }
+    ctx.builder.const_i32(r1 as i32);
+    ctx.builder.const_i32(r2 as i32);
+    ctx.builder.call_fn2("instr_0F2C_reg");
+}
+
 pub fn instr_0F2A_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
     if mmx_inline() {
         codegen::gen_mark_fpu_simd_dirty_once(ctx);

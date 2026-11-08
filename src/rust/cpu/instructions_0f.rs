@@ -998,6 +998,7 @@ pub unsafe fn instr_660F2B_mem(addr: i32, r: i32) {
     mov_r_m128(addr, r);
 }
 
+#[no_mangle]
 pub unsafe fn instr_0F2C(source: u64, r: i32) {
     // cvttps2pi mm, xmm/m64
     let low = f32::from_bits(source as u32);
