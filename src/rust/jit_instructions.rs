@@ -4753,8 +4753,93 @@ pub fn instr_DB_3_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fn1_const(ctx.builder, "instr_DB_3_reg", r);
 }
 
+fn fld80_inline_jit(ctx: &mut JitContext, address_local: &WasmLocal) {
+    let relaxed_all = crate::cpu::fpu::get_fpu_fld80_relaxed() != 0;
+    codegen::gen_safe_read64(ctx, address_local);
+    let mant = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(8);
+    ctx.builder.add_i32();
+    let hi_addr = ctx.builder.set_new_local();
+    codegen::gen_safe_read16(ctx, &hi_addr);
+    ctx.builder.free_local(hi_addr);
+    let se = ctx.builder.set_new_local();
+    ctx.builder.get_local(&se);
+    ctx.builder.const_i32(0x7FFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(16383 - 1023);
+    ctx.builder.sub_i32();
+    let fexp = ctx.builder.set_new_local();
+    ctx.builder.get_local(&fexp);
+    ctx.builder.const_i32(1);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(0x7FE);
+    ctx.builder.ltu_i32();
+    if !relaxed_all {
+        ctx.builder.get_local_i64(&mant);
+        ctx.builder.const_i64(i64::MIN | 0x7FF);
+        ctx.builder.and_i64();
+        ctx.builder.const_i64(i64::MIN);
+        ctx.builder.eq_i64();
+        ctx.builder.and_i32();
+    }
+    ctx.builder.get_local(&se);
+    ctx.builder.const_i32(0x7FFF);
+    ctx.builder.and_i32();
+    ctx.builder.eqz_i32();
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.const_i64(0);
+    ctx.builder.eq_i64();
+    ctx.builder.and_i32();
+    let zero = ctx.builder.tee_new_local();
+    ctx.builder.or_i32();
+    ctx.builder.if_void();
+    ctx.builder.get_local(&se);
+    ctx.builder.const_i32(15);
+    ctx.builder.shr_u_i32();
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i64(63);
+    ctx.builder.shl_i64();
+    ctx.builder.get_local(&zero);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_i64();
+    ctx.builder.get_local(&fexp);
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i64(52);
+    ctx.builder.shl_i64();
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.const_i64(0x7FFF_FFFF_FFFF_FFFF);
+    ctx.builder.and_i64();
+    ctx.builder.const_i64(11);
+    ctx.builder.shr_u_i64();
+    ctx.builder.or_i64();
+    ctx.builder.else_();
+    ctx.builder.const_i64(0);
+    ctx.builder.block_end();
+    ctx.builder.or_i64();
+    ctx.builder.const_i32(0x7FFE);
+    codegen::gen_fpu_relaxed_push_loaded(ctx);
+    ctx.builder.else_();
+    ctx.builder.get_local(address_local);
+    ctx.builder.call_fn1("fpu_fldm80_without_fault");
+    ctx.builder.block_end();
+    ctx.builder.free_local(zero);
+    ctx.builder.free_local(fexp);
+    ctx.builder.free_local(se);
+    ctx.builder.free_local_i64(mant);
+}
+
 pub fn instr_DB_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     let address_local = codegen::gen_modrm_resolve_into_local(ctx, modrm_byte);
+    if crate::jit::fld80_inline_enabled()
+        && crate::softfloat::is_fpu_relaxed()
+        && (crate::cpu::fpu::get_fpu_fld80_exact_fast() != 0 || crate::cpu::fpu::get_fpu_fld80_relaxed() != 0)
+    {
+        codegen::gen_mark_fpu_simd_dirty_once(ctx);
+        fld80_inline_jit(ctx, &address_local);
+        ctx.builder.free_local(address_local);
+        return;
+    }
     codegen::gen_readable_or_pagefault(ctx, &address_local, 10);
     ctx.builder.get_local(&address_local);
     ctx.builder.call_fn1("fpu_fldm80_without_fault");

@@ -1422,6 +1422,12 @@ pub fn set_jit_idiv_inline(on: u32) { unsafe { JIT_IDIV_INLINE = on != 0 } }
 #[no_mangle]
 pub fn get_jit_idiv_inline() -> u32 { unsafe { JIT_IDIV_INLINE as u32 } }
 pub fn idiv_inline_enabled() -> bool { unsafe { JIT_IDIV_INLINE } }
+static mut JIT_FLD80_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_fld80_inline(on: u32) { unsafe { JIT_FLD80_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_fld80_inline() -> u32 { unsafe { JIT_FLD80_INLINE as u32 } }
+pub fn fld80_inline_enabled() -> bool { unsafe { JIT_FLD80_INLINE } }
 static mut JIT_SMC_EXIT_LOCAL: bool = false;
 #[no_mangle]
 pub fn set_jit_smc_exit_local(on: u32) { unsafe { JIT_SMC_EXIT_LOCAL = on != 0 } }
@@ -8797,6 +8803,12 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_IDIV_INLINE {
             add(0x7A11_002E);
+        }
+        if JIT_FLD80_INLINE {
+            add(0x7A11_002F);
+        }
+        if crate::cpu::fpu::get_fpu_fld80_relaxed() != 0 {
+            add(0x7A11_0030);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
