@@ -6794,6 +6794,10 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
             _ => {},
         }
     }
+    if crate::jit::x87_cmp_lean_enabled() {
+        set &= !model.need_empty;
+        clear &= !model.need_valid;
+    }
     if set | clear != 0 {
         ctx.builder.get_local(&rot);
         ctx.builder.const_i32(!(clear as i32));
@@ -6851,8 +6855,46 @@ fn gen_x87_run_clear_c1(ctx: &mut JitContext, status: &WasmLocal) {
     ctx.builder.set_local(status);
 }
 
+fn gen_x87_run_compare_flags_lean(ctx: &mut JitContext, x: &WasmLocalI64, y: &WasmLocalI64) -> WasmLocal {
+    ctx.builder.get_local_i64(x);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(y);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.lt_f64();
+    ctx.builder.const_i32(8);
+    ctx.builder.shl_i32();
+    ctx.builder.get_local_i64(x);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(y);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.eq_f64();
+    ctx.builder.const_i32(14);
+    ctx.builder.shl_i32();
+    ctx.builder.or_i32();
+    ctx.builder.get_local_i64(x);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(x);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.ne_f64();
+    ctx.builder.get_local_i64(y);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.get_local_i64(y);
+    ctx.builder.reinterpret_i64_as_f64();
+    ctx.builder.ne_f64();
+    ctx.builder.or_i32();
+    ctx.builder.const_i32((FPU_C0 | FPU_C2 | FPU_C3) as i32);
+    ctx.builder.mul_i32();
+    ctx.builder.or_i32();
+    ctx.builder.set_new_local()
+}
+
 fn gen_x87_run_compare(ctx: &mut JitContext, status: &WasmLocal, x: &WasmLocalI64, y: &WasmLocalI64) {
-    let flags = gen_fpu_compare_flags(ctx, x, y, FPU_C0 | FPU_C2 | FPU_C3, FPU_C0, FPU_C3);
+    let flags = if crate::jit::x87_cmp_lean_enabled() {
+        gen_x87_run_compare_flags_lean(ctx, x, y)
+    }
+    else {
+        gen_fpu_compare_flags(ctx, x, y, FPU_C0 | FPU_C2 | FPU_C3, FPU_C0, FPU_C3)
+    };
     ctx.builder.get_local(status);
     ctx.builder.const_i32(!FPU_RESULT_FLAGS);
     ctx.builder.and_i32();

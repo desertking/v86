@@ -1317,6 +1317,12 @@ pub fn set_jit_page_straddle(on: u32) { unsafe { JIT_PAGE_STRADDLE = on != 0 } }
 #[no_mangle]
 pub fn get_jit_page_straddle() -> u32 { unsafe { JIT_PAGE_STRADDLE as u32 } }
 pub fn page_straddle_enabled() -> bool { unsafe { JIT_PAGE_STRADDLE } }
+static mut JIT_X87_CMP_LEAN: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_cmp_lean(on: u32) { unsafe { JIT_X87_CMP_LEAN = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_cmp_lean() -> u32 { unsafe { JIT_X87_CMP_LEAN as u32 } }
+pub fn x87_cmp_lean_enabled() -> bool { unsafe { JIT_X87_CMP_LEAN } }
 static mut STRADDLES_COMPILED: u32 = 0;
 #[no_mangle]
 pub fn jit_straddles_compiled() -> u32 { unsafe { STRADDLES_COMPILED } }
@@ -8419,6 +8425,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_PAGE_STRADDLE {
             add(0x7A11_0016);
+        }
+        if JIT_X87_CMP_LEAN {
+            add(0x7A11_0017);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
