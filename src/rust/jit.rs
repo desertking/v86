@@ -111,6 +111,18 @@ static mut WBUF_INTRINSIC_HOT: [WbufIntrinsicDesc; WBUF_INTRINSIC_HOT_CAPACITY] 
 static mut WBUF_INTRINSIC_HOT_MIN_TARGET: u32 = u32::MAX;
 static mut WBUF_INTRINSIC_HOT_MAX_TARGET: u32 = 0;
 static mut WBUF_INTRINSIC_REGISTERED: u32 = 0;
+static mut WBUF_INTRINSIC_BITMAP: [u8; 8192] = [0; 8192];
+static mut JIT_WBUF_BITMAP: bool = false;
+#[no_mangle]
+pub fn set_jit_wbuf_bitmap(on: u32) { unsafe { JIT_WBUF_BITMAP = on != 0 } }
+#[no_mangle]
+pub fn get_jit_wbuf_bitmap() -> u32 { unsafe { JIT_WBUF_BITMAP as u32 } }
+pub fn wbuf_bitmap_enabled() -> bool { unsafe { JIT_WBUF_BITMAP } }
+pub(crate) fn wbuf_intrinsic_bitmap_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_BITMAP) as u32
+}
+#[inline]
+fn wbuf_bitmap_granule(target: u32) -> usize { (target >> 4) as usize & 0xFFFF }
 static mut WBUF_INTRINSIC_HITS: u32 = 0;
 static mut WBUF_INTRINSIC_FALLBACKS: u32 = 0;
 static mut WBUF_INTRINSIC_CODEGEN_CALL32: u32 = 0;
@@ -197,6 +209,8 @@ pub unsafe fn jit_wbuf_intrinsic_register(
             };
             WBUF_INTRINSIC_MIN_TARGET = WBUF_INTRINSIC_MIN_TARGET.min(target);
             WBUF_INTRINSIC_MAX_TARGET = WBUF_INTRINSIC_MAX_TARGET.max(target);
+            let g = wbuf_bitmap_granule(target);
+            WBUF_INTRINSIC_BITMAP[g >> 3] |= 1 << (g & 7);
             if was_empty {
                 WBUF_INTRINSIC_REGISTERED = WBUF_INTRINSIC_REGISTERED.wrapping_add(1);
             }
@@ -799,6 +813,7 @@ pub unsafe fn jit_wbuf_intrinsic_clear_registry() {
     WBUF_INTRINSIC_MIN_TARGET = u32::MAX;
     WBUF_INTRINSIC_MAX_TARGET = 0;
     WBUF_INTRINSIC_TABLE = [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_CAPACITY];
+    WBUF_INTRINSIC_BITMAP = [0; 8192];
     WBUF_INTRINSIC_HOT = [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_HOT_CAPACITY];
     WBUF_INTRINSIC_HOT_MIN_TARGET = u32::MAX;
     WBUF_INTRINSIC_HOT_MAX_TARGET = 0;
@@ -8806,6 +8821,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_FLD80_INLINE {
             add(0x7A11_002F);
+        }
+        if JIT_WBUF_BITMAP {
+            add(0x7A11_0031);
         }
         if crate::cpu::fpu::get_fpu_fld80_relaxed() != 0 {
             add(0x7A11_0030);

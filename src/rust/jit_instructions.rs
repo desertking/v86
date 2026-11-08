@@ -5488,6 +5488,25 @@ fn gen_indirect_call32(ctx: &mut JitContext, new_eip: WasmLocal) {
         ctx.builder.get_local(&new_eip);
         ctx.builder.geu_i32();
         ctx.builder.and_i32();
+        if crate::jit::wbuf_bitmap_enabled() {
+            ctx.builder.get_local(&new_eip);
+            ctx.builder.const_i32(4);
+            ctx.builder.shr_u_i32();
+            ctx.builder.const_i32(0xFFFF);
+            ctx.builder.and_i32();
+            let g = ctx.builder.tee_new_local();
+            ctx.builder.const_i32(3);
+            ctx.builder.shr_u_i32();
+            ctx.builder.load_u8(crate::jit::wbuf_intrinsic_bitmap_ptr());
+            ctx.builder.get_local(&g);
+            ctx.builder.const_i32(7);
+            ctx.builder.and_i32();
+            ctx.builder.shr_u_i32();
+            ctx.builder.const_i32(1);
+            ctx.builder.and_i32();
+            ctx.builder.and_i32();
+            ctx.builder.free_local(g);
+        }
         ctx.builder.if_void();
         ctx.builder.get_local(&new_eip);
         codegen::gen_get_reg32(ctx, regs::ESP);
