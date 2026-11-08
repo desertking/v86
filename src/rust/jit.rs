@@ -1226,7 +1226,7 @@ fn free_for_reform(ctx: &mut JitState, root: WasmTableIndex) {
             continue;
         }
         if let Some((hotness, _)) = ctx.entry_points.get_mut(&page) {
-            *hotness = (*hotness).max(JIT_THRESHOLD);
+            *hotness = (*hotness).max(get_jit_threshold());
         }
     }
 }
@@ -3109,7 +3109,12 @@ pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0
 #[no_mangle]
 pub fn get_dispatch_stats() -> u32 { unsafe { DISPATCH_STATS as u32 } }
 
-pub const JIT_THRESHOLD: u32 = 200 * 1000;
+pub const JIT_THRESHOLD_DEFAULT: u32 = 200 * 1000;
+static mut JIT_THRESHOLD: u32 = JIT_THRESHOLD_DEFAULT;
+#[no_mangle]
+pub fn set_jit_threshold(value: u32) { unsafe { JIT_THRESHOLD = value.max(1) } }
+#[no_mangle]
+pub fn get_jit_threshold() -> u32 { unsafe { JIT_THRESHOLD } }
 
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;
@@ -5140,7 +5145,7 @@ pub fn jit_force_generate_unsafe(virt_addr: i32) {
         cpu::translate_address_read(virt_addr).unwrap(),
         cpu::get_seg_cs() as u32,
         cpu::get_state_flags(),
-        JIT_THRESHOLD,
+        get_jit_threshold(),
     );
     dbg_assert!(get_jit_state().compiling.is_some());
 }
@@ -8193,7 +8198,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
     }
 
     *hotness += heat;
-    if *hotness >= JIT_THRESHOLD {
+    if *hotness >= get_jit_threshold() {
         if is_compiling {
             return;
         }
@@ -8848,6 +8853,10 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_RMW_MISC_INLINE {
             add(0x7A11_0033);
+        }
+        if JIT_THRESHOLD != JIT_THRESHOLD_DEFAULT {
+            add(0x7A11_0034);
+            add(JIT_THRESHOLD);
         }
         if crate::cpu::fpu::get_fpu_fld80_relaxed() != 0 {
             add(0x7A11_0030);
