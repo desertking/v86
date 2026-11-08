@@ -774,6 +774,9 @@ const SIMD_I16X8_NARROW_I32X4_S: u32 = 0x85;
 const SIMD_I16X8_SHR_S: u32 = 0x8C;
 const SIMD_I16X8_SHR_U: u32 = 0x8D;
 const SIMD_I16X8_ADD: u32 = 0x8E;
+const SIMD_I8X16_EQ: u32 = 0x23;
+const SIMD_I16X8_EQ: u32 = 0x2D;
+const SIMD_I32X4_EQ: u32 = 0x37;
 
 fn mmx_inline() -> bool { crate::jit::mmx_inline_enabled() }
 
@@ -784,6 +787,14 @@ fn mmx_inline_kind(name: &str) -> Option<u8> {
         "instr_0F68" => Some(2),
         "instr_0F67" => Some(3),
         "instr_0F6B" => Some(4),
+        _ if !crate::jit::mmx_logic_inline_enabled() => None,
+        "instr_0F74" => Some(5),
+        "instr_0F75" => Some(6),
+        "instr_0F76" => Some(7),
+        "instr_0FDB" => Some(8),
+        "instr_0FDF" => Some(9),
+        "instr_0FEB" => Some(10),
+        "instr_0FEF" => Some(11),
         _ => None,
     }
 }
@@ -835,6 +846,19 @@ fn mmx_get(ctx: &mut JitContext, r: u32) {
 fn mmx_binop_inline(ctx: &mut JitContext, kind: u8, r: u32) {
     let s = ctx.builder.set_new_local_i64();
     match kind {
+        8..=11 => {
+            mmx_get(ctx, r);
+            if kind == 9 {
+                ctx.builder.const_i64(-1);
+                ctx.builder.xor_i64();
+            }
+            ctx.builder.get_local_i64(&s);
+            match kind {
+                10 => ctx.builder.or_i64(),
+                11 => ctx.builder.xor_i64(),
+                _ => ctx.builder.and_i64(),
+            }
+        },
         4 => {
             mmx_get(ctx, r);
             ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
@@ -880,6 +904,9 @@ fn mmx_binop_inline(ctx: &mut JitContext, kind: u8, r: u32) {
             ctx.builder.simd_op_u32(SIMD_I64X2_SPLAT);
             match kind {
                 0 => ctx.builder.simd_op_u32(SIMD_I16X8_ADD),
+                5 => ctx.builder.simd_op_u32(SIMD_I8X16_EQ),
+                6 => ctx.builder.simd_op_u32(SIMD_I16X8_EQ),
+                7 => ctx.builder.simd_op_u32(SIMD_I32X4_EQ),
                 1 => ctx.builder.simd_shuffle([0, 16, 1, 17, 2, 18, 3, 19, 0, 0, 0, 0, 0, 0, 0, 0]),
                 _ => ctx.builder.simd_shuffle([4, 20, 5, 21, 6, 22, 7, 23, 0, 0, 0, 0, 0, 0, 0, 0]),
             }
@@ -1353,14 +1380,14 @@ macro_rules! define_instruction_read_write_mem8(
         pub fn $name_mem(ctx: &mut JitContext, modrm_byte: ModrmByte) {
             codegen::gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| {
                 codegen::gen_safe_read_write(ctx, BitSize::BYTE, &addr, &|ref mut ctx| {
-                    ctx.builder.call_fn1_ret($fn);
+                    gen_rmw8_unary(ctx, $fn);
                 });
             });
         }
 
         pub fn $name_reg(ctx: &mut JitContext, r1: u32) {
             codegen::gen_get_reg8(ctx, r1);
-            ctx.builder.call_fn1_ret($fn);
+            gen_rmw8_unary(ctx, $fn);
             codegen::gen_set_reg8(ctx, r1);
         }
     );
@@ -2545,6 +2572,119 @@ fn gen_ror32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &Lo
     builder.and_i32();
     builder.call_fn2_ret("ror32");
     builder.set_local(dest_operand);
+}
+fn gen_ror32_inline(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
+    let count = match source_operand {
+        LocalOrImmediate::WasmLocal(l) => {
+            ctx.builder.get_local(l);
+            ctx.builder.const_i32(31);
+            ctx.builder.and_i32();
+            let c = ctx.builder.tee_new_local();
+            ctx.builder.if_void();
+            Some(c)
+        },
+        LocalOrImmediate::Immediate(i) => {
+            if *i & 31 == 0 {
+                return;
+            }
+            None
+        },
+    };
+    ctx.builder.get_local(dest_operand);
+    match &count {
+        Some(c) => ctx.builder.get_local(c),
+        None => ctx.builder.const_i32(source_operand_imm(source_operand) & 31),
+    }
+    ctx.builder.rotr_i32();
+    ctx.builder.set_local(dest_operand);
+    codegen::gen_clear_flags_changed_bits(ctx.builder, FLAG_CARRY | FLAG_OVERFLOW);
+    ctx.builder.const_i32(global_pointers::flags as i32);
+    codegen::gen_get_flags(ctx.builder);
+    ctx.builder.const_i32(!(FLAG_CARRY | FLAG_OVERFLOW));
+    ctx.builder.and_i32();
+    ctx.builder.get_local(dest_operand);
+    ctx.builder.const_i32(31);
+    ctx.builder.shr_u_i32();
+    ctx.builder.or_i32();
+    ctx.builder.get_local(dest_operand);
+    ctx.builder.const_i32(20);
+    ctx.builder.shr_s_i32();
+    ctx.builder.get_local(dest_operand);
+    ctx.builder.const_i32(19);
+    ctx.builder.shr_s_i32();
+    ctx.builder.xor_i32();
+    ctx.builder.const_i32(FLAG_OVERFLOW);
+    ctx.builder.and_i32();
+    ctx.builder.or_i32();
+    ctx.builder.flag_store_i32(4);
+    if let Some(c) = count {
+        ctx.builder.block_end();
+        ctx.builder.free_local(c);
+    }
+}
+fn source_operand_imm(source_operand: &LocalOrImmediate) -> i32 {
+    match source_operand {
+        LocalOrImmediate::Immediate(i) => *i,
+        LocalOrImmediate::WasmLocal(_) => 0,
+    }
+}
+fn gen_ror32_maybe_inline(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
+    if crate::jit::rmw_misc_inline_enabled() {
+        gen_ror32_inline(ctx, dest_operand, source_operand)
+    }
+    else {
+        gen_ror32(ctx, dest_operand, source_operand)
+    }
+}
+fn gen_incdec8_inline(ctx: &mut JitContext, is_dec: bool) {
+    let d = ctx.builder.set_new_local();
+    if !ctx.cf_in_flags {
+        ctx.builder.const_i32(global_pointers::flags as i32);
+        codegen::gen_get_flags(ctx.builder);
+        ctx.builder.const_i32(!1);
+        ctx.builder.and_i32();
+        codegen::gen_getcf(ctx, ConditionNegate::False);
+        ctx.builder.or_i32();
+        ctx.builder.flag_store_i32(4);
+    }
+    ctx.builder.const_i32(global_pointers::last_op1 as i32);
+    ctx.builder.get_local(&d);
+    ctx.builder.flag_store_i32(0);
+    ctx.builder.const_i32(global_pointers::last_result as i32);
+    ctx.builder.get_local(&d);
+    ctx.builder.const_i32(1);
+    if is_dec {
+        ctx.builder.sub_i32();
+    }
+    else {
+        ctx.builder.add_i32();
+    }
+    ctx.builder.const_i32(0xFF);
+    ctx.builder.and_i32();
+    ctx.builder.flag_store_i32(1);
+    codegen::gen_set_last_op_size_and_flags_changed(
+        ctx.builder,
+        OPSIZE_8,
+        if is_dec { FLAGS_ALL & !1 | FLAG_SUB } else { FLAGS_ALL & !1 },
+    );
+    ctx.builder.free_local(d);
+    ctx.builder
+        .flag_load_u8(1, global_pointers::last_result as u32);
+}
+fn gen_rmw8_unary(ctx: &mut JitContext, name: &str) {
+    if crate::jit::rmw_misc_inline_enabled() {
+        match name {
+            "inc8" => return gen_incdec8_inline(ctx, false),
+            "dec8" => return gen_incdec8_inline(ctx, true),
+            "not8" => {
+                ctx.builder.const_i32(-1);
+                ctx.builder.xor_i32();
+                return;
+            },
+            _ => {},
+        }
+    }
+    ctx.builder.call_fn1_ret(name);
 }
 
 fn gen_rcl32(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
@@ -4096,7 +4236,7 @@ define_instruction_read_write_mem16!(
     imm8_5bits
 );
 define_instruction_read_write_mem32!(
-    gen_ror32,
+    gen_ror32_maybe_inline,
     instr32_C1_1_mem_jit,
     instr32_C1_1_reg_jit,
     imm8_5bits
@@ -4317,7 +4457,7 @@ define_instruction_read_write_mem16!(
     constant_one
 );
 define_instruction_read_write_mem32!(
-    gen_ror32,
+    gen_ror32_maybe_inline,
     instr32_D1_1_mem_jit,
     instr32_D1_1_reg_jit,
     constant_one
@@ -4414,7 +4554,7 @@ define_instruction_read_write_mem16!("rol16", instr16_D3_0_mem_jit, instr16_D3_0
 define_instruction_read_write_mem32!(gen_rol32, instr32_D3_0_mem_jit, instr32_D3_0_reg_jit, cl);
 
 define_instruction_read_write_mem16!("ror16", instr16_D3_1_mem_jit, instr16_D3_1_reg_jit, cl);
-define_instruction_read_write_mem32!(gen_ror32, instr32_D3_1_mem_jit, instr32_D3_1_reg_jit, cl);
+define_instruction_read_write_mem32!(gen_ror32_maybe_inline, instr32_D3_1_mem_jit, instr32_D3_1_reg_jit, cl);
 
 define_instruction_read_write_mem16!("rcl16", instr16_D3_2_mem_jit, instr16_D3_2_reg_jit, cl);
 define_instruction_read_write_mem32!(gen_rcl32, instr32_D3_2_mem_jit, instr32_D3_2_reg_jit, cl);

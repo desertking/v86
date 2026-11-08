@@ -1350,6 +1350,7 @@ impl WasmBuilder {
     pub fn or_i32(&mut self) { self.instruction_body.push(op::OP_I32OR); }
     pub fn or_i64(&mut self) { self.instruction_body.push(op::OP_I64OR); }
     pub fn and_i64(&mut self) { self.instruction_body.push(op::OP_I64AND); }
+    pub fn xor_i64(&mut self) { self.instruction_body.push(op::OP_I64XOR); }
     pub fn xor_i32(&mut self) { self.instruction_body.push(op::OP_I32XOR); }
     pub fn mul_i32(&mut self) { self.instruction_body.push(op::OP_I32MUL); }
     pub fn mul_i64(&mut self) { self.instruction_body.push(op::OP_I64MUL); }
@@ -1359,6 +1360,7 @@ impl WasmBuilder {
     pub fn rem_s_i64(&mut self) { self.instruction_body.push(op::OP_I64REMS); }
 
     pub fn rotl_i32(&mut self) { self.instruction_body.push(op::OP_I32ROTL); }
+    pub fn rotr_i32(&mut self) { self.instruction_body.push(op::OP_I32ROTR); }
 
     pub fn shl_i32(&mut self) { self.instruction_body.push(op::OP_I32SHL); }
     pub fn shl_i64(&mut self) { self.instruction_body.push(op::OP_I64SHL); }

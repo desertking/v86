@@ -3666,11 +3666,15 @@ pub unsafe fn do_many_cycles_native() {
     // so thunk-stub tails (OUT + RET N into the spin loop) execute normally first —
     // exiting mid-stub instead breaks the async-park ESP bookkeeping (observed as
     // "async RET N mismatch" → stack-EIP fault → guest SEH ExitProcess(0)).
+    let urgent_exit = crate::jit::budget0_exit_enabled();
     while (*instruction_counter).wrapping_sub(initial_instruction_counter) < limit
         && !*in_hlt
         && !hypercall::eip_at_park(*instruction_pointer as u32)
     {
         cycle_internal();
+        if urgent_exit && hypercall::read_cycle_limit() == 0 {
+            break;
+        }
     }
 }
 

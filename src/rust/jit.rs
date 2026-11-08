@@ -118,6 +118,12 @@ pub fn set_jit_wbuf_bitmap(on: u32) { unsafe { JIT_WBUF_BITMAP = on != 0 } }
 #[no_mangle]
 pub fn get_jit_wbuf_bitmap() -> u32 { unsafe { JIT_WBUF_BITMAP as u32 } }
 pub fn wbuf_bitmap_enabled() -> bool { unsafe { JIT_WBUF_BITMAP } }
+static mut JIT_BUDGET0_EXIT: bool = false;
+#[no_mangle]
+pub fn set_jit_budget0_exit(on: u32) { unsafe { JIT_BUDGET0_EXIT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_budget0_exit() -> u32 { unsafe { JIT_BUDGET0_EXIT as u32 } }
+pub fn budget0_exit_enabled() -> bool { unsafe { JIT_BUDGET0_EXIT } }
 pub(crate) fn wbuf_intrinsic_bitmap_ptr() -> u32 {
     std::ptr::addr_of!(WBUF_INTRINSIC_BITMAP) as u32
 }
@@ -1413,6 +1419,18 @@ pub fn set_jit_mmx_inline(on: u32) { unsafe { JIT_MMX_INLINE = on != 0 } }
 #[no_mangle]
 pub fn get_jit_mmx_inline() -> u32 { unsafe { JIT_MMX_INLINE as u32 } }
 pub fn mmx_inline_enabled() -> bool { unsafe { JIT_MMX_INLINE } }
+static mut JIT_MMX_LOGIC_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_mmx_logic_inline(on: u32) { unsafe { JIT_MMX_LOGIC_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_mmx_logic_inline() -> u32 { unsafe { JIT_MMX_LOGIC_INLINE as u32 } }
+pub fn mmx_logic_inline_enabled() -> bool { unsafe { JIT_MMX_LOGIC_INLINE } }
+static mut JIT_RMW_MISC_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_rmw_misc_inline(on: u32) { unsafe { JIT_RMW_MISC_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_rmw_misc_inline() -> u32 { unsafe { JIT_RMW_MISC_INLINE as u32 } }
+pub fn rmw_misc_inline_enabled() -> bool { unsafe { JIT_RMW_MISC_INLINE } }
 static mut JIT_GG_MEMBER_INLINE_FALLBACK: bool = false;
 #[no_mangle]
 pub fn set_jit_gg_member_inline_fallback(on: u32) { unsafe { JIT_GG_MEMBER_INLINE_FALLBACK = on != 0 } }
@@ -8824,6 +8842,12 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_WBUF_BITMAP {
             add(0x7A11_0031);
+        }
+        if JIT_MMX_LOGIC_INLINE {
+            add(0x7A11_0032);
+        }
+        if JIT_RMW_MISC_INLINE {
+            add(0x7A11_0033);
         }
         if crate::cpu::fpu::get_fpu_fld80_relaxed() != 0 {
             add(0x7A11_0030);
