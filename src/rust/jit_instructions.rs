@@ -1641,6 +1641,8 @@ fn gen_adc_sbb8_inline(
     else {
         ctx.builder.add_i32();
     }
+    let direct = crate::jit::adc8_cf_direct_enabled();
+    let sum = if direct { Some(ctx.builder.tee_new_local()) } else { None };
     ctx.builder.const_i32(0xFF);
     ctx.builder.and_i32();
     let res = ctx.builder.set_new_local();
@@ -1652,6 +1654,76 @@ fn gen_adc_sbb8_inline(
         codegen::gen_get_flags(ctx.builder);
         ctx.builder.const_i32(!FLAG_CARRY);
         ctx.builder.and_i32();
+        if let Some(sum) = &sum {
+            ctx.builder.get_local(sum);
+            ctx.builder.const_i32(8);
+            ctx.builder.shr_u_i32();
+            if sub {
+                ctx.builder.const_i32(FLAG_CARRY);
+                ctx.builder.and_i32();
+            }
+        }
+        else {
+            if sub {
+                ctx.builder.get_local(&res);
+                ctx.builder.get_local(&res);
+                ctx.builder.get_local(&src);
+                ctx.builder.xor_i32();
+                ctx.builder.get_local(&src);
+                ctx.builder.get_local(&d);
+            }
+            else {
+                ctx.builder.get_local(&d);
+                ctx.builder.get_local(&d);
+                ctx.builder.get_local(&src);
+                ctx.builder.xor_i32();
+                ctx.builder.get_local(&src);
+                ctx.builder.get_local(&res);
+            }
+            ctx.builder.xor_i32();
+            ctx.builder.and_i32();
+            ctx.builder.xor_i32();
+            ctx.builder.const_i32(7);
+            ctx.builder.shr_u_i32();
+            ctx.builder.const_i32(FLAG_CARRY);
+            ctx.builder.and_i32();
+        }
+        ctx.builder.or_i32();
+        ctx.builder.flag_store_i32(4);
+        ctx.builder.get_local(&res);
+        ctx.builder.free_local(res);
+        ctx.builder.free_local(src);
+        ctx.builder.free_local(d);
+        if let Some(sum) = sum {
+            ctx.builder.free_local(sum);
+        }
+        return;
+    }
+
+    codegen::gen_set_last_op1(ctx.builder, &d);
+    codegen::gen_set_last_result(ctx.builder, &res);
+    codegen::gen_set_last_op_size_and_flags_changed(
+        ctx.builder,
+        OPSIZE_8,
+        FLAGS_ALL & !FLAG_CARRY & !FLAG_OVERFLOW & !FLAG_ADJUST | if sub { FLAG_SUB } else { 0 },
+    );
+
+    ctx.builder.const_i32(global_pointers::flags as i32);
+    codegen::gen_get_flags(ctx.builder);
+    ctx.builder
+        .const_i32(!FLAG_CARRY & !FLAG_ADJUST & !FLAG_OVERFLOW);
+    ctx.builder.and_i32();
+
+    if let Some(sum) = &sum {
+        ctx.builder.get_local(sum);
+        ctx.builder.const_i32(8);
+        ctx.builder.shr_u_i32();
+        if sub {
+            ctx.builder.const_i32(FLAG_CARRY);
+            ctx.builder.and_i32();
+        }
+    }
+    else {
         if sub {
             ctx.builder.get_local(&res);
             ctx.builder.get_local(&res);
@@ -1675,52 +1747,7 @@ fn gen_adc_sbb8_inline(
         ctx.builder.shr_u_i32();
         ctx.builder.const_i32(FLAG_CARRY);
         ctx.builder.and_i32();
-        ctx.builder.or_i32();
-        ctx.builder.flag_store_i32(4);
-        ctx.builder.get_local(&res);
-        ctx.builder.free_local(res);
-        ctx.builder.free_local(src);
-        ctx.builder.free_local(d);
-        return;
     }
-
-    codegen::gen_set_last_op1(ctx.builder, &d);
-    codegen::gen_set_last_result(ctx.builder, &res);
-    codegen::gen_set_last_op_size_and_flags_changed(
-        ctx.builder,
-        OPSIZE_8,
-        FLAGS_ALL & !FLAG_CARRY & !FLAG_OVERFLOW & !FLAG_ADJUST | if sub { FLAG_SUB } else { 0 },
-    );
-
-    ctx.builder.const_i32(global_pointers::flags as i32);
-    codegen::gen_get_flags(ctx.builder);
-    ctx.builder
-        .const_i32(!FLAG_CARRY & !FLAG_ADJUST & !FLAG_OVERFLOW);
-    ctx.builder.and_i32();
-
-    if sub {
-        ctx.builder.get_local(&res);
-        ctx.builder.get_local(&res);
-        ctx.builder.get_local(&src);
-        ctx.builder.xor_i32();
-        ctx.builder.get_local(&src);
-        ctx.builder.get_local(&d);
-    }
-    else {
-        ctx.builder.get_local(&d);
-        ctx.builder.get_local(&d);
-        ctx.builder.get_local(&src);
-        ctx.builder.xor_i32();
-        ctx.builder.get_local(&src);
-        ctx.builder.get_local(&res);
-    }
-    ctx.builder.xor_i32();
-    ctx.builder.and_i32();
-    ctx.builder.xor_i32();
-    ctx.builder.const_i32(7);
-    ctx.builder.shr_u_i32();
-    ctx.builder.const_i32(FLAG_CARRY);
-    ctx.builder.and_i32();
     ctx.builder.or_i32();
 
     ctx.builder.get_local(&d);
@@ -1760,6 +1787,9 @@ fn gen_adc_sbb8_inline(
     ctx.builder.free_local(res);
     ctx.builder.free_local(src);
     ctx.builder.free_local(d);
+    if let Some(sum) = sum {
+        ctx.builder.free_local(sum);
+    }
 }
 fn gen_adc8(ctx: &mut JitContext, dest_operand: &WasmLocal, source_operand: &LocalOrImmediate) {
     if crate::jit::carry8_inline_enabled() {
