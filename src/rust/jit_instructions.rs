@@ -4438,6 +4438,15 @@ pub fn instr32_D9_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 
 pub fn instr16_D9_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_modrm_resolve_safe_read16(ctx, modrm_byte);
+    if crate::jit::fldcw_inline_enabled() {
+        let cw = ctx.builder.set_new_local();
+        ctx.builder.const_i32(global_pointers::fpu_control_word as i32);
+        ctx.builder.get_local(&cw);
+        ctx.builder.store_aligned_u16(0);
+        ctx.builder.free_local(cw);
+        codegen::gen_mark_fpu_simd_dirty(ctx.builder);
+        return;
+    }
     ctx.builder.call_fn1("set_control_word");
 }
 pub fn instr16_D9_5_reg_jit(ctx: &mut JitContext, r: u32) {
