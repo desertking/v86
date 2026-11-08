@@ -58,10 +58,11 @@ function buildImage(seed) {
     emit(0xBE, ...d32(DATA));
     const flagsToChk = () => { emit(0x9C, 0x58, 0x25, ...d32(0x8D5), 0x31, 0x05, ...d32(CHK), 0xD1, 0x05, ...d32(CHK)); };
     const n = 30 + R(30);
+    emit(0xDB, 0xE3, 0xD9, 0xE8, 0x0F, 0x7E, 0xC8, 0xDD, ...MEM(6, 0x680), 0xDB, 0xE3, 0xD9, 0xE8, 0x0F, 0x7E, ...MEM(1, 0x6F0), 0xDD, ...MEM(6, 0x700));
     for (let i = 0; i < n; i++) {
         const r = R(8), r1 = R(3) === 0 ? r : R(8), disp = 8 * R(60), useMem = R(2) === 0;
         const modrm = useMem ? MEM(r, disp) : [0xC0 | r << 3 | r1];
-        const kind = R(14);
+        const kind = R(18);
         if (kind < 2) emit(0x0F, 0xFD, ...modrm);
         else if (kind < 4) emit(0x0F, 0x60, ...modrm);
         else if (kind < 5) emit(0x0F, 0x68, ...modrm);
@@ -70,9 +71,13 @@ function buildImage(seed) {
         else if (kind < 9) emit(0x0F, 0x6F, ...modrm);
         else if (kind < 10) emit(0x0F, 0x7F, ...(useMem ? MEM(r, 0x400 + 8 * R(32)) : [0xC0 | r << 3 | r1]));
         else if (kind < 11) emit(0x0F, 0x77);
-        else if (kind < 12) emit(0xD9, ...MEM(0, 4 * R(60)), 0xDD, ...MEM(3, 0x400 + 8 * R(32)));
+        else if (kind < 12) { if (R(2)) emit(0xDB, 0xE3); emit(0xD9, ...MEM(0, 4 * R(60)), 0xDD, ...MEM(3, 0x400 + 8 * R(32))); if (R(2)) emit(0xD9, 0xE8); }
         else if (kind < 13) emit(0xDD, ...MEM(6, 0x600), 0x0F, 0x6F, ...MEM(r, 0x600 + 20 + 16 * R(4)));
-        else emit(0xDF, 0xE0, 0x31, 0x05, ...d32(CHK));
+        else if (kind < 14) emit(0xDF, 0xE0, 0x31, 0x05, ...d32(CHK));
+        else if (kind < 15) emit(0x0F, 0x2A, ...modrm);
+        else if (kind < 16) emit(0x0F, 0x6B, ...modrm);
+        else if (kind < 17) emit(0x0F, 0x7E, 0xC0 | r << 3 | R(4), 0x31, 0x05, ...d32(CHK));
+        else emit(0x0F, 0x7E, ...MEM(r, 0x400 + 4 * R(64)));
         if (R(8) === 0) { emit(0xA1, ...d32(CTR)); emit(0x69, 0xC0, ...d32(0x9E3779B1)); emit(0x89, 0xC1, 0x89, 0xC2, 0x89, 0xC3); }
     }
     emit(0xDD, ...MEM(6, 0x700));
