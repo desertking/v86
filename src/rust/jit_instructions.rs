@@ -5221,8 +5221,63 @@ pub fn instr16_F7_7_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_trigger_de(ctx);
     ctx.builder.block_end();
 }
+fn gen_idiv32_inline(ctx: &mut JitContext) {
+    ctx.builder.extend_signed_i32_to_i64();
+    let s = ctx.builder.set_new_local_i64();
+    codegen::gen_get_reg32(ctx, regs::EDX);
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.const_i64(32);
+    ctx.builder.shl_i64();
+    codegen::gen_get_reg32(ctx, regs::EAX);
+    ctx.builder.extend_unsigned_i32_to_i64();
+    ctx.builder.or_i64();
+    let t = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local_i64(&s);
+    ctx.builder.const_i64(0);
+    ctx.builder.eq_i64();
+    ctx.builder.get_local_i64(&s);
+    ctx.builder.const_i64(-1);
+    ctx.builder.eq_i64();
+    ctx.builder.get_local_i64(&t);
+    ctx.builder.const_i64(i64::MIN);
+    ctx.builder.eq_i64();
+    ctx.builder.and_i32();
+    ctx.builder.or_i32();
+    ctx.builder.if_void();
+    codegen::gen_trigger_de(ctx);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&t);
+    ctx.builder.get_local_i64(&s);
+    ctx.builder.div_s_i64();
+    let q = ctx.builder.tee_new_local_i64();
+    ctx.builder.const_i64(0x8000_0000);
+    ctx.builder.add_i64();
+    ctx.builder.const_i64(0xFFFF_FFFF);
+    ctx.builder.gtu_i64();
+    ctx.builder.if_void();
+    codegen::gen_trigger_de(ctx);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&t);
+    ctx.builder.get_local_i64(&s);
+    ctx.builder.rem_s_i64();
+    ctx.builder.wrap_i64_to_i32();
+    codegen::gen_set_reg32(ctx, regs::EDX);
+    ctx.builder.get_local_i64(&q);
+    ctx.builder.wrap_i64_to_i32();
+    codegen::gen_set_reg32(ctx, regs::EAX);
+    ctx.builder.block_end();
+    ctx.builder.block_end();
+    ctx.builder.free_local_i64(q);
+    ctx.builder.free_local_i64(t);
+    ctx.builder.free_local_i64(s);
+}
+
 pub fn instr32_F7_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+    if crate::jit::idiv_inline_enabled() {
+        gen_idiv32_inline(ctx);
+        return;
+    }
     codegen::gen_move_registers_from_locals_to_memory(ctx);
     ctx.builder.call_fn1_ret("idiv32_without_fault");
     codegen::gen_move_registers_from_memory_to_locals(ctx);
@@ -5233,6 +5288,10 @@ pub fn instr32_F7_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
 }
 pub fn instr32_F7_7_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_get_reg32(ctx, r);
+    if crate::jit::idiv_inline_enabled() {
+        gen_idiv32_inline(ctx);
+        return;
+    }
     codegen::gen_move_registers_from_locals_to_memory(ctx);
     ctx.builder.call_fn1_ret("idiv32_without_fault");
     codegen::gen_move_registers_from_memory_to_locals(ctx);

@@ -1355,6 +1355,8 @@ impl WasmBuilder {
     pub fn mul_i64(&mut self) { self.instruction_body.push(op::OP_I64MUL); }
     pub fn div_i64(&mut self) { self.instruction_body.push(op::OP_I64DIVU); }
     pub fn rem_i64(&mut self) { self.instruction_body.push(op::OP_I64REMU); }
+    pub fn div_s_i64(&mut self) { self.instruction_body.push(op::OP_I64DIVS); }
+    pub fn rem_s_i64(&mut self) { self.instruction_body.push(op::OP_I64REMS); }
 
     pub fn rotl_i32(&mut self) { self.instruction_body.push(op::OP_I32ROTL); }
 
