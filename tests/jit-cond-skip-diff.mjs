@@ -32,6 +32,7 @@ const d16 = v => [v & 255, v >> 8 & 255];
 
 let idioms = 0;
 const NONAN = !args.includes("--nan");
+const LATE = Math.floor(OUTER / 2);
 const idiomAt = [];
 const SWM = opt("--swmask") ? [0x25, ...d32(parseInt(opt("--swmask"), 16))] : [];
 function buildImage(seed) {
@@ -149,8 +150,10 @@ function buildImage(seed) {
                 emit(0xDB, 0x05, ...d32(scr));
                 depth++;
             }
-            const p = varying ? 6 : R(6);
-            if (p === 6) emit(0xA8, 1 << R(3));
+            const late = R(2) === 0;
+            const p = late ? 7 : varying ? 6 : R(6);
+            if (p === 7) emit(0x81, 0x3D, ...d32(CTR), ...d32(LATE));
+            else if (p === 6) emit(0xA8, 1 << R(3));
             else if (p === 0) emit(0x85, 0xC0);
             else if (p === 1) emit(0x83, 0xF8, R(256));
             else if (p === 2) emit(0x01, 0xC2);
@@ -158,12 +161,13 @@ function buildImage(seed) {
             else if (p === 4) emit(0x85, 0xC0, 0x8B, 0xD0);
             else emit(0x3B, 0x05, ...d32(D1 + i32()));
             idiomAt.push((ts ? "T" : "") + (BASE + o).toString(16));
-            emit(varying ? 0x74 + R(2) : 0x70 + R(16), 6);
+            emit(late ? 0x72 + R(2) : varying ? 0x74 + R(2) : 0x70 + R(16), 6);
             const far = R(2) ? D1 : D2;
             if (R(2)) emit(0xD8, 0x05, ...d32(far + f32()));
             else emit(0xDC, 0x05, ...d32(far + f64()));
             if (hole >= 0) img[hole] = (o - (hole + 1)) & 255;
-            if (ts || R(2)) emit(0xD8, ...mem(1, f32()));
+            if (ts || late || R(2)) emit(0xD8, ...mem(1, f32()));
+            if (late) emit(0xD8, 0x05, ...d32(far + f32()), 0xD9, 0x15, ...d32(D1 + st32()));
             if (pushes && depth > 1 && R(2)) { emit(0xDE, 0xC1); depth--; }
             if (R(3) === 0) emit(0xDF, 0xE0, ...SWM, 0x31, 0x05, ...d32(CHK), 0x89, 0x05, ...d32(D1 + st32()));
             continue;

@@ -32,6 +32,7 @@ const d16 = v => [v & 255, v >> 8 & 255];
 
 let idioms = 0, scenarios = 0;
 const NONAN = !args.includes("--nan");
+const LATE = Math.floor(OUTER / 2);
 const idiomAt = [];
 const SWM = opt("--swmask") ? [0x25, ...d32(parseInt(opt("--swmask"), 16))] : [];
 function buildImage(seed) {
@@ -142,11 +143,12 @@ function buildImage(seed) {
                 else emit(0x0F, 0x01, 0xE0, 0x83, 0xC8, 0x08, 0x0F, 0x01, 0xF0);
             };
             const x87 = () => { emit(0xD9, 0xE8, 0xD9, 0x1D, ...d32(D1 + st32())); };
-            const k = R(7);
+            const k = R(8);
             x87();
             if (k === 0) { setTs(); emit(0xEB, 0x00); x87(); }
             else if (k === 1) {
-                emit(0xA1, ...d32(CTR), 0xA8, 1 << R(3), R(2) ? 0x74 : 0x75, 0x00);
+                if (R(2)) emit(0x81, 0x3D, ...d32(CTR), ...d32(LATE), R(2) ? 0x72 : 0x73, 0x00);
+                else emit(0xA1, ...d32(CTR), 0xA8, 1 << R(3), R(2) ? 0x74 : 0x75, 0x00);
                 const hole = o - 1;
                 setTs();
                 img[hole] = (o - (hole + 1)) & 255;
@@ -154,6 +156,14 @@ function buildImage(seed) {
             }
             else if (k === 2) { emit(0xEB, 0x00); x87(); emit(0xA1, ...d32(CTR), 0xA8, 1, 0x74, 0x00); x87(); }
             else if (k === 3) { setTs(); emit(0xCD, 0x40); x87(); }
+            else if (k === 7) {
+                setTs();
+                emit(0x81, 0x3D, ...d32(CTR), ...d32(LATE), 0x72, 0x00);
+                const hole = o - 1;
+                x87();
+                img[hole] = (o - (hole + 1)) & 255;
+                x87();
+            }
             else if (k === 4) { emit(0x0F, 0x6E, 0xC0 | R(8) << 3, 0x0F, 0x77, 0xEB, 0x00); x87(); }
             else if (k === 5) { emit(0x0F, 0xAE, 0x05, ...d32(FXA), 0xEB, 0x00); x87(); emit(0x0F, 0xAE, 0x0D, ...d32(FXA), 0xEB, 0x00); x87(); }
             else {
