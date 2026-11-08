@@ -1210,6 +1210,24 @@ fn free_for_reform(ctx: &mut JitState, root: WasmTableIndex) {
     }
 }
 
+fn straddle_analysis(phys: u32, virt: i32, cpu: &CpuContext) -> Option<u32> {
+    let next_virt = (virt & !0xFFF).wrapping_add(0x1000);
+    let next_phys = cpu::translate_address_read_no_side_effects(next_virt).ok()?;
+    if next_phys & !0xFFF != (phys & !0xFFF) + 0x1000 || memory::in_mapped_range(next_phys) {
+        return None;
+    }
+    let mut c = CpuContext { eip: phys, ..cpu.clone() };
+    let limit = (phys & !0xFFF) + 0x1000 + 15;
+    let (analysis, fits) = crate::cpu_context::decode_within(limit, || analysis::analyze_step(&mut c));
+    if !fits || analysis.ty != AnalysisType::Normal || analysis.no_next_instruction || analysis.absolute_jump {
+        return None;
+    }
+    if c.eip - phys > 15 || c.eip <= (phys & !0xFFF) + 0x1000 {
+        return None;
+    }
+    Some(c.eip)
+}
+
 /// Analyse one instruction without reading past the end of its page. None = it would cross.
 fn analyze_step_within_page(cpu: &mut CpuContext) -> Option<analysis::Analysis> {
     let limit = (cpu.eip & !0xFFF).wrapping_add(0x1000);
@@ -1293,6 +1311,18 @@ pub fn set_jit_x87_entry_state(on: u32) { unsafe { JIT_X87_ENTRY_STATE = on != 0
 #[no_mangle]
 pub fn get_jit_x87_entry_state() -> u32 { unsafe { JIT_X87_ENTRY_STATE as u32 } }
 pub fn x87_entry_state_enabled() -> bool { unsafe { JIT_X87_ENTRY_STATE } }
+static mut JIT_PAGE_STRADDLE: bool = false;
+#[no_mangle]
+pub fn set_jit_page_straddle(on: u32) { unsafe { JIT_PAGE_STRADDLE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_page_straddle() -> u32 { unsafe { JIT_PAGE_STRADDLE as u32 } }
+pub fn page_straddle_enabled() -> bool { unsafe { JIT_PAGE_STRADDLE } }
+static mut STRADDLES_COMPILED: u32 = 0;
+#[no_mangle]
+pub fn jit_straddles_compiled() -> u32 { unsafe { STRADDLES_COMPILED } }
+pub fn block_is_straddle(block: &BasicBlock) -> bool {
+    Page::page_of(block.end_addr - 1) != Page::page_of(block.addr)
+}
 static mut X87_ENTRY_FACTS: Vec<(u32, bool, bool, bool)> = Vec::new();
 static mut X87_ENTRY_IN: Option<HashMap<u32, (bool, bool)>> = None;
 static mut X87_ENTRY_KNOWN: u32 = 0;
@@ -4167,9 +4197,55 @@ fn jit_find_basic_blocks(
                 match analyze_step_within_page(&mut cpu) {
                     Some(analysis) => analysis,
                     None => {
-                        // Straddles the page end: the block ends before it, the interpreter
-                        // runs it with the real two-page fetch.
-                        profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                        let straddle_virt = (to_visit & !0xFFF) + (addr_before_instruction & 0xFFF) as i32;
+                        let next_page = Page::page_of(addr_before_instruction + 0x1000);
+                        let straddle = if page_straddle_enabled() && cpu.state_flags.is_32() {
+                            straddle_analysis(addr_before_instruction, straddle_virt, &cpu)
+                                .filter(|_| {
+                                    !page_blacklist.contains(&next_page)
+                                        && (pages.contains(&next_page) || (pages.len() as u32) < max_pages)
+                                })
+                        }
+                        else {
+                            None
+                        };
+                        match straddle {
+                            Some(end) if current_block.number_of_instructions == 0 => {
+                                pages.insert(next_page);
+                                current_block.number_of_instructions = 1;
+                                current_block.last_instruction_addr = addr_before_instruction;
+                                current_block.end_addr = end;
+                                let end_virt = straddle_virt + (end - addr_before_instruction) as i32;
+                                current_block.ty = BasicBlockType::Normal {
+                                    next_block_addr: follow_jump(
+                                        end_virt,
+                                        ctx,
+                                        &mut pages,
+                                        &mut page_blacklist,
+                                        max_pages,
+                                        &mut marked_as_entry,
+                                        &mut to_visit_stack,
+                                        Some(Page::page_of(phys_addr)),
+                                        &mut join,
+                                    ),
+                                    jump_offset: 0,
+                                    jump_offset_is_32: true,
+                                };
+                            },
+                            Some(_) => {
+                                to_visit_stack.push(straddle_virt);
+                                current_block.ty = BasicBlockType::Normal {
+                                    next_block_addr: Some(addr_before_instruction),
+                                    jump_offset: 0,
+                                    jump_offset_is_32: true,
+                                };
+                            },
+                            None => {
+                                // Straddles the page end: the block ends before it, the interpreter
+                                // runs it with the real two-page fetch.
+                                profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                            },
+                        }
                         break;
                     },
                 }
@@ -7302,6 +7378,13 @@ fn jit_generate_basic_block(
         ctx.builder.gg.log.push(analysis::GgEvent::Block(block.addr));
     }
 
+    if block_is_straddle(block) {
+        codegen::gen_straddle_check(ctx, start_addr);
+        if !codegen_dry_run() {
+            unsafe { STRADDLES_COMPILED = STRADDLES_COMPILED.saturating_add(1) }
+        }
+    }
+
     ctx.builder.get_local(&ctx.instruction_counter);
     ctx.builder.const_i32(block.number_of_instructions as i32);
     ctx.builder.add_i32();
@@ -8333,6 +8416,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_X87_ENTRY_STATE {
             add(0x7A11_0015);
+        }
+        if JIT_PAGE_STRADDLE {
+            add(0x7A11_0016);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

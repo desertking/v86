@@ -47,9 +47,9 @@ pub fn gen_mark_fpu_simd_dirty_once(ctx: &mut JitContext) {
 /// the page end, page-tail mode only) must ADD: the low bits alone would be the page's start.
 /// Below 0x1000 this emits the stock `or`, so modules compiled without page tails are unchanged.
 fn gen_or_page_offset(builder: &mut WasmBuilder, offset: i32) {
-    dbg_assert!(offset >= 0 && offset <= 0x1000);
-    if offset == 0x1000 {
-        builder.const_i32(0x1000);
+    dbg_assert!(offset >= 0 && offset < 0x2000);
+    if offset >= 0x1000 {
+        builder.const_i32(offset);
         builder.add_i32();
     }
     else {
@@ -122,6 +122,25 @@ pub fn gen_relative_jump(builder: &mut WasmBuilder, n: i32) {
         builder.add_i32();
         builder.store_aligned_i32(0);
     }
+}
+
+pub fn gen_straddle_check(ctx: &mut JitContext, start_addr: u32) {
+    gen_set_eip_low_bits(ctx.builder, start_addr as i32 & 0xFFF);
+    gen_get_eip(ctx.builder);
+    ctx.builder.const_i32(!0xFFF);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(0x1000);
+    ctx.builder.add_i32();
+    let address_local = ctx.builder.set_new_local();
+    let saved = ctx.start_of_current_instruction;
+    ctx.start_of_current_instruction = start_addr;
+    gen_get_phys_eip_plus_mem(ctx, &address_local);
+    ctx.start_of_current_instruction = saved;
+    ctx.builder.free_local(address_local);
+    ctx.builder
+        .const_i32(((start_addr & !0xFFF) + 0x1000) as i32 + unsafe { memory::mem8 } as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if_hinted(ctx.exit_label, HINT_GROUP_MEM, HINT_UNLIKELY);
 }
 
 pub fn gen_page_switch_check(
