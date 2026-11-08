@@ -1287,6 +1287,94 @@ pub fn set_jit_cond_skip(on: u32) { unsafe { JIT_COND_SKIP = on != 0 } }
 pub fn get_jit_cond_skip() -> u32 { unsafe { JIT_COND_SKIP as u32 } }
 pub fn cond_skip_enabled() -> bool { unsafe { JIT_COND_SKIP } }
 static mut COND_SKIPS_COMPILED: u32 = 0;
+static mut JIT_X87_ENTRY_STATE: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_entry_state(on: u32) { unsafe { JIT_X87_ENTRY_STATE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_entry_state() -> u32 { unsafe { JIT_X87_ENTRY_STATE as u32 } }
+pub fn x87_entry_state_enabled() -> bool { unsafe { JIT_X87_ENTRY_STATE } }
+static mut X87_ENTRY_FACTS: Vec<(u32, bool, bool, bool)> = Vec::new();
+static mut X87_ENTRY_IN: Option<HashMap<u32, (bool, bool)>> = None;
+static mut X87_ENTRY_KNOWN: u32 = 0;
+#[no_mangle]
+pub fn jit_x87_entry_known_blocks() -> u32 { unsafe { X87_ENTRY_KNOWN } }
+#[allow(static_mut_refs)]
+fn x87_entry_in(addr: u32) -> (bool, bool) {
+    if codegen_dry_run() {
+        return (false, false);
+    }
+    unsafe {
+        match &X87_ENTRY_IN {
+            Some(m) => m.get(&addr).copied().unwrap_or((false, false)),
+            None => (false, false),
+        }
+    }
+}
+#[allow(static_mut_refs)]
+fn x87_entry_compute(basic_blocks: &HashMap<u32, BasicBlock>, entries: &HashSet<u32>) {
+    let facts: HashMap<u32, (bool, bool, bool)> = unsafe {
+        std::mem::take(&mut X87_ENTRY_FACTS)
+            .into_iter()
+            .map(|(a, cr0, kept, dirty)| (a, (cr0, kept, dirty)))
+            .collect()
+    };
+    let mut preds: HashMap<u32, Vec<u32>> = HashMap::new();
+    for b in basic_blocks.values() {
+        let succs: Vec<u32> = match b.ty {
+            BasicBlockType::Normal { next_block_addr, .. } => next_block_addr.into_iter().collect(),
+            BasicBlockType::ConditionalJump {
+                next_block_addr,
+                next_block_branch_taken_addr,
+                ..
+            } => next_block_addr.into_iter().chain(next_block_branch_taken_addr).collect(),
+            BasicBlockType::AbsoluteEip | BasicBlockType::Exit => Vec::new(),
+        };
+        for t in succs {
+            preds.entry(t).or_default().push(b.addr);
+        }
+    }
+    let mut state: HashMap<u32, (bool, bool)> = HashMap::new();
+    for b in basic_blocks.values() {
+        let known = !b.is_entry_block && !entries.contains(&b.addr) && preds.contains_key(&b.addr);
+        state.insert(b.addr, (known, known));
+    }
+    let out = |state: &HashMap<u32, (bool, bool)>, p: u32| -> (bool, bool) {
+        let (cr0_in, dirty_in) = state.get(&p).copied().unwrap_or((false, false));
+        match facts.get(&p) {
+            Some(&(cr0, kept, dirty)) => (cr0 || cr0_in && kept, dirty || dirty_in),
+            None => (false, false),
+        }
+    };
+    loop {
+        let mut changed = false;
+        let addrs: Vec<u32> = state.keys().copied().collect();
+        for a in addrs {
+            let (cr0_in, dirty_in) = state[&a];
+            if !cr0_in && !dirty_in {
+                continue;
+            }
+            let mut cr0 = cr0_in;
+            let mut dirty = dirty_in;
+            for &p in &preds[&a] {
+                let (pc, pd) = out(&state, p);
+                cr0 &= pc;
+                dirty &= pd;
+            }
+            if (cr0, dirty) != (cr0_in, dirty_in) {
+                state.insert(a, (cr0, dirty));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    state.retain(|_, v| v.0 || v.1);
+    unsafe {
+        X87_ENTRY_KNOWN = X87_ENTRY_KNOWN.saturating_add(state.len() as u32);
+        X87_ENTRY_IN = Some(state);
+    }
+}
 #[no_mangle]
 pub fn jit_cond_skips_compiled() -> u32 { unsafe { COND_SKIPS_COMPILED } }
 static mut SMC_EXIT_PENDING: u8 = 0;
@@ -3207,6 +3295,7 @@ pub struct JitContext<'a> {
     pub fpu_pc_cache: Option<WasmLocal>,
     pub fpu_pc_cache_kept: bool,
     pub cr0_fpu_ok: bool,
+    pub cr0_killed: bool,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -4883,6 +4972,7 @@ fn jit_analyze_and_generate(
         )
         .0
     };
+    unsafe { X87_ENTRY_IN = None };
     dbg_assert!(!entries.is_empty());
 
     let mut page_info = HashMap::new();
@@ -5853,6 +5943,7 @@ fn jit_generate_module_guard_groups(
         })
         .collect();
 
+    unsafe { X87_ENTRY_FACTS.clear() };
     unsafe { CODEGEN_DRY_RUN = true };
     let (_, recorded_ok) = jit_generate_module(
         structure.clone(),
@@ -5865,6 +5956,9 @@ fn jit_generate_module_guard_groups(
         None,
     );
     unsafe { CODEGEN_DRY_RUN = false };
+    if x87_entry_state_enabled() {
+        x87_entry_compute(basic_blocks, &entry_set);
+    }
     let log = std::mem::take(&mut builder.gg.log);
     gg_stat_add(0, 1);
     for ev in &log {
@@ -6052,6 +6146,7 @@ fn jit_generate_module(
         fpu_pc_cache: None,
         fpu_pc_cache_kept: false,
         cr0_fpu_ok: false,
+        cr0_killed: false,
         x87_cache_kept: false,
         x87_run_left: 0,
         gg,
@@ -7185,7 +7280,9 @@ fn jit_generate_basic_block(
     };
 
     profiler::stat_increment(stat::COMPILE_BASIC_BLOCK);
-    ctx.cr0_fpu_ok = false;
+    let (cr0_in, dirty_in) = x87_entry_in(block.addr);
+    ctx.cr0_fpu_ok = cr0_in;
+    ctx.cr0_killed = false;
     let mut instructions_done = 0u32;
     ctx.builder.x87_top_ready = false;
 
@@ -7259,7 +7356,7 @@ fn jit_generate_basic_block(
     ctx.cpu.eip = start_addr;
     ctx.current_instruction = Instruction::Other;
     ctx.previous_instruction = Instruction::Other;
-    ctx.fpu_simd_dirty_marked = false;
+    ctx.fpu_simd_dirty_marked = dirty_in;
     ctx.elide_current_flags = false;
     let mut cond_skip_open: Option<(bool, bool)> = None;
 
@@ -7363,6 +7460,9 @@ fn jit_generate_basic_block(
         let end_eip = ctx.cpu.eip;
         if ctx.cr0_fpu_ok && opcode_may_write_cr0(start_eip) {
             ctx.cr0_fpu_ok = false;
+        }
+        if opcode_may_write_cr0(start_eip) {
+            ctx.cr0_killed = true;
         }
 
         // The PC predicate is deliberately narrower than the generic ST cache:
@@ -7468,6 +7568,11 @@ fn jit_generate_basic_block(
         }
         else {
             ctx.previous_instruction = produced;
+        }
+    }
+    if codegen_dry_run() && x87_entry_state_enabled() {
+        unsafe {
+            X87_ENTRY_FACTS.push((block.addr, ctx.cr0_fpu_ok, !ctx.cr0_killed, ctx.fpu_simd_dirty_marked));
         }
     }
 }
@@ -8225,6 +8330,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_COND_SKIP {
             add(0x7A11_0014);
+        }
+        if JIT_X87_ENTRY_STATE {
+            add(0x7A11_0015);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
