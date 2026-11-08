@@ -1380,6 +1380,12 @@ pub fn set_jit_sse_packed_inline(on: u32) { unsafe { JIT_SSE_PACKED_INLINE = on 
 #[no_mangle]
 pub fn get_jit_sse_packed_inline() -> u32 { unsafe { JIT_SSE_PACKED_INLINE as u32 } }
 pub fn sse_packed_inline_enabled() -> bool { unsafe { JIT_SSE_PACKED_INLINE } }
+static mut JIT_ALU16_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_alu16_inline(on: u32) { unsafe { JIT_ALU16_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_alu16_inline() -> u32 { unsafe { JIT_ALU16_INLINE as u32 } }
+pub fn alu16_inline_enabled() -> bool { unsafe { JIT_ALU16_INLINE } }
 static mut JIT_SMC_EXIT_LOCAL: bool = false;
 #[no_mangle]
 pub fn set_jit_smc_exit_local(on: u32) { unsafe { JIT_SMC_EXIT_LOCAL = on != 0 } }
@@ -8734,6 +8740,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_SSE_PACKED_INLINE {
             add(0x7A11_0027);
+        }
+        if JIT_ALU16_INLINE {
+            add(0x7A11_0028);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

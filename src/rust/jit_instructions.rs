@@ -852,10 +852,60 @@ fn group_arith_al_imm8(
     codegen::gen_set_reg8_unmasked(ctx, regs::EAX);
 }
 
+fn gen_call_fn2_ret_alu16(ctx: &mut JitContext, name: &str) {
+    let kind = match name {
+        "add16" => 0,
+        "sub16" => 1,
+        "and16" | "or16" | "xor16" => 2,
+        _ => 3,
+    };
+    if kind == 3 || !crate::jit::alu16_inline_enabled() {
+        ctx.builder.call_fn2_ret(name);
+        return;
+    }
+    let b = ctx.builder.set_new_local();
+    let a = ctx.builder.set_new_local();
+    ctx.builder.get_local(&a);
+    ctx.builder.get_local(&b);
+    match name {
+        "add16" => ctx.builder.add_i32(),
+        "sub16" => ctx.builder.sub_i32(),
+        "and16" => ctx.builder.and_i32(),
+        "or16" => ctx.builder.or_i32(),
+        _ => ctx.builder.xor_i32(),
+    }
+    if kind != 2 {
+        ctx.builder.const_i32(0xFFFF);
+        ctx.builder.and_i32();
+    }
+    let res = ctx.builder.set_new_local();
+    codegen::gen_set_last_result(ctx.builder, &res);
+    if kind == 2 {
+        codegen::gen_set_last_op_size_and_flags_changed(
+            ctx.builder,
+            OPSIZE_16,
+            FLAGS_ALL & !FLAG_CARRY & !FLAG_OVERFLOW & !FLAG_ADJUST,
+        );
+        codegen::gen_clear_flags_bits(ctx.builder, FLAG_CARRY | FLAG_OVERFLOW | FLAG_ADJUST);
+    }
+    else {
+        codegen::gen_set_last_op1(ctx.builder, &a);
+        codegen::gen_set_last_op_size_and_flags_changed(
+            ctx.builder,
+            OPSIZE_16,
+            if kind == 1 { FLAGS_ALL | FLAG_SUB } else { FLAGS_ALL },
+        );
+    }
+    ctx.builder.get_local(&res);
+    ctx.builder.free_local(res);
+    ctx.builder.free_local(a);
+    ctx.builder.free_local(b);
+}
+
 fn group_arith_ax_imm16(ctx: &mut JitContext, op: &str, imm16: u32) {
     codegen::gen_get_reg16(ctx, regs::AX);
     ctx.builder.const_i32(imm16 as i32);
-    ctx.builder.call_fn2_ret(op);
+    gen_call_fn2_ret_alu16(ctx, op);
     codegen::gen_set_reg16(ctx, regs::AX);
 }
 
@@ -1029,14 +1079,14 @@ macro_rules! define_instruction_write_reg16(
         pub fn $name_mem(ctx: &mut JitContext, modrm_byte: ModrmByte, r: u32) {
             codegen::gen_get_reg16(ctx, r);
             codegen::gen_modrm_resolve_safe_read16(ctx, modrm_byte);
-            ctx.builder.call_fn2_ret($fn);
+            gen_call_fn2_ret_alu16(ctx, $fn);
             codegen::gen_set_reg16(ctx, r);
         }
 
         pub fn $name_reg(ctx: &mut JitContext, r1: u32, r2: u32) {
             codegen::gen_get_reg16(ctx, r2);
             codegen::gen_get_reg16(ctx, r1);
-            ctx.builder.call_fn2_ret($fn);
+            gen_call_fn2_ret_alu16(ctx, $fn);
             codegen::gen_set_reg16(ctx, r2);
         }
     )
@@ -1200,7 +1250,7 @@ macro_rules! define_instruction_read_write_mem16(
             codegen::gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| {
                 codegen::gen_safe_read_write(ctx, BitSize::WORD, &addr, &|ref mut ctx| {
                     codegen::gen_get_reg16(ctx, r);
-                    ctx.builder.call_fn2_ret($fn);
+                    gen_call_fn2_ret_alu16(ctx, $fn);
                 });
             });
         }
@@ -1208,7 +1258,7 @@ macro_rules! define_instruction_read_write_mem16(
         pub fn $name_reg(ctx: &mut JitContext, r1: u32, r2: u32) {
             codegen::gen_get_reg16(ctx, r1);
             codegen::gen_get_reg16(ctx, r2);
-            ctx.builder.call_fn2_ret($fn);
+            gen_call_fn2_ret_alu16(ctx, $fn);
             codegen::gen_set_reg16(ctx, r1);
         }
     );
@@ -1218,7 +1268,7 @@ macro_rules! define_instruction_read_write_mem16(
             codegen::gen_modrm_resolve_with_local(ctx, modrm_byte, &|ctx, addr| {
                 codegen::gen_safe_read_write(ctx, BitSize::WORD, &addr, &|ref mut ctx| {
                     ctx.builder.const_i32(1);
-                    ctx.builder.call_fn2_ret($fn);
+                    gen_call_fn2_ret_alu16(ctx, $fn);
                 });
             });
         }
@@ -1226,7 +1276,7 @@ macro_rules! define_instruction_read_write_mem16(
         pub fn $name_reg(ctx: &mut JitContext, r1: u32) {
             codegen::gen_get_reg16(ctx, r1);
             ctx.builder.const_i32(1);
-            ctx.builder.call_fn2_ret($fn);
+            gen_call_fn2_ret_alu16(ctx, $fn);
             codegen::gen_set_reg16(ctx, r1);
         }
     );
@@ -1238,7 +1288,7 @@ macro_rules! define_instruction_read_write_mem16(
                     codegen::gen_get_reg8(ctx, regs::CL);
                     ctx.builder.const_i32(31);
                     ctx.builder.and_i32();
-                    ctx.builder.call_fn2_ret($fn);
+                    gen_call_fn2_ret_alu16(ctx, $fn);
                 });
             });
         }
@@ -1248,7 +1298,7 @@ macro_rules! define_instruction_read_write_mem16(
             codegen::gen_get_reg8(ctx, regs::CL);
                 ctx.builder.const_i32(31);
                 ctx.builder.and_i32();
-            ctx.builder.call_fn2_ret($fn);
+            gen_call_fn2_ret_alu16(ctx, $fn);
             codegen::gen_set_reg16(ctx, r1);
         }
     );
@@ -1322,7 +1372,7 @@ macro_rules! define_instruction_read_write_mem16(
                 let imm = mask_imm!(imm, $imm) as i32;
                 codegen::gen_safe_read_write(ctx, BitSize::WORD, &addr, &|ref mut ctx| {
                     ctx.builder.const_i32(imm as i32);
-                    ctx.builder.call_fn2_ret($fn);
+                    gen_call_fn2_ret_alu16(ctx, $fn);
                 });
             });
         }
@@ -1331,7 +1381,7 @@ macro_rules! define_instruction_read_write_mem16(
             let imm = mask_imm!(imm, $imm);
             codegen::gen_get_reg16(ctx, r1);
             ctx.builder.const_i32(imm as i32);
-            ctx.builder.call_fn2_ret($fn);
+            gen_call_fn2_ret_alu16(ctx, $fn);
             codegen::gen_set_reg16(ctx, r1);
         }
     );
