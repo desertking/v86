@@ -1280,6 +1280,15 @@ pub fn set_jit_flag_carry_neutral(on: u32) { unsafe { JIT_FLAG_CARRY_NEUTRAL = o
 #[no_mangle]
 pub fn get_jit_flag_carry_neutral() -> u32 { unsafe { JIT_FLAG_CARRY_NEUTRAL as u32 } }
 pub fn flag_carry_neutral_enabled() -> bool { unsafe { JIT_FLAG_CARRY_NEUTRAL } }
+static mut JIT_COND_SKIP: bool = false;
+#[no_mangle]
+pub fn set_jit_cond_skip(on: u32) { unsafe { JIT_COND_SKIP = on != 0 } }
+#[no_mangle]
+pub fn get_jit_cond_skip() -> u32 { unsafe { JIT_COND_SKIP as u32 } }
+pub fn cond_skip_enabled() -> bool { unsafe { JIT_COND_SKIP } }
+static mut COND_SKIPS_COMPILED: u32 = 0;
+#[no_mangle]
+pub fn jit_cond_skips_compiled() -> u32 { unsafe { COND_SKIPS_COMPILED } }
 static mut SMC_EXIT_PENDING: u8 = 0;
 static mut SMC_EXITS: u64 = 0;
 static mut SMC_PENDING_SET: u32 = 0;
@@ -3276,6 +3285,18 @@ fn skip_instruction_prefixes(mut addr: u32) -> u32 {
     }
 }
 
+fn cond_skip_at(addr: u32) -> bool {
+    let opcode = read_jit_u8(addr);
+    if !(0x70..=0x7F).contains(&opcode) || read_jit_u8(addr + 1) != 6 {
+        return false;
+    }
+    let skipped = addr + 2;
+    if Page::page_of(skipped + 6) != Page::page_of(addr) || is_near_end_of_page(skipped + 6) {
+        return false;
+    }
+    matches!(read_jit_u8(skipped), 0xD8 | 0xDC) && read_jit_u8(skipped + 1) == 0x05
+}
+
 fn opcode_is_flag_neutral(addr: u32) -> bool {
     matches!(
         decode_jit_opcode(addr).0,
@@ -4129,6 +4150,12 @@ fn jit_find_basic_blocks(
                         }
                     }
                 },
+                AnalysisType::Jump {
+                    condition: Some(_),
+                    ..
+                } if cond_skip_enabled()
+                    && next_on_page
+                    && cond_skip_at(addr_before_instruction) => {},
                 AnalysisType::Jump {
                     offset,
                     is_32,
@@ -7234,6 +7261,7 @@ fn jit_generate_basic_block(
     ctx.previous_instruction = Instruction::Other;
     ctx.fpu_simd_dirty_marked = false;
     ctx.elide_current_flags = false;
+    let mut cond_skip_open: Option<(bool, bool)> = None;
 
     loop {
         // Eight bytes, not four: the operand-form census needs the SIB byte, and a
@@ -7262,7 +7290,35 @@ fn jit_generate_basic_block(
             }
         }
 
-        if ctx.x87_run_left == 0 && x87_runs_enabled() && ctx.cpu.eip != last_instruction_addr {
+        if cond_skip_open.is_none()
+            && cond_skip_enabled()
+            && ctx.cpu.eip != last_instruction_addr
+            && ctx.x87_run_left == 0
+            && cond_skip_at(ctx.cpu.eip)
+        {
+            let condition = read_jit_u8(ctx.cpu.eip) as u8;
+            gen_cond_skip_fence(ctx);
+            if ctx.builder.x87_top_local.is_some() && !ctx.builder.x87_top_ready {
+                ctx.builder.x87_top_init();
+            }
+            codegen::gen_condition_fn_negated(ctx, condition);
+            ctx.builder.if_void();
+            if !codegen_dry_run() {
+                unsafe { COND_SKIPS_COMPILED = COND_SKIPS_COMPILED.saturating_add(1) }
+            }
+            cond_skip_open = Some((ctx.cr0_fpu_ok, ctx.fpu_simd_dirty_marked));
+            ctx.cpu.eip += 2;
+            ctx.previous_instruction = Instruction::Other;
+            ctx.current_instruction = Instruction::Other;
+            instructions_done += 1;
+            continue;
+        }
+
+        if ctx.x87_run_left == 0
+            && x87_runs_enabled()
+            && cond_skip_open.is_none()
+            && ctx.cpu.eip != last_instruction_addr
+        {
             ctx.cpu.prefixes = 0;
             if ctx.cpu.asize_32() {
                 let run = x87_run_scan(ctx.cpu.eip, last_instruction_addr);
@@ -7332,6 +7388,18 @@ fn jit_generate_basic_block(
             }
         }
         instructions_done += 1;
+        if let Some((cr0_fpu_ok, fpu_simd_dirty_marked)) = cond_skip_open.take() {
+            gen_cond_skip_fence(ctx);
+            ctx.builder.else_();
+            ctx.builder.get_local(&ctx.instruction_counter);
+            ctx.builder.const_i32(1);
+            ctx.builder.sub_i32();
+            ctx.builder.set_local(&ctx.instruction_counter);
+            ctx.builder.block_end();
+            ctx.cr0_fpu_ok = cr0_fpu_ok;
+            ctx.fpu_simd_dirty_marked = fpu_simd_dirty_marked;
+            ctx.current_instruction = Instruction::Other;
+        }
         if smc_exit_enabled()
             && ctx.builder.code_write_call_seen
             && ctx.x87_run_left == 0
@@ -7401,6 +7469,17 @@ fn jit_generate_basic_block(
         else {
             ctx.previous_instruction = produced;
         }
+    }
+}
+
+fn gen_cond_skip_fence(ctx: &mut JitContext) {
+    codegen::gen_x87_local_cache_free_all(ctx);
+    codegen::gen_push32_write_cache_free(ctx);
+    codegen::gen_read_tlb_cache_free(ctx);
+    codegen::gen_perm_map_off_free(ctx);
+    codegen::gen_fpu_pc_cache_free(ctx);
+    if ctx.gg.mode != codegen::GgMode::Off {
+        ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
     }
 }
 
@@ -8143,6 +8222,9 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_FLAG_CARRY_NEUTRAL {
             add(0x7A11_0013);
+        }
+        if JIT_COND_SKIP {
+            add(0x7A11_0014);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
