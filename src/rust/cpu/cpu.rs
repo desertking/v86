@@ -4245,7 +4245,7 @@ pub unsafe fn safe_write_slow_jit(
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(addr_low));
+            if !memory::is_silent(addr_low, (bitsize / 8) as u32, value_low, value_high) { jit::jit_dirty_page(Page::page_of(addr_low)); }
         }
         ((addr_low as i32 + memory::mem8 as i32) ^ addr) & !0xFFF
     }
@@ -4285,7 +4285,7 @@ pub unsafe fn safe_write8(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            if !memory::is_silent(phys_addr, 1, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4307,7 +4307,7 @@ pub unsafe fn safe_write16(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            if !memory::is_silent(phys_addr, 2, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4332,7 +4332,7 @@ pub unsafe fn safe_write32(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            if !memory::is_silent(phys_addr, 4, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4355,7 +4355,7 @@ pub unsafe fn safe_write64(addr: i32, value: u64) -> OrPageFault<()> {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                if !memory::is_silent(phys_addr, 8, value, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4379,7 +4379,7 @@ pub unsafe fn safe_write128(addr: i32, value: reg128) -> OrPageFault<()> {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                if !memory::is_silent(phys_addr, 16, value.u64[0], value.u64[1]) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4402,7 +4402,7 @@ pub unsafe fn safe_read_write8(addr: i32, instruction: &dyn Fn(i32) -> i32) {
     }
     else {
         if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_addr));
+            if !memory::is_silent(phys_addr, 1, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4429,7 +4429,7 @@ pub unsafe fn safe_read_write16(addr: i32, instruction: &dyn Fn(i32) -> i32) {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                if !memory::is_silent(phys_addr, 2, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4457,7 +4457,7 @@ pub unsafe fn safe_read_write32(addr: i32, instruction: &dyn Fn(i32) -> i32) {
         }
         else {
             if !can_skip_dirty_page {
-                jit::jit_dirty_page(Page::page_of(phys_addr));
+                if !memory::is_silent(phys_addr, 4, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));

@@ -291,7 +291,16 @@ unsafe fn string_instruction(
         dbg_assert!(count_until_end_of_page > 0);
 
         if !skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(phys_dst));
+            let silent = match instruction {
+                Instruction::Movs if !movs_into_svga_lfb => memory::is_silent_copy(
+                    phys_src, phys_dst, count_until_end_of_page, size_bytes as u32, direction == -1),
+                Instruction::Stos => memory::is_silent_fill(
+                    phys_dst, count_until_end_of_page, size_bytes as u32, direction == -1, data as u32),
+                _ => false,
+            };
+            if !silent {
+                jit::jit_dirty_page(Page::page_of(phys_dst));
+            }
         }
 
         let mut rep_cmp_finished = false;

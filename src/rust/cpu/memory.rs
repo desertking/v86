@@ -276,13 +276,87 @@ pub unsafe fn read128(addr: u32) -> reg128 {
     }
 }
 
+pub static mut SMC_SILENT: bool = false;
+pub static mut SMC_SILENT_SKIPS: u32 = 0;
+#[no_mangle]
+pub fn set_jit_smc_silent(on: u32) { unsafe { SMC_SILENT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_smc_silent() -> u32 { unsafe { SMC_SILENT as u32 } }
+#[no_mangle]
+pub fn jit_smc_silent_skips() -> u32 { unsafe { SMC_SILENT_SKIPS } }
+
+#[inline]
+fn silent_counted(phys: u32) -> bool {
+    if jit::jit_page_has_code(Page::page_of(phys)) {
+        unsafe { SMC_SILENT_SKIPS = SMC_SILENT_SKIPS.wrapping_add(1) }
+    }
+    true
+}
+
+pub unsafe fn is_silent(phys: u32, bytes: u32, lo: u64, hi: u64) -> bool {
+    if !SMC_SILENT || bytes == 0 || bytes > 16 {
+        return false;
+    }
+    let end = phys as u64 + bytes as u64;
+    if end > *crate::cpu::global_pointers::memory_size as u64 || in_mapped_range(phys) || in_mapped_range((end - 1) as u32) {
+        return false;
+    }
+    let p = mem8.offset(phys as isize);
+    for i in 0..bytes {
+        let want = if i < 8 { (lo >> (8 * i)) as u8 } else { (hi >> (8 * (i - 8))) as u8 };
+        if *p.offset(i as isize) != want {
+            return false;
+        }
+    }
+    silent_counted(phys)
+}
+
+pub unsafe fn is_silent_fill(phys: u32, count: u32, size: u32, backwards: bool, value: u32) -> bool {
+    if !SMC_SILENT || count == 0 {
+        return false;
+    }
+    let len = count * size;
+    let start = if backwards { phys + size - len } else { phys };
+    let end = start as u64 + len as u64;
+    if end > *crate::cpu::global_pointers::memory_size as u64 || in_mapped_range(start) || in_mapped_range((end - 1) as u32) {
+        return false;
+    }
+    let p = mem8.offset(start as isize);
+    for i in 0..len {
+        if *p.offset(i as isize) != (value >> (8 * (i % size))) as u8 {
+            return false;
+        }
+    }
+    silent_counted(start)
+}
+
+pub unsafe fn is_silent_copy(phys_src: u32, phys_dst: u32, count: u32, size: u32, backwards: bool) -> bool {
+    if !SMC_SILENT || count == 0 {
+        return false;
+    }
+    let len = count * size;
+    let (s0, d0) = if backwards { (phys_src + size - len, phys_dst + size - len) } else { (phys_src, phys_dst) };
+    let mem_end = *crate::cpu::global_pointers::memory_size as u64;
+    if s0 as u64 + len as u64 > mem_end || d0 as u64 + len as u64 > mem_end || in_mapped_range(d0) || in_mapped_range(d0 + len - 1) {
+        return false;
+    }
+    let ps = mem8.offset(s0 as isize);
+    let pd = mem8.offset(d0 as isize);
+    for i in 0..len as isize {
+        if *ps.offset(i) != *pd.offset(i) {
+            return false;
+        }
+    }
+    silent_counted(d0)
+}
+
 #[no_mangle]
 pub unsafe fn write8(addr: u32, value: i32) {
     if in_mapped_range(addr) {
         mmap_write8(addr, value & 0xFF);
     }
     else {
-        jit::jit_dirty_page(Page::page_of(addr));
+        if !is_silent(addr, 1, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(addr)); }
         write8_no_mmap_or_dirty_check(addr, value);
     };
 }
@@ -304,7 +378,7 @@ pub unsafe fn write16(addr: u32, value: i32) {
         mmap_write16(addr, value & 0xFFFF);
     }
     else {
-        jit::jit_dirty_cache_small(addr, addr + 2);
+        if !is_silent(addr, 2, value as u32 as u64, 0) { jit::jit_dirty_cache_small(addr, addr + 2); }
         write16_no_mmap_or_dirty_check(addr, value);
     };
 }
@@ -320,7 +394,7 @@ pub unsafe fn write32(addr: u32, value: i32) {
         mmap_write32(addr, value);
     }
     else {
-        jit::jit_dirty_cache_small(addr, addr + 4);
+        if !is_silent(addr, 4, value as u32 as u64, 0) { jit::jit_dirty_cache_small(addr, addr + 4); }
         write32_no_mmap_or_dirty_check(addr, value);
     }
 }
