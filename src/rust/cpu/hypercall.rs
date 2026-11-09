@@ -373,6 +373,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         43 => handle_cdecl_pow(),
         44 => handle_cdecl_ceil(),
         45 => handle_cdecl_floor(),
+        46 => handle_char_next_a(),
+        47 => handle_char_next_w(),
         // String/memory hypercalls (Tier 3)
         51 => handle_wcslen(),
         52 => handle_wcscpy(),
@@ -2581,6 +2583,38 @@ unsafe fn handle_memmove() -> bool {
 }
 
 /// memchr(void* s, int c, size_t n): first occurrence of c, or NULL.
+/// CharNextA(LPCSTR lpsz), stdcall: one byte on, or lpsz itself on the terminator. Every
+/// ANSI code page the HLE provides is single-byte (IsDBCSLeadByte answers FALSE).
+unsafe fn handle_char_next_a() -> bool {
+    let esp = read_reg32(ESP);
+    let Ok(p) = safe_read32s(esp.wrapping_add(4)) else { return false; };
+    if p == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    let Ok(ch) = hc_safe_read8(p) else { return false; };
+    write_reg32(EAX, if ch == 0 { p } else { p.wrapping_add(1) });
+    true
+}
+
+/// CharNextW(LPCWSTR lpsz), stdcall: one UTF-16 unit on, or lpsz itself on the terminator.
+unsafe fn handle_char_next_w() -> bool {
+    let esp = read_reg32(ESP);
+    let Ok(p) = safe_read32s(esp.wrapping_add(4)) else { return false; };
+    if p == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    let Ok(ch) = hc_safe_read16(p) else { return false; };
+    write_reg32(EAX, if ch == 0 { p } else { p.wrapping_add(2) });
+    true
+}
+
+/// Handler ids 46/47 (CharNextA/CharNextW) exist in this build. The host binds them only
+/// when this reports 1, so an older engine keeps the JS thunks.
+#[no_mangle]
+pub extern "C" fn get_char_next_abi() -> u32 { 1 }
+
 unsafe fn handle_memchr() -> bool {
     let esp = read_reg32(ESP);
     let Ok(src) = safe_read32s(esp.wrapping_add(4)) else { return false; };
