@@ -6997,10 +6997,20 @@ fn gen_x87_run_hosts_shared(
         let desc = crate::modrm::gg_desc(ctx.cpu, &modrm);
         let key = desc.map(|d| (d.seg, d.base, d.index, d.scale));
         let disp = desc.map_or(0, |d| d.disp);
+        let absolute = matches!(key, Some((seg, base, index, _))
+            if seg == analysis::GG_SEG_FLAT && base == analysis::GG_NOREG && index == analysis::GG_NOREG);
         let found = groups.iter().position(|g| {
-            g.key.is_some()
-                && g.key == key
-                && (disp + bytes).max(g.hi) as i64 - disp.min(g.lo) as i64 <= 64
+            if g.key.is_none() || g.key != key {
+                return false;
+            }
+            let lo = disp.min(g.lo);
+            let hi = (disp + bytes).max(g.hi);
+            if absolute {
+                (lo as u32 & !0xFFF) == ((hi - 1) as u32 & !0xFFF)
+            }
+            else {
+                hi as i64 - lo as i64 <= 64
+            }
         });
         match found {
             Some(gi) => {
