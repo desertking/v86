@@ -1626,6 +1626,18 @@ pub fn x87_runs_note_compiled() {
         unsafe { X87_RUNS_COMPILED = X87_RUNS_COMPILED.saturating_add(1) }
     }
 }
+static mut JIT_X87_RUN_TAIL: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_run_tail(on: u32) { unsafe { JIT_X87_RUN_TAIL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_run_tail() -> u32 { unsafe { JIT_X87_RUN_TAIL as u32 } }
+pub fn x87_run_tail_enabled() -> bool { unsafe { JIT_X87_RUN_TAIL } }
+static mut JIT_X87_RUN_GUARD_SHARE: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_run_guard_share(on: u32) { unsafe { JIT_X87_RUN_GUARD_SHARE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_run_guard_share() -> u32 { unsafe { JIT_X87_RUN_GUARD_SHARE as u32 } }
+pub fn x87_run_guard_share_enabled() -> bool { unsafe { JIT_X87_RUN_GUARD_SHARE } }
 pub fn x87_runs_enabled() -> bool {
     unsafe {
         JIT_X87_RUNS
@@ -7867,7 +7879,10 @@ fn jit_generate_basic_block(
         {
             ctx.cpu.prefixes = 0;
             if ctx.cpu.asize_32() {
-                let run = x87_run_scan(ctx.cpu.eip, last_instruction_addr);
+                let include_last = x87_run_tail_enabled()
+                    && !needs_eip_updated
+                    && matches!(block.ty, BasicBlockType::Normal { .. });
+                let run = x87_run_scan(ctx.cpu.eip, last_instruction_addr, include_last);
                 if run.len() >= 2 {
                     ctx.x87_run_left = run.len() as u32;
                     codegen::gen_x87_run(ctx, &run);
@@ -8150,16 +8165,23 @@ fn x87_run_decode(addr: u32) -> Option<codegen::X87RunOp> {
     }
 }
 
-fn x87_run_scan(start: u32, last_instruction_addr: u32) -> Vec<codegen::X87RunInsn> {
+fn x87_run_scan(start: u32, last_instruction_addr: u32, include_last: bool) -> Vec<codegen::X87RunInsn> {
     let mut run = Vec::new();
     let mut model = codegen::X87RunModel::new();
     let mut addr = start;
     let mut stored = false;
     let mut ops = 0;
-    while addr != last_instruction_addr && run.len() < 16 {
+    while run.len() < 16 {
+        let is_last = addr == last_instruction_addr;
+        if is_last && !include_last {
+            break;
+        }
         if read_jit_u8(addr) == 0x9B && fwait_inline_enabled() && !run.is_empty() {
             run.push(codegen::X87RunInsn { addr, op: codegen::X87RunOp::Wait });
             addr += 1;
+            if is_last {
+                break;
+            }
             continue;
         }
         if !(0xD8..=0xDF).contains(&read_jit_u8(addr)) {
@@ -8171,7 +8193,7 @@ fn x87_run_scan(start: u32, last_instruction_addr: u32) -> Vec<codegen::X87RunIn
         };
         let len = 1 + x87_run_modrm_length(addr + 1);
         if Page::page_of(addr) != Page::page_of(addr + len - 1)
-            || addr + len > last_instruction_addr
+            || !is_last && addr + len > last_instruction_addr
         {
             break;
         }
@@ -8185,7 +8207,7 @@ fn x87_run_scan(start: u32, last_instruction_addr: u32) -> Vec<codegen::X87RunIn
         ops += 1;
         run.push(codegen::X87RunInsn { addr, op });
         addr += len;
-        if matches!(op, codegen::X87RunOp::Fnstsw) {
+        if matches!(op, codegen::X87RunOp::Fnstsw) || is_last {
             break;
         }
     }
@@ -8811,6 +8833,12 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_PAGE_STRADDLE {
             add(0x7A11_0016);
+        }
+        if JIT_X87_RUN_TAIL {
+            add(0x7A11_0040);
+        }
+        if JIT_X87_RUN_GUARD_SHARE {
+            add(0x7A11_0041);
         }
         if JIT_X87_CMP_LEAN {
             add(0x7A11_0017);

@@ -6609,6 +6609,10 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
     }
 
     let mut hosts: Vec<Option<WasmLocal>> = Vec::with_capacity(run.len());
+    if crate::jit::x87_run_guard_share_enabled() {
+        gen_x87_run_hosts_shared(ctx, run, slow, &mut hosts);
+    }
+    else {
     for insn in run {
         let access = match insn.op {
             X87RunOp::PushMem(X87RunMem::M80) => Some((10, false)),
@@ -6659,6 +6663,7 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
         ctx.builder.set_local(&address);
         ctx.builder.free_local(entry);
         hosts.push(Some(address));
+    }
     }
     ctx.cpu.eip = start;
 
@@ -6944,6 +6949,126 @@ pub fn gen_x87_run(ctx: &mut JitContext, run: &[X87RunInsn]) {
     ctx.builder.free_local(rot);
     ctx.builder.free_local(empty);
     ctx.builder.free_local(top);
+}
+
+fn x87_run_access(op: &X87RunOp) -> Option<(i32, bool)> {
+    match *op {
+        X87RunOp::PushMem(X87RunMem::M80) => Some((10, false)),
+        X87RunOp::PushMem(m) | X87RunOp::BinMem(_, m) | X87RunOp::ComMem(m, _) => {
+            Some((if m == X87RunMem::M64 { 8 } else { 4 }, false))
+        },
+        X87RunOp::StoreMem { m64, .. } => Some((if m64 { 8 } else { 4 }, true)),
+        _ => None,
+    }
+}
+
+fn x87_run_decode_modrm(ctx: &mut JitContext, addr: u32) -> ModrmByte {
+    ctx.cpu.eip = addr;
+    ctx.cpu.prefixes = 0;
+    ctx.cpu.read_imm8();
+    let modrm_byte = ctx.cpu.read_imm8();
+    crate::modrm::decode(ctx.cpu, modrm_byte)
+}
+
+fn gen_x87_run_hosts_shared(
+    ctx: &mut JitContext,
+    run: &[X87RunInsn],
+    slow: crate::wasmgen::wasm_builder::Label,
+    hosts: &mut Vec<Option<WasmLocal>>,
+) {
+    struct Group {
+        key: Option<(u8, u8, u8, u8)>,
+        lo: i32,
+        hi: i32,
+        write: bool,
+        rep: u32,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    let mut member: Vec<Option<(usize, i32)>> = Vec::with_capacity(run.len());
+    for insn in run {
+        let (bytes, write) = match x87_run_access(&insn.op) {
+            Some(a) => a,
+            None => {
+                member.push(None);
+                continue;
+            },
+        };
+        let modrm = x87_run_decode_modrm(ctx, insn.addr);
+        let desc = crate::modrm::gg_desc(ctx.cpu, &modrm);
+        let key = desc.map(|d| (d.seg, d.base, d.index, d.scale));
+        let disp = desc.map_or(0, |d| d.disp);
+        let found = groups.iter().position(|g| {
+            g.key.is_some()
+                && g.key == key
+                && (disp + bytes).max(g.hi) as i64 - disp.min(g.lo) as i64 <= 64
+        });
+        match found {
+            Some(gi) => {
+                let g = &mut groups[gi];
+                if disp < g.lo {
+                    g.lo = disp;
+                    g.rep = insn.addr;
+                }
+                g.hi = g.hi.max(disp + bytes);
+                g.write |= write;
+                member.push(Some((gi, disp)));
+            },
+            None => {
+                groups.push(Group { key, lo: disp, hi: disp + bytes, write, rep: insn.addr });
+                member.push(Some((groups.len() - 1, disp)));
+            },
+        }
+    }
+    let mut bases: Vec<WasmLocal> = Vec::with_capacity(groups.len());
+    for g in &groups {
+        let modrm = x87_run_decode_modrm(ctx, g.rep);
+        gen_modrm_resolve(ctx, modrm);
+        let address = ctx.builder.set_new_local();
+        ctx.builder.get_local(&address);
+        ctx.builder.const_i32(12);
+        ctx.builder.shr_u_i32();
+        ctx.builder.const_i32(2);
+        ctx.builder.shl_i32();
+        ctx.builder
+            .load_aligned_i32(unsafe { &tlb_data[0] as *const i32 as u32 });
+        let entry = ctx.builder.tee_new_local();
+        ctx.builder.const_i32(if g.write { gg_tlb_mask_write(ctx) } else { gg_tlb_mask_read(ctx) });
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(TLB_VALID as i32);
+        ctx.builder.ne_i32();
+        ctx.builder.get_local(&address);
+        ctx.builder.const_i32(0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.const_i32(0x1000 - (g.hi - g.lo));
+        ctx.builder.gt_i32();
+        ctx.builder.or_i32();
+        ctx.builder.br_if(slow);
+        ctx.builder.get_local(&entry);
+        ctx.builder.const_i32(!0xFFF);
+        ctx.builder.and_i32();
+        ctx.builder.get_local(&address);
+        ctx.builder.xor_i32();
+        ctx.builder.set_local(&address);
+        ctx.builder.free_local(entry);
+        bases.push(address);
+    }
+    for m in &member {
+        match *m {
+            None => hosts.push(None),
+            Some((gi, disp)) => {
+                ctx.builder.get_local(&bases[gi]);
+                let delta = disp - groups[gi].lo;
+                if delta != 0 {
+                    ctx.builder.const_i32(delta);
+                    ctx.builder.add_i32();
+                }
+                hosts.push(Some(ctx.builder.set_new_local()));
+            },
+        }
+    }
+    for b in bases {
+        ctx.builder.free_local(b);
+    }
 }
 
 fn gen_x87_run_clear_c1(ctx: &mut JitContext, status: &WasmLocal) {

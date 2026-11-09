@@ -250,6 +250,11 @@ function run(img, cfg) {
                 if (!w.set_jit_x87_runs) { resolve({ status: "NO-SWITCH" }); return; }
                 w.set_jit_x87_runs(cfg.on ? 1 : 0);
                 w.set_jit_flag_locals_auto?.(cfg.auto ? 1 : 0);
+                for (const kv of (process.env.X87_RUN_EXTRA || "").split(",").filter(Boolean)) {
+                    const [n, v] = kv.split("=");
+                    if (!w["set_" + n]) { resolve({ status: "NO-SWITCH" }); return; }
+                    w["set_" + n](Number(v));
+                }
                 if (cfg.stats) w.set_dispatch_stats(1);
                 cpu.jit_clear_cache?.();
             }
