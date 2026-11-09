@@ -113,6 +113,10 @@ const OFF_HC_RAND_SEED: usize = 0x0B0;
 /// on every capture mutation and on buffer-change resync, which makes the page
 /// authoritative at all times.
 const OFF_HC_CAPTURE_HWND: usize = 0x0B4;
+/// TlsAlloc'd slots 0..63 as a bit mask (lo = 0..31, hi = 32..63), published by JS on
+/// TlsAlloc/TlsFree and on every page resync. TlsSetValue on a clear bit falls back to JS.
+const OFF_HC_TLS_ALLOCATED_LO: usize = 0x0B8;
+const OFF_HC_TLS_ALLOCATED_HI: usize = 0x0BC;
 const OFF_HC_DISPATCH_TABLE: usize = 0x100;
 const OFF_HC_DISPATCH_TABLE_EXT: usize = 0x4000;
 const HC_DISPATCH_LIMIT: i32 = 0x10000;
@@ -375,6 +379,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         45 => handle_cdecl_floor(),
         46 => handle_char_next_a(),
         47 => handle_char_next_w(),
+        48 => handle_tls_set_value(),
         // String/memory hypercalls (Tier 3)
         51 => handle_wcslen(),
         52 => handle_wcscpy(),
@@ -2264,6 +2269,43 @@ unsafe fn handle_tls_get_value() -> bool {
     write_reg32(EAX, value);
     true
 }
+
+/// TlsSetValue(dwTlsIndex, lpTlsValue) — stdcall(2). Writes the slot TlsGetValue (handler
+/// 64) reads: the current thread's TEB TLS array. LastError is untouched on success, as in
+/// Win32. Index >= 64, an unallocated slot or a missing TEB fall back to JS.
+unsafe fn handle_tls_set_value() -> bool {
+    let esp = read_reg32(ESP);
+    let Ok(index) = safe_read32s(esp.wrapping_add(4)) else { return false; };
+    let Ok(value) = safe_read32s(esp.wrapping_add(8)) else { return false; };
+    let index = index as u32;
+    if index >= 64 {
+        return false;
+    }
+    let mask = if index < 32 {
+        *(hp_ptr().add(OFF_HC_TLS_ALLOCATED_LO) as *const u32) >> index
+    }
+    else {
+        *(hp_ptr().add(OFF_HC_TLS_ALLOCATED_HI) as *const u32) >> (index - 32)
+    };
+    if mask & 1 == 0 {
+        return false;
+    }
+    let teb_base = *(hp_ptr().add(OFF_HC_TEB_BASE) as *const u32);
+    if teb_base == 0 {
+        return false;
+    }
+    let tls_array_ptr = memory::read32_no_mmap_check(teb_base + 0x2C) as u32;
+    if tls_array_ptr == 0 {
+        return false;
+    }
+    memory::write32_no_mmap_or_dirty_check(tls_array_ptr + index * 4, value);
+    write_reg32(EAX, 1);
+    true
+}
+
+/// Handler 48 (TlsSetValue) and the TLS allocation mask at 0x0B8 exist in this build.
+#[no_mangle]
+pub extern "C" fn get_tls_set_value_abi() -> u32 { 1 }
 
 /// FlsGetValue(dwFlsIndex) — stdcall(1).
 /// Reads FLS slot value from HYPERCALL_PAGE shadow written by JS.
