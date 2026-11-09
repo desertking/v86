@@ -1221,7 +1221,6 @@ unsafe fn handle_wcslen() -> bool {
         };
         if ch == 0 { break; }
         len += 1;
-        if len > 0x100000 { break; }
     }
     write_reg32(EAX, len as i32);
     true
@@ -1255,7 +1254,6 @@ unsafe fn handle_wcscpy() -> bool {
         if hc_safe_write16(dst + i as i32 * 2, ch).is_err() { return false; }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, dst);
     true
@@ -1285,7 +1283,6 @@ unsafe fn handle_wcscat() -> bool {
         };
         if ch == 0 { break; }
         dst_len += 1;
-        if dst_len > 0x100000 { break; }
     }
     // Copy src
     let mut i: u32 = 0;
@@ -1297,7 +1294,6 @@ unsafe fn handle_wcscat() -> bool {
         if hc_safe_write16(dst + (dst_len + i) as i32 * 2, ch).is_err() { return false; }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, dst);
     true
@@ -1334,7 +1330,6 @@ unsafe fn handle_wcsicmp() -> bool {
         if l1 != l2 { break (l1 as i32) - (l2 as i32); }
         if c1 == 0 { break 0i32; }
         i += 1;
-        if i > 0x100000 { break 0i32; }
     };
     write_reg32(EAX, result);
     true
@@ -1371,7 +1366,6 @@ unsafe fn handle_wcschr() -> bool {
         }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, 0);
     true
@@ -1423,7 +1417,6 @@ unsafe fn handle_wcsstr() -> bool {
                 };
                 if h2 != nc { break false; }
                 j += 1;
-                if j > 0x100000 { break false; }
             };
             if matched {
                 write_reg32(EAX, haystack + i as i32 * 2);
@@ -1431,7 +1424,6 @@ unsafe fn handle_wcsstr() -> bool {
             }
         }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, 0);
     true
@@ -1635,7 +1627,6 @@ unsafe fn handle_strlen() -> bool {
         };
         if ch == 0 { break; }
         len += 1;
-        if len > 0x100000 { break; }
     }
     write_reg32(EAX, len as i32);
     true
@@ -1669,7 +1660,6 @@ unsafe fn handle_strcmp() -> bool {
         if c1 != c2 { break (c1 as i32) - (c2 as i32); }
         if c1 == 0 { break 0i32; }
         i += 1;
-        if i > 0x100000 { break 0i32; }
     };
     write_reg32(EAX, result);
     true
@@ -1703,7 +1693,6 @@ unsafe fn handle_strcpy() -> bool {
         if hc_safe_write8(dst + i as i32, ch).is_err() { return false; }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, dst);
     true
@@ -1739,7 +1728,6 @@ unsafe fn handle_stricmp() -> bool {
         if l1 != l2 { break (l1 as i32) - (l2 as i32); }
         if c1 == 0 { break 0i32; }
         i += 1;
-        if i > 0x100000 { break 0i32; }
     };
     write_reg32(EAX, result);
     true
@@ -1877,7 +1865,6 @@ unsafe fn handle_strstr() -> bool {
                 };
                 if h2 != nc { break false; }
                 j += 1;
-                if j > 0x100000 { break false; }
             };
             if matched {
                 write_reg32(EAX, haystack + i as i32);
@@ -1885,7 +1872,6 @@ unsafe fn handle_strstr() -> bool {
             }
         }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, 0);
     true
