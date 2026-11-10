@@ -27,6 +27,7 @@
 //!   0x0A0: hc_sleep_starvation_counter u32 — consecutive WASM-handled Sleep(0) calls with peers
 //!   0x0A4: hc_sleep_starvation_limit   u32 — max consecutive before JS fallthrough
 //!   0x0B0: hc_rand_seed         u32 — RNG seed for handle_rand
+//!   0x0B8: hc_tls_allocated     [u8; 64] — TlsAlloc'd flag per TEB-array slot (written by JS)
 //!   0x100: hc_dispatch_table    [u8; 4096] — dispatch_table[functionId] = handler_id
 //!   0x1100: hc_fls_allocated    [u8; 129] — FLS slot allocation bitmap (written by JS, slot 0 unused)
 //!   0x1184: hc_fls_values       [u32; 129] — FLS slot values (written by JS)
@@ -113,6 +114,11 @@ const OFF_HC_RAND_SEED: usize = 0x0B0;
 /// on every capture mutation and on buffer-change resync, which makes the page
 /// authoritative at all times.
 const OFF_HC_CAPTURE_HWND: usize = 0x0B4;
+/// One byte per slot of the 64-entry per-thread TLS array: nonzero while the JS
+/// scheduler holds the index as TlsAlloc'd. Only consulted by TlsSetValue — JS answers
+/// an unallocated index with FALSE, so the fast path must decline it rather than store.
+const OFF_HC_TLS_ALLOCATED: usize = 0x0B8;
+const HC_TLS_SLOT_COUNT: usize = 64;
 const OFF_HC_DISPATCH_TABLE: usize = 0x100;
 const OFF_HC_DISPATCH_TABLE_EXT: usize = 0x4000;
 const HC_DISPATCH_LIMIT: i32 = 0x10000;
@@ -414,6 +420,7 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         83 => handle_resume_thread(),
         84 => handle_memmove(),
         85 => handle_memchr(),
+        86 => handle_tls_set_value(),
 
         // ── Handler-id band 128..=255: Guarded Inner-Loop HLE engine kernels,
         //    kept in a distinct range from the
@@ -2274,6 +2281,48 @@ unsafe fn handle_tls_get_value() -> bool {
     memory::write32_no_mmap_or_dirty_check(teb_base + 0x34, 0);
 
     write_reg32(EAX, value);
+    true
+}
+
+/// TlsSetValue(dwTlsIndex, lpTlsValue) — stdcall(2).
+/// Stores into the same TEB+0x2C array handle_tls_get_value reads, which is also the
+/// JS scheduler's storage for slots 0..63. Declines (JS answers) for an index JS has not
+/// allocated, an expansion index, or a thread whose TEB/TLS array is not published.
+unsafe fn handle_tls_set_value() -> bool {
+    let esp = read_reg32(ESP);
+    let index = match safe_read32s(esp + 4) {
+        Ok(v) => v as u32,
+        Err(_) => return false,
+    };
+    let value = match safe_read32s(esp + 8) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    if index as usize >= HC_TLS_SLOT_COUNT {
+        return false;
+    }
+    if *hp_ptr().add(OFF_HC_TLS_ALLOCATED + index as usize) == 0 {
+        return false;
+    }
+
+    let teb_base = *(hp_ptr().add(OFF_HC_TEB_BASE) as *const u32);
+    if teb_base == 0 {
+        return false;
+    }
+    let tls_array_ptr = memory::read32_no_mmap_check(teb_base + 0x2C) as u32;
+    if tls_array_ptr == 0 {
+        return false;
+    }
+    // A raw store outside guest RAM would be dropped silently; let JS report it instead.
+    let slot = tls_array_ptr.wrapping_add(index * 4);
+    let mem_size = *crate::cpu::global_pointers::memory_size;
+    if slot < tls_array_ptr || slot.wrapping_add(4) > mem_size {
+        return false;
+    }
+
+    memory::write32_no_mmap_or_dirty_check(slot, value);
+    write_reg32(EAX, 1);
     true
 }
 
