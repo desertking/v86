@@ -231,20 +231,45 @@ unsafe fn wbuf_guest_range_ok(addr: u32, size: u32) -> bool {
 /// LINEAR address through `mem8`, so a non-identity mapping would touch the wrong page. The
 /// walk is non-faulting and sets no accessed/dirty bits, so declining leaves the guest's own
 /// CALL to raise the exact #PF at the exact place.
+/// The helper stores through `mem8` without the dirty-page bookkeeping of a guest store, so a
+/// destination page that holds compiled code must be declined: the guest's own CALL then does
+/// the stores and invalidates that code (including, through the SMC bail, the module that is
+/// executing the CALL). A valid TLB entry mirrors code presence in TLB_HAS_CODE; without one
+/// (the non-faulting walk fills no entry) ask the JIT directly.
+#[inline]
+unsafe fn wbuf_page_has_code(page: u32) -> bool {
+    let entry = cpu::tlb_data[(page >> 12) as usize];
+    if entry & cpu::TLB_VALID != 0 {
+        entry & cpu::TLB_HAS_CODE != 0
+    }
+    else {
+        jit_page_has_code(Page::page_of(page))
+    }
+}
+
 #[inline]
 unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool {
     if !wbuf_guest_range_ok(addr, size) {
         return false;
     }
-    if size == 0 || *global_pointers::cr & cpu::CR0_PG == 0 {
+    if size == 0 {
+        return true;
+    }
+    let paging = *global_pointers::cr & cpu::CR0_PG != 0;
+    if !paging && !for_writing {
         return true;
     }
     let last = (addr + size - 1) & !0xFFF;
     let mut page = addr & !0xFFF;
     loop {
-        match cpu::translate_address_no_fault(page as i32, for_writing) {
-            Some(phys) if phys == page => {},
-            _ => return false,
+        if paging {
+            match cpu::translate_address_no_fault(page as i32, for_writing) {
+                Some(phys) if phys == page => {},
+                _ => return false,
+            }
+        }
+        if for_writing && wbuf_page_has_code(page) {
+            return false;
         }
         if page == last {
             return true;

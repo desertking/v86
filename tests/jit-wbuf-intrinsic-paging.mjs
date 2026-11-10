@@ -204,6 +204,26 @@ function after_halt(emulator)
     result.alias_cleanup = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
     result.alias_head = dv.getUint32(CTRL, true);
     result.alias_first_word = dv.getUint32(DATA + HEAD_ALIAS, true);
+
+    // (b5) a ring slot on a page that holds COMPILED CODE (the guest loop's page, compiled in
+    // phase 1): the helper stores through mem8 with no dirty-page bookkeeping, so it must
+    // decline and leave the store -- and the code invalidation -- to the guest's own CALL.
+    const CODE_PAGE = ENTRY & ~0xFFF, CODE_RING = CODE_PAGE + 0x800, CTRL_CODE = CTRL + 0x100;
+    const CODE_TARGET = TARGET + 0x200;
+    result.code_page_compiled = (ex.jit_aot_page_table_index(CODE_PAGE) >>> 0) !== 0xFFFF;
+    if(!ex.jit_wbuf_intrinsic_register(CODE_TARGET, 0x66, 0, 1, 1, CTRL_CODE, CODE_RING, 0x400))
+        fail("code-page ring registration failed");
+    dv.setUint32(CTRL_CODE, 0, true);
+    const code_before = Buffer.from(cpu.mem8.subarray(CODE_RING, CODE_RING + 8)).toString("hex");
+    dv.setUint32(ARGS, 0x600DF00D, true);
+    result.code_cleanup = ex.jit_wbuf_intrinsic_execute(CODE_TARGET, ARGS) | 0;
+    result.code_head = dv.getUint32(CTRL_CODE, true);
+    result.code_ring_intact = Buffer.from(cpu.mem8.subarray(CODE_RING, CODE_RING + 8)).toString("hex") === code_before;
+    // positive control: the same descriptor shape on a data page is executed
+    if(!ex.jit_wbuf_intrinsic_register(CODE_TARGET + 0x10, 0x67, 0, 1, 1, CTRL_CODE + 4, DATA + 0x8000, 0x400))
+        fail("data-page ring registration failed");
+    dv.setUint32(CTRL_CODE + 4, 0, true);
+    result.data_cleanup = ex.jit_wbuf_intrinsic_execute(CODE_TARGET + 0x10, ARGS) | 0;
     return result;
 }
 
@@ -224,4 +244,8 @@ if(r.recover_cleanup !== 16 || r.recover_head !== 0x2000 + STRIDE)
     fail("(b3) intrinsic did not recover after the decline");
 if(r.alias_cleanup !== -1 || r.alias_head !== 0x3000 || r.alias_first_word !== 0x7E577E57)
     fail("(b4) a constant block aliasing its own ring slot was executed");
+if(!r.code_page_compiled) fail("(b5) the guest loop's page was not compiled -- the case proves nothing");
+if(r.code_cleanup !== -1 || r.code_head !== 0 || !r.code_ring_intact)
+    fail("(b5) a ring slot on a compiled code page was written by the helper");
+if(r.data_cleanup !== 4) fail("(b5) control: the same descriptor on a data page was refused");
 console.log("  ok — hits under paging, and a non-present constant page declines with no side effect");
