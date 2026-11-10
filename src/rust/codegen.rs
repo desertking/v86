@@ -470,11 +470,27 @@ pub fn gen_readable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal
     }
 }
 
+/// The last argument of every JIT write slow path that may bail on self-modifying code:
+/// eip offset | table index of this module | instructions left in the block (layout and
+/// rationale at cpu::SMC_PACK_INDEX_SHIFT). Emitted only on the slow edge of a store, which a
+/// store into a code page always takes (TLB_HAS_CODE is in every inline write mask).
+pub fn smc_packed_eip(ctx: &JitContext) -> i32 {
+    use crate::cpu::cpu::{
+        SMC_PACK_INDEX_MASK, SMC_PACK_INDEX_SHIFT, SMC_PACK_REMAINING_MAX, SMC_PACK_REMAINING_SHIFT,
+    };
+    // A block longer than SMC_PACK_REMAINING_MAX instructions (straight-line code without a
+    // branch over most of a page) saturates: a bail there over-counts by the excess.
+    let remaining = ctx.smc_instructions_remaining.min(SMC_PACK_REMAINING_MAX);
+    dbg_assert!((ctx.wasm_table_index as u32) <= SMC_PACK_INDEX_MASK);
+    (ctx.start_of_current_instruction & 0xFFF
+        | (ctx.wasm_table_index as u32 & SMC_PACK_INDEX_MASK) << SMC_PACK_INDEX_SHIFT
+        | remaining << SMC_PACK_REMAINING_SHIFT) as i32
+}
+
 pub fn gen_writable_or_pagefault(ctx: &mut JitContext, address_local: &WasmLocal, size: i32) {
     ctx.builder.get_local(address_local);
     ctx.builder.const_i32(size);
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.const_i32(smc_packed_eip(ctx));
     ctx.builder.call_fn3_ret("writable_or_pagefault_jit");
     if cfg!(feature = "profiler") {
         ctx.builder.if_void();
@@ -1037,7 +1053,7 @@ fn gen_safe_write_grouped(
             ctx.builder.get_local_i64(local2)
         },
     }
-    ctx.builder.const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.const_i32(smc_packed_eip(ctx));
     match bits {
         BitSize::BYTE => ctx.builder.call_fn3_ret("safe_write8_slow_jit"),
         BitSize::WORD => ctx.builder.call_fn3_ret("safe_write16_slow_jit"),
@@ -1120,7 +1136,7 @@ fn gen_safe_read_write_grouped(
     }
 
     ctx.builder.get_local(address_local);
-    ctx.builder.const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.const_i32(smc_packed_eip(ctx));
     match bits {
         BitSize::BYTE => ctx.builder.call_fn2_ret("safe_read_write8_slow_jit"),
         BitSize::WORD => ctx.builder.call_fn2_ret("safe_read_write16_slow_jit"),
@@ -1165,6 +1181,8 @@ fn gen_safe_read_write_grouped(
             GenSafeReadWriteValue::I32(l) => ctx.builder.get_local(l),
             GenSafeReadWriteValue::I64(l) => ctx.builder.get_local_i64(l),
         }
+        // Second half of a slow read-modify-write: the first call already translated (and
+        // SMC-checked) both pages, so this one must never bail -- bare eip = no check.
         ctx.builder.const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
         match bits {
             BitSize::BYTE => ctx.builder.call_fn3_ret("safe_write8_slow_jit"),
@@ -2059,8 +2077,7 @@ fn gen_fastmem_write_map(
             ctx.builder.get_local_i64(local2)
         },
     }
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.const_i32(smc_packed_eip(ctx));
     match bits {
         BitSize::BYTE => ctx.builder.call_fn3_ret("safe_write8_slow_jit"),
         BitSize::WORD => ctx.builder.call_fn3_ret("safe_write16_slow_jit"),
@@ -2210,8 +2227,7 @@ fn gen_safe_write(
             ctx.builder.get_local_i64(local2)
         },
     }
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.const_i32(smc_packed_eip(ctx));
     match bits {
         BitSize::BYTE => {
             ctx.builder.call_fn3_ret("safe_write8_slow_jit");
@@ -2414,8 +2430,7 @@ fn gen_push32_coalesced_write(
     gen_read_tlb_cache_invalidate(ctx);
     ctx.builder.get_local(address_local);
     ctx.builder.get_local(value_local);
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.const_i32(smc_packed_eip(ctx));
     ctx.builder.call_fn3_ret("safe_write32_slow_jit");
     ctx.builder.tee_local(&entry_local);
     ctx.builder.const_i32(1);
@@ -2524,8 +2539,7 @@ pub fn gen_safe_read_write(
     // architectural TLB. Invalidate only when the translation helper is actually entered.
     gen_read_tlb_cache_invalidate(ctx);
     ctx.builder.get_local(&address_local);
-    ctx.builder
-        .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
+    ctx.builder.const_i32(smc_packed_eip(ctx));
 
     match bits {
         BitSize::BYTE => {
@@ -2615,6 +2629,8 @@ pub fn gen_safe_read_write(
             GenSafeReadWriteValue::I64(l) => ctx.builder.get_local_i64(l),
         }
 
+        // Second half of a slow read-modify-write: the first call already translated (and
+        // SMC-checked) both pages, so this one must never bail -- bare eip = no check.
         ctx.builder
             .const_i32(ctx.start_of_current_instruction as i32 & 0xFFF);
 

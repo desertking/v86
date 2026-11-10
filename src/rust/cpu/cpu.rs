@@ -346,7 +346,48 @@ pub static mut valid_tlb_entries_count: i32 = 0;
 
 pub static mut in_jit: bool = false;
 
-pub static mut jit_fault: Option<(i32, Option<i32>)> = None;
+/// Why a generated module took its `exit_with_fault` edge (upstream 2b49f4b7's JitExitReason).
+/// Consumed exactly once by `trigger_fault_end_jit` in that module's epilogue.
+pub enum JitExitReason {
+    None,
+    CpuException { code: i32, error_code: Option<i32> },
+    /// A store from the running module hit a page holding that module's own code. Nothing of
+    /// the storing instruction was committed; EIP names it, so the interpreter re-runs it.
+    SelfModifyingCodeBail,
+}
+
+pub static mut jit_exit_reason: JitExitReason = JitExitReason::None;
+
+// Self-modifying-code bail (upstream 2b49f4b7, ported). JIT slow-path helpers that may write
+// receive one packed i32 instead of the bare `eip & 0xFFF`:
+//   bits  0..11  offset of the storing instruction in its page (as before)
+//   bits 12..21  wasm table index of the module that emitted the call (0 = no SMC check)
+//   bits 22..30  instructions of the current basic block from the storing one to the block end,
+//                inclusive -- the block prologue already counted them, the bail un-counts them
+// Table index 0 is never handed out (WASM_TABLE_SIZE - 1 usable slots), so a bare eip --
+// emitted by call sites that must never bail, and by modules from older engines -- decodes
+// as "no check" and keeps the old behaviour exactly.
+pub const SMC_PACK_INDEX_SHIFT: u32 = 12;
+pub const SMC_PACK_INDEX_MASK: u32 = 0x3FF;
+pub const SMC_PACK_REMAINING_SHIFT: u32 = 22;
+pub const SMC_PACK_REMAINING_MAX: u32 = 0x1FF;
+
+/// 1 (default) = bail; 0 = old behaviour (dirty the page, keep running the stale module);
+/// 2 = bail but skip the instruction-counter correction (negative control for the counter).
+pub static mut JIT_SMC_BAIL_MODE: u32 = 1;
+pub static mut JIT_SMC_BAIL_COUNT: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn jit_set_smc_bail(mode: u32) { JIT_SMC_BAIL_MODE = mode.min(2); }
+#[no_mangle]
+pub unsafe fn jit_get_smc_bail() -> u32 { JIT_SMC_BAIL_MODE }
+#[no_mangle]
+pub unsafe fn jit_smc_bail_count() -> u32 { JIT_SMC_BAIL_COUNT }
+#[no_mangle]
+pub unsafe fn jit_smc_bail_count_reset() { JIT_SMC_BAIL_COUNT = 0; }
+
+#[inline(always)]
+pub fn smc_unpack_eip(packed: i32) -> i32 { packed & 0xFFF }
 
 pub enum LastJump {
     Interrupt {
@@ -2141,18 +2182,47 @@ pub unsafe fn translate_address_read_jit(address: i32) -> OrPageFault<u32> {
 pub unsafe fn translate_address_write(address: i32) -> OrPageFault<u32> {
     translate_address(address, true, *cpl == 3, false, true)
 }
-pub unsafe fn translate_address_write_jit_and_can_skip_dirty(
-    address: i32,
-) -> OrPageFault<(u32, bool)> {
+/// Write translation for the JIT's slow-path helpers. A page holding compiled code is dirtied
+/// here (every module on it is dropped), and if one of those modules is the one executing the
+/// store -- named by the packed table index -- the store is refused: the module leaves through
+/// its fault edge with EIP at the storing instruction and the interpreter re-runs it, instead
+/// of the module running on into code that no longer matches memory. Only reached for TLB
+/// misses and for entries with TLB_HAS_CODE (the inline fast path rejects both), so ordinary
+/// stores pay nothing.
+pub unsafe fn translate_address_write_jit(address: i32, packed: i32) -> OrPageFault<u32> {
     let mut entry = tlb_data[(address as u32 >> 12) as usize];
     let user = *cpl == 3;
     if entry & (TLB_VALID | if user { TLB_NO_USER } else { 0 } | TLB_READONLY) != TLB_VALID {
         entry = do_page_walk(address, true, user, true, true)?.get();
     }
-    Ok((
-        (entry & !0xFFF ^ address) as u32 - memory::mem8 as u32,
-        entry & TLB_HAS_CODE == 0,
-    ))
+    let phys_addr = (entry & !0xFFF ^ address) as u32 - memory::mem8 as u32;
+    if entry & TLB_HAS_CODE == 0 {
+        return Ok(phys_addr);
+    }
+    let page = Page::page_of(phys_addr);
+    let wasm_table_index = (packed as u32 >> SMC_PACK_INDEX_SHIFT & SMC_PACK_INDEX_MASK) as u16;
+    let is_smc = wasm_table_index != 0
+        && JIT_SMC_BAIL_MODE != 0
+        && jit::jit_page_has_wasm_table_index(page, wasm_table_index);
+    jit::jit_dirty_page(page);
+    if !is_smc {
+        return Ok(phys_addr);
+    }
+    dbg_log!(
+        "SMC: write to phys={:x} virt={:x} from the running module {}, bailing out",
+        phys_addr,
+        address as u32,
+        wasm_table_index,
+    );
+    JIT_SMC_BAIL_COUNT = JIT_SMC_BAIL_COUNT.wrapping_add(1);
+    if JIT_SMC_BAIL_MODE == 1 {
+        // The block prologue credited the storing instruction and everything after it in its
+        // block; the interpreter will count the storing instruction again when it re-runs it.
+        let remaining = packed as u32 >> SMC_PACK_REMAINING_SHIFT & SMC_PACK_REMAINING_MAX;
+        *instruction_counter = (*instruction_counter).wrapping_sub(remaining);
+    }
+    jit_exit_reason = JitExitReason::SelfModifyingCodeBail;
+    Err(())
 }
 
 pub unsafe fn translate_address_system_read(address: i32) -> OrPageFault<u32> {
@@ -2478,7 +2548,7 @@ pub unsafe fn trigger_de_jit(eip_offset_in_page: i32) {
     dbg_log!("#de in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-    jit_fault = Some((CPU_EXCEPTION_DE, None))
+    jit_exit_reason = JitExitReason::CpuException { code: CPU_EXCEPTION_DE, error_code: None }
 }
 
 #[no_mangle]
@@ -2486,7 +2556,7 @@ pub unsafe fn trigger_ud_jit(eip_offset_in_page: i32) {
     dbg_log!("#ud in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-    jit_fault = Some((CPU_EXCEPTION_UD, None))
+    jit_exit_reason = JitExitReason::CpuException { code: CPU_EXCEPTION_UD, error_code: None }
 }
 
 #[no_mangle]
@@ -2494,7 +2564,7 @@ pub unsafe fn trigger_nm_jit(eip_offset_in_page: i32) {
     dbg_log!("#nm in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-    jit_fault = Some((CPU_EXCEPTION_NM, None))
+    jit_exit_reason = JitExitReason::CpuException { code: CPU_EXCEPTION_NM, error_code: None }
 }
 
 #[no_mangle]
@@ -2502,13 +2572,24 @@ pub unsafe fn trigger_gp_jit(code: i32, eip_offset_in_page: i32) {
     dbg_log!("#gp in jit mode");
     dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
     *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-    jit_fault = Some((CPU_EXCEPTION_GP, Some(code)))
+    jit_exit_reason = JitExitReason::CpuException { code: CPU_EXCEPTION_GP, error_code: Some(code) }
 }
 
+/// The `exit_with_fault` epilogue of every generated module (upstream renamed it exit_jit; the
+/// import name is kept so existing hooks on jit_imports.trigger_fault_end_jit keep working).
+/// Registers are already back in memory. A CPU exception is delivered here; an SMC bail just
+/// returns, leaving EIP at the storing instruction for the interpreter.
 #[no_mangle]
 pub unsafe fn trigger_fault_end_jit() {
     #[allow(static_mut_refs)]
-    let (code, error_code) = jit_fault.take().unwrap();
+    let (code, error_code) = match std::mem::replace(&mut jit_exit_reason, JitExitReason::None) {
+        JitExitReason::CpuException { code, error_code } => (code, error_code),
+        JitExitReason::SelfModifyingCodeBail => return,
+        JitExitReason::None => {
+            dbg_assert!(false, "trigger_fault_end_jit without exit reason");
+            return;
+        },
+    };
     if DEBUG {
         if js::cpu_exception_hook(code) {
             return;
@@ -2523,7 +2604,7 @@ pub unsafe fn trigger_fault_end_jit() {
 /// - translate_address_{read,write}_jit do the normal page walk and call this method with
 ///   jit=true when a page fault happens
 /// - this method prepares a page fault by setting cr2, and writes the error code
-///   into jit_fault. This method *doesn't* trigger the interrupt, as registers are
+///   into jit_exit_reason. This method *doesn't* trigger the interrupt, as registers are
 ///   still stored in the wasm module
 /// - back in the wasm module, the generated code detects the page fault, restores the registers
 ///   and finally calls trigger_fault_end_jit, which does the interrupt
@@ -2551,7 +2632,10 @@ pub unsafe fn trigger_pagefault(addr: i32, present: bool, write: bool, user: boo
     set_tlb_entry(page, 0);
     let error_code = (user as i32) << 2 | (write as i32) << 1 | present as i32;
     if jit {
-        jit_fault = Some((CPU_EXCEPTION_PF, Some(error_code)));
+        jit_exit_reason = JitExitReason::CpuException {
+            code: CPU_EXCEPTION_PF,
+            error_code: Some(error_code),
+        };
     }
     else {
         *instruction_pointer = *previous_ip;
@@ -3972,22 +4056,16 @@ static mut jit_paging_scratch_buffer: ScratchBuffer = ScratchBuffer([0; 2 * 0x10
 pub unsafe fn safe_read_slow_jit(
     addr: i32,
     bitsize: i32,
-    eip_offset_in_page: i32,
+    packed_eip: i32,
     is_write: bool,
 ) -> i32 {
-    dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
-    if is_write && Page::page_of(*instruction_pointer as u32) == Page::page_of(addr as u32) {
-        // XXX: Check based on virtual address
-        dbg_log!(
-            "SMC (rmw): bits={} eip={:x} writeaddr={:x}",
-            bitsize,
-            (*instruction_pointer & !0xFFF | eip_offset_in_page) as u32,
-            addr as u32
-        );
-    }
+    // Reads pass a bare eip; read-modify-write passes the packed SMC word (see
+    // SMC_PACK_INDEX_SHIFT): its write translation runs before the read, so a bail leaves
+    // nothing of the instruction committed.
+    let eip_offset_in_page = smc_unpack_eip(packed_eip);
     let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
     let addr_low = match if is_write {
-        translate_address_write_jit_and_can_skip_dirty(addr).map(|x| x.0)
+        translate_address_write_jit(addr, packed_eip)
     }
     else {
         translate_address_read_jit(addr)
@@ -4001,7 +4079,7 @@ pub unsafe fn safe_read_slow_jit(
     if crosses_page {
         let boundary_addr = (addr | 0xFFF) + 1;
         let addr_high = match if is_write {
-            translate_address_write_jit_and_can_skip_dirty(boundary_addr).map(|x| x.0)
+            translate_address_write_jit(boundary_addr, packed_eip)
         }
         else {
             translate_address_read_jit(boundary_addr)
@@ -4127,16 +4205,15 @@ pub unsafe fn readable_or_pagefault_jit(addr: i32, size: i32, eip_offset_in_page
 }
 
 #[no_mangle]
-pub unsafe fn writable_or_pagefault_jit(addr: i32, size: i32, eip_offset_in_page: i32) -> i32 {
+pub unsafe fn writable_or_pagefault_jit(addr: i32, size: i32, packed_eip: i32) -> i32 {
     dbg_assert!(size > 0 && size < 0x1000);
-    dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
-    // Validation only: the pre-checked helper performs its writes through safe_write*,
-    // which own dirty-page/SMC bookkeeping (plain eip convention; SMC invalidation is
-    // handled by the fastmem-generation deopt, not a packed wasm_table_index).
+    // Pre-check for helpers that store a whole operand themselves (fstenv, fbstp, maskmov*).
+    // It is the last point at which nothing of the instruction has been committed, so it is
+    // where a store into the running module's own code must bail (packed SMC word).
+    let eip_offset_in_page = smc_unpack_eip(packed_eip);
     let crosses_page = (addr & 0xFFF) + size > 0x1000;
-    if translate_address_write_jit_and_can_skip_dirty(addr).is_err()
-        || crosses_page
-            && translate_address_write_jit_and_can_skip_dirty((addr | 0xFFF) + 1).is_err()
+    if translate_address_write_jit(addr, packed_eip).is_err()
+        || crosses_page && translate_address_write_jit((addr | 0xFFF) + 1, packed_eip).is_err()
     {
         *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
         return 1;
@@ -4149,22 +4226,12 @@ pub unsafe fn safe_write_slow_jit(
     bitsize: i32,
     value_low: u64,
     value_high: u64,
-    eip_offset_in_page: i32,
+    packed_eip: i32,
 ) -> i32 {
-    dbg_assert!(eip_offset_in_page >= 0 && eip_offset_in_page < 0x1000);
-    if Page::page_of(*instruction_pointer as u32) == Page::page_of(addr as u32) {
-        // XXX: Check based on virtual address
-        dbg_log!(
-            "SMC: bits={} eip={:x} writeaddr={:x} value={:x}",
-            bitsize,
-            (*instruction_pointer & !0xFFF | eip_offset_in_page) as u32,
-            addr as u32,
-            value_low,
-        );
-    }
+    let eip_offset_in_page = smc_unpack_eip(packed_eip);
     let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
-    let (addr_low, can_skip_dirty_page) = match translate_address_write_jit_and_can_skip_dirty(addr)
-    {
+    // Both halves are translated (and dirtied / SMC-checked) before any byte is stored.
+    let addr_low = match translate_address_write_jit(addr, packed_eip) {
         Err(()) => {
             *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
             return 1;
@@ -4172,14 +4239,13 @@ pub unsafe fn safe_write_slow_jit(
         Ok(x) => x,
     };
     if crosses_page {
-        let (addr_high, _) =
-            match translate_address_write_jit_and_can_skip_dirty((addr | 0xFFF) + 1) {
-                Err(()) => {
-                    *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
-                    return 1;
-                },
-                Ok(x) => x,
-            };
+        let addr_high = match translate_address_write_jit((addr | 0xFFF) + 1, packed_eip) {
+            Err(()) => {
+                *instruction_pointer = *instruction_pointer & !0xFFF | eip_offset_in_page;
+                return 1;
+            },
+            Ok(x) => x,
+        };
         // TODO: Could check if virtual pages point to consecutive physical and go to fast path
 
         // do write, return dummy pointer for fast path to write into
@@ -4228,9 +4294,7 @@ pub unsafe fn safe_write_slow_jit(
         ((scratch as i32) ^ addr) & !0xFFF
     }
     else {
-        if !can_skip_dirty_page {
-            jit::jit_dirty_page(Page::page_of(addr_low));
-        }
+        // a code page was already dirtied by translate_address_write_jit
         ((addr_low as i32 + memory::mem8 as i32) ^ addr) & !0xFFF
     }
 }

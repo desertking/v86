@@ -2649,6 +2649,10 @@ pub struct JitContext<'a> {
     /// codegen context so instruction-specific early returns can attribute retired
     /// guest instructions just like the shared module epilogue.
     pub wasm_table_index: u16,
+    /// Instructions of the current basic block from the one being emitted to the block end,
+    /// inclusive (the block prologue credits them all up front). Packed into the SMC word of
+    /// write slow paths so a self-modifying-code bail can un-count what did not retire.
+    pub smc_instructions_remaining: u32,
     /// Emit the per-page-map store fast path for this unit.
     pub fastmem_writes: bool,
     pub x87_local_cache: [Option<X87LocalCacheSlot>; 8],
@@ -5277,6 +5281,7 @@ fn jit_generate_module(
         elide_current_flags: false,
         instruction_counter,
         wasm_table_index: wasm_table_index.to_u16(),
+        smc_instructions_remaining: 0,
         fastmem_writes: fastmem_writes_compile_enabled(state_flags),
         x87_local_cache: std::array::from_fn(|_| None),
         push32_write_cache: None,
@@ -6429,6 +6434,7 @@ fn jit_generate_basic_block(
     ctx.previous_instruction = Instruction::Other;
     ctx.fpu_simd_dirty_marked = false;
     ctx.elide_current_flags = false;
+    let mut instruction_index_in_block: u32 = 0;
 
     loop {
         // Eight bytes, not four: the operand-form census needs the SIB byte, and a
@@ -6475,6 +6481,10 @@ fn jit_generate_basic_block(
                 ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
             }
         }
+        dbg_assert!(instruction_index_in_block < block.number_of_instructions);
+        ctx.smc_instructions_remaining =
+            block.number_of_instructions.saturating_sub(instruction_index_in_block);
+        instruction_index_in_block += 1;
         jit_instructions::jit_instruction(ctx, &mut instruction_flags);
         let end_eip = ctx.cpu.eip;
 
@@ -6880,6 +6890,22 @@ fn jit_clear_cache(ctx: &mut JitState) {
 
 pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_jit_state(), page) }
 
+/// Does `page` hold code of the module in table slot `wasm_table_index` (as its primary module
+/// or as a hidden, superseded one that may still be running)? Upstream 2b49f4b7.
+pub fn jit_page_has_wasm_table_index(page: Page, wasm_table_index: u16) -> bool {
+    let ctx = get_jit_state();
+    match ctx.pages.get(&page) {
+        Some(info) => {
+            info.wasm_table_index.to_u16() == wasm_table_index
+                || info
+                    .hidden_wasm_table_indices
+                    .iter()
+                    .any(|w| w.to_u16() == wasm_table_index)
+        },
+        None => false,
+    }
+}
+
 fn jit_page_has_code_ctx(ctx: &mut JitState, page: Page) -> bool {
     ctx.pages.contains_key(&page) || ctx.entry_points.contains_key(&page)
 }
@@ -7041,7 +7067,8 @@ fn jit_codegen_fingerprint() -> u64 {
     };
     // Generated-code ABI revision. Bump whenever an always-on emitter changes so an AOT
     // module produced by an older runtime cannot silently bypass the new code shape.
-    add(12);
+    // 13: write slow paths carry the packed SMC word (table index + remaining count).
+    add(13);
     unsafe {
         add(MAX_PAGES);
         add(JIT_USE_LOOP_SAFETY as u32);
