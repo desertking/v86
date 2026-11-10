@@ -143,10 +143,9 @@ function buildImage(seed) {
     emit(0x81, 0x3D, ...d32(CTR), ...d32(OUTER - PATCH_GUEST_AT));
     emit(0x0F, 0x85); rel32("noguest");
     for (const a of guestSites) emit(0xC7, 0x05, ...d32(a), ...d32(rand32() | 1));
-    // Leave the module after patching (OUT is a block boundary). v86 keeps running the module
-    // that performed a store into its OWN page set until that module exits — a pre-existing
-    // hole independent of this feature (SMC_NO_FENCE=1 reproduces it on a stock engine with
-    // RET speculation); the fence keeps it out of this oracle's verdict.
+    // Leave the module after patching (OUT is a block boundary). The fence kept a hole out of
+    // this oracle's verdict -- a module that stored into its OWN page set kept running until it
+    // exited -- which the SMC bail now closes: SMC_NO_FENCE=1 must pass as well.
     if (!process.env.SMC_NO_FENCE) { emit(0x66, 0xBA, FENCE_PORT & 0xFF, FENCE_PORT >> 8); emit(0xEE); }
     label("noguest");
     emit(0x81, 0x3D, ...d32(CTR), ...d32(OUTER - PATCH_HOST_AT));

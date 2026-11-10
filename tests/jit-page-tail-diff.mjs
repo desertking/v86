@@ -214,9 +214,9 @@ function buildImage(seed) {
     emit(0x75); rel8("noguest");
     for (const a of [...patchTail.slice(0, 4), ...patchCross.slice(0, 4)])
         emit(0xC7, 0x05, ...d32(a), ...d32((rnd() * 2 ** 32) >>> 0 | 1)); // guest SMC
-    // Leave the module after patching (OUT is a block boundary): v86 keeps running a module
-    // that stored into its own page set until it exits, a pre-existing hole this oracle is not
-    // about (see jit-hot-edge-diff.mjs, SMC_NO_FENCE).
+    // Leave the module after patching (OUT is a block boundary). This fenced a hole -- a module
+    // that stored into its own page set kept running until it exited -- that the SMC bail now
+    // closes; SMC_NO_FENCE=1 runs without the fence and must pass too (jit-smc-bail-diff.mjs).
     if (!process.env.SMC_NO_FENCE) { emit(0x66, 0xBA, FENCE_PORT & 0xFF, FENCE_PORT >> 8); emit(0xEE); }
     label("noguest");
     emit(0x81, 0x3D, ...d32(CTR), ...d32(OUTER - PATCH_HOST_AT));
