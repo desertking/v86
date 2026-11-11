@@ -216,6 +216,7 @@ function run(build, cfg) {
                 if (cfg.regions) {
                     if (!w.set_jit_hot_edge_regions) { resolve({ status: "NO-SWITCH" }); return; }
                     w.set_jit_hot_edge_regions(1);
+                    if (w.get_jit_block_chaining_effective && w.get_jit_block_chaining_effective() !== 0) { resolve({ status: "CHAIN-WITH-REGIONS" }); return; }
                     w.set_jit_hot_edge_params(8, 5, 256);
                 }
                 else if (w.set_jit_hot_edge_regions) w.set_jit_hot_edge_regions(0);
@@ -248,6 +249,7 @@ for (let seed = SEED_START; seed < SEED_START + SEED_COUNT; seed++) {
     const off = await run(build, { jit: true, regions: false });
     const on = await run(build, { jit: true, regions: true });
     if (interp.status !== "done") { fail(`seed ${seed}: interpreter did not finish (${interp.status})`); continue; }
+    if (on.status === "CHAIN-WITH-REGIONS") { fail(`seed ${seed}: direct block chaining stayed active with hot-edge regions on`); continue; }
     if (on.status === "NO-SWITCH") { console.log(`seed ${seed}: engine has no set_jit_hot_edge_regions; off ${sig(off) === sig(interp) ? "matches" : "DIVERGES"}`); continue; }
     const note = ` (joins=${on.joins} refused=${on.refused} joinedCompiles=${on.joinedCompiles}/${on.compiles}` +
                  ` joinedPages=${on.joinedPages} joinedBytes=${on.joinedBytes}/${on.bytes} samples=${on.samples}` +
