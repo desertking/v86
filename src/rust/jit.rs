@@ -1707,7 +1707,7 @@ const RET_SPEC_MAX_CANDIDATES: usize = 4;
 // the wasm data section, so a 16 K ceiling cost 252 KB of shipped module (10%) for a knob
 // whose own measurement said there was nothing to win — the memo hits 98.9% at 512 and
 // conflict misses are 1%. Raise this deliberately if a title is ever shown to thrash it.
-const RET_CACHE_CAPACITY: usize = 1 << 9;
+const RET_CACHE_CAPACITY: usize = 1 << 14;
 
 /// One memo entry, 16 bytes so four share a cache line. The epoch is u32 rather than the
 /// u64 counter it mirrors: on wasm32 a 64-bit compare is two operations on the single
@@ -1723,8 +1723,8 @@ struct RetMemo {
     epoch: u32,
 }
 static mut RET_CACHE: [RetMemo; RET_CACHE_CAPACITY] =
-    [RetMemo { eip: 0, flags: 0, packed: -1, epoch: 0 }; RET_CACHE_CAPACITY];
-static mut RET_CACHE_MASK: usize = 512 - 1;
+    [RetMemo { eip: 0, flags: 0, packed: 0, epoch: 0 }; RET_CACHE_CAPACITY];
+static mut RET_CACHE_MASK: usize = 8192 - 1;
 // Index derivation (set_jit_config idx 26): 0 = stock `virt >> 2`, which uses only bits
 // 2..2+log2(size) — inside one 4 KiB page that is fine, but indirect targets scattered over
 // many pages alias on their page offset alone. 1 folds the page number in.
