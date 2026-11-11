@@ -133,7 +133,7 @@ pub unsafe fn run<const SIZE: u32, const KIND: u32>(
 
     let result = if KIND == 2 {
         // The aligned path dirties before its loop; this route has to do it itself.
-        if !skip_dirty {
+        if !skip_dirty && !memory::is_silent_fill(phys_dst, n, SIZE, backwards, value as u32) {
             jit::jit_dirty_page(Page::page_of(phys_dst));
         }
         if rep_memory::fill::<SIZE>(phys_dst, n, backwards, value) { Some((n, 0, 0)) } else { None }

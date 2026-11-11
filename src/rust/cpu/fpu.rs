@@ -458,9 +458,51 @@ pub unsafe fn fpu_set_status_word(sw: u16) {
 
 pub unsafe fn fpu_fldm32(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m32(addr))); }
 pub unsafe fn fpu_fldm64(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m64(addr))); }
-pub unsafe fn fpu_fldm80(addr: i32) { fpu_push(return_on_pagefault!(fpu_load_m80(addr))); }
+pub unsafe fn fpu_fldm80(addr: i32) { fpu_push(fld80_value(return_on_pagefault!(fpu_load_m80(addr)))); }
 #[no_mangle]
-pub unsafe fn fpu_fldm80_without_fault(addr: i32) { fpu_push(fpu_load_m80(addr).unwrap()); }
+pub unsafe fn fpu_fldm80_without_fault(addr: i32) { fpu_push(fld80_value(fpu_load_m80(addr).unwrap())); }
+
+static mut FPU_FLD80_RELAXED: bool = false;
+#[no_mangle]
+pub fn set_fpu_fld80_relaxed(on: u32) { unsafe { FPU_FLD80_RELAXED = on != 0 } }
+#[no_mangle]
+pub fn get_fpu_fld80_relaxed() -> u32 { unsafe { FPU_FLD80_RELAXED as u32 } }
+
+static mut FPU_FLD80_EXACT_FAST: bool = false;
+static mut FPU_FLD80_EXACT_HITS: u32 = 0;
+#[no_mangle]
+pub fn set_fpu_fld80_exact_fast(on: u32) { unsafe { FPU_FLD80_EXACT_FAST = on != 0 } }
+#[no_mangle]
+pub fn get_fpu_fld80_exact_fast() -> u32 { unsafe { FPU_FLD80_EXACT_FAST as u32 } }
+#[no_mangle]
+pub fn get_fpu_fld80_exact_hits() -> u32 { unsafe { FPU_FLD80_EXACT_HITS } }
+
+fn f80_fits_f64_exactly(v: &F80) -> bool {
+    let exp = (v.sign_exponent & 0x7FFF) as i32;
+    let mant = v.mantissa;
+    if exp == 0 {
+        return mant == 0;
+    }
+    if exp == 0x7FFF {
+        return mant == 1 << 63;
+    }
+    let unbiased = exp - 16383;
+    mant >> 63 == 1 && mant & 0x7FF == 0 && unbiased >= -1022 && unbiased <= 1023
+}
+
+unsafe fn fld80_value(v: F80) -> F80 {
+    if !crate::softfloat::is_fpu_relaxed() || v.sign_exponent == crate::softfloat::RELAXED_TAG {
+        return v;
+    }
+    if FPU_FLD80_RELAXED {
+        return F80::of_f64(v.to_f64_strict());
+    }
+    if FPU_FLD80_EXACT_FAST && f80_fits_f64_exactly(&v) {
+        FPU_FLD80_EXACT_HITS = FPU_FLD80_EXACT_HITS.wrapping_add(1);
+        return F80::of_f64(v.to_f64_strict());
+    }
+    v
+}
 
 #[no_mangle]
 pub unsafe fn fpu_fmul(target_index: i32, val: F80) {

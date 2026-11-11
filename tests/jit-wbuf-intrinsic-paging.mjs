@@ -224,6 +224,20 @@ function after_halt(emulator)
         fail("data-page ring registration failed");
     dv.setUint32(CTRL_CODE + 4, 0, true);
     result.data_cleanup = ex.jit_wbuf_intrinsic_execute(CODE_TARGET + 0x10, ARGS) | 0;
+    const HEAD_RO = 0x4000;
+    dv.setUint32(CTRL, HEAD_RO, true);
+    frame(CONST_OK);
+    result.warm_cleanup = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
+    const ctrl_pte = PT0_ADDR + (CTRL >>> 12) * 4;
+    dv.setUint32(ctrl_pte, dv.getUint32(ctrl_pte, true) & ~2, true);
+    cpu.cr[0] |= 0x10000;
+    ex.full_clear_tlb();
+    frame(CONST_OK);
+    dv.setUint32(CTRL, HEAD_RO, true);
+    result.ro_cleanup = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
+    frame(CONST_OK);
+    result.ro_cleanup_tlb = ex.jit_wbuf_intrinsic_execute(CONST_TARGET, ARGS) | 0;
+    result.ro_head = dv.getUint32(CTRL, true);
     return result;
 }
 
@@ -248,4 +262,7 @@ if(!r.code_page_compiled) fail("(b5) the guest loop's page was not compiled -- t
 if(r.code_cleanup !== -1 || r.code_head !== 0 || !r.code_ring_intact)
     fail("(b5) a ring slot on a compiled code page was written by the helper");
 if(r.data_cleanup !== 4) fail("(b5) control: the same descriptor on a data page was refused");
+if(r.warm_cleanup !== 16) fail("(b5) warm-up call on a writable ring was refused");
+if(r.ro_cleanup !== -1 || r.ro_cleanup_tlb !== -1 || r.ro_head !== 0x4000)
+    fail("(b5) a ring control word on a read-only page (CR0.WP) was written");
 console.log("  ok — hits under paging, and a non-present constant page declines with no side effect");

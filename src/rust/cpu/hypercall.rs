@@ -379,6 +379,8 @@ pub unsafe fn try_dispatch(function_id: i32) -> bool {
         43 => handle_cdecl_pow(),
         44 => handle_cdecl_ceil(),
         45 => handle_cdecl_floor(),
+        46 => handle_char_next_a(),
+        47 => handle_char_next_w(),
         // String/memory hypercalls (Tier 3)
         51 => handle_wcslen(),
         52 => handle_wcscpy(),
@@ -1228,7 +1230,6 @@ unsafe fn handle_wcslen() -> bool {
         };
         if ch == 0 { break; }
         len += 1;
-        if len > 0x100000 { break; }
     }
     write_reg32(EAX, len as i32);
     true
@@ -1262,7 +1263,6 @@ unsafe fn handle_wcscpy() -> bool {
         if hc_safe_write16(dst + i as i32 * 2, ch).is_err() { return false; }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, dst);
     true
@@ -1292,7 +1292,6 @@ unsafe fn handle_wcscat() -> bool {
         };
         if ch == 0 { break; }
         dst_len += 1;
-        if dst_len > 0x100000 { break; }
     }
     // Copy src
     let mut i: u32 = 0;
@@ -1304,7 +1303,6 @@ unsafe fn handle_wcscat() -> bool {
         if hc_safe_write16(dst + (dst_len + i) as i32 * 2, ch).is_err() { return false; }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, dst);
     true
@@ -1341,7 +1339,6 @@ unsafe fn handle_wcsicmp() -> bool {
         if l1 != l2 { break (l1 as i32) - (l2 as i32); }
         if c1 == 0 { break 0i32; }
         i += 1;
-        if i > 0x100000 { break 0i32; }
     };
     write_reg32(EAX, result);
     true
@@ -1378,7 +1375,6 @@ unsafe fn handle_wcschr() -> bool {
         }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, 0);
     true
@@ -1430,7 +1426,6 @@ unsafe fn handle_wcsstr() -> bool {
                 };
                 if h2 != nc { break false; }
                 j += 1;
-                if j > 0x100000 { break false; }
             };
             if matched {
                 write_reg32(EAX, haystack + i as i32 * 2);
@@ -1438,7 +1433,6 @@ unsafe fn handle_wcsstr() -> bool {
             }
         }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, 0);
     true
@@ -1642,7 +1636,6 @@ unsafe fn handle_strlen() -> bool {
         };
         if ch == 0 { break; }
         len += 1;
-        if len > 0x100000 { break; }
     }
     write_reg32(EAX, len as i32);
     true
@@ -1676,7 +1669,6 @@ unsafe fn handle_strcmp() -> bool {
         if c1 != c2 { break (c1 as i32) - (c2 as i32); }
         if c1 == 0 { break 0i32; }
         i += 1;
-        if i > 0x100000 { break 0i32; }
     };
     write_reg32(EAX, result);
     true
@@ -1710,7 +1702,6 @@ unsafe fn handle_strcpy() -> bool {
         if hc_safe_write8(dst + i as i32, ch).is_err() { return false; }
         if ch == 0 { break; }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, dst);
     true
@@ -1746,7 +1737,6 @@ unsafe fn handle_stricmp() -> bool {
         if l1 != l2 { break (l1 as i32) - (l2 as i32); }
         if c1 == 0 { break 0i32; }
         i += 1;
-        if i > 0x100000 { break 0i32; }
     };
     write_reg32(EAX, result);
     true
@@ -1884,7 +1874,6 @@ unsafe fn handle_strstr() -> bool {
                 };
                 if h2 != nc { break false; }
                 j += 1;
-                if j > 0x100000 { break false; }
             };
             if matched {
                 write_reg32(EAX, haystack + i as i32);
@@ -1892,7 +1881,6 @@ unsafe fn handle_strstr() -> bool {
             }
         }
         i += 1;
-        if i > 0x100000 { break; }
     }
     write_reg32(EAX, 0);
     true
@@ -2644,6 +2632,38 @@ unsafe fn handle_memmove() -> bool {
 }
 
 /// memchr(void* s, int c, size_t n): first occurrence of c, or NULL.
+/// CharNextA(LPCSTR lpsz), stdcall: one byte on, or lpsz itself on the terminator. Every
+/// ANSI code page the HLE provides is single-byte (IsDBCSLeadByte answers FALSE).
+unsafe fn handle_char_next_a() -> bool {
+    let esp = read_reg32(ESP);
+    let Ok(p) = safe_read32s(esp.wrapping_add(4)) else { return false; };
+    if p == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    let Ok(ch) = hc_safe_read8(p) else { return false; };
+    write_reg32(EAX, if ch == 0 { p } else { p.wrapping_add(1) });
+    true
+}
+
+/// CharNextW(LPCWSTR lpsz), stdcall: one UTF-16 unit on, or lpsz itself on the terminator.
+unsafe fn handle_char_next_w() -> bool {
+    let esp = read_reg32(ESP);
+    let Ok(p) = safe_read32s(esp.wrapping_add(4)) else { return false; };
+    if p == 0 {
+        write_reg32(EAX, 0);
+        return true;
+    }
+    let Ok(ch) = hc_safe_read16(p) else { return false; };
+    write_reg32(EAX, if ch == 0 { p } else { p.wrapping_add(2) });
+    true
+}
+
+/// Handler ids 46/47 (CharNextA/CharNextW) exist in this build. The host binds them only
+/// when this reports 1, so an older engine keeps the JS thunks.
+#[no_mangle]
+pub extern "C" fn get_char_next_abi() -> u32 { 1 }
+
 unsafe fn handle_memchr() -> bool {
     let esp = read_reg32(ESP);
     let Ok(src) = safe_read32s(esp.wrapping_add(4)) else { return false; };

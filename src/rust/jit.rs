@@ -21,7 +21,7 @@ use crate::profiler;
 use crate::profiler::stat;
 use crate::state_flags::CachedStateFlags;
 use crate::trace_profiler;
-use crate::wasmgen::wasm_builder::{Label, WasmBuilder, WasmLocal, WasmLocalI64};
+use crate::wasmgen::wasm_builder::{Label, PendingFlags, WasmBuilder, WasmLocal, WasmLocalI64};
 
 #[derive(Copy, Clone, Eq, Hash, PartialEq)]
 #[repr(transparent)]
@@ -76,6 +76,7 @@ pub(crate) const WBUF_INTRINSIC_CAPACITY: usize = 512;
 pub(crate) const WBUF_INTRINSIC_PROBES: usize = 8;
 const WBUF_KIND_SCALAR: u32 = 0;
 const WBUF_KIND_SHADER_CONSTANT: u32 = 1;
+const WBUF_KIND_NO_ARGS: u32 = 2;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -110,6 +111,24 @@ static mut WBUF_INTRINSIC_HOT: [WbufIntrinsicDesc; WBUF_INTRINSIC_HOT_CAPACITY] 
 static mut WBUF_INTRINSIC_HOT_MIN_TARGET: u32 = u32::MAX;
 static mut WBUF_INTRINSIC_HOT_MAX_TARGET: u32 = 0;
 static mut WBUF_INTRINSIC_REGISTERED: u32 = 0;
+static mut WBUF_INTRINSIC_BITMAP: [u8; 8192] = [0; 8192];
+static mut JIT_WBUF_BITMAP: bool = false;
+#[no_mangle]
+pub fn set_jit_wbuf_bitmap(on: u32) { unsafe { JIT_WBUF_BITMAP = on != 0 } }
+#[no_mangle]
+pub fn get_jit_wbuf_bitmap() -> u32 { unsafe { JIT_WBUF_BITMAP as u32 } }
+pub fn wbuf_bitmap_enabled() -> bool { unsafe { JIT_WBUF_BITMAP } }
+static mut JIT_BUDGET0_EXIT: bool = false;
+#[no_mangle]
+pub fn set_jit_budget0_exit(on: u32) { unsafe { JIT_BUDGET0_EXIT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_budget0_exit() -> u32 { unsafe { JIT_BUDGET0_EXIT as u32 } }
+pub fn budget0_exit_enabled() -> bool { unsafe { JIT_BUDGET0_EXIT } }
+pub(crate) fn wbuf_intrinsic_bitmap_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_BITMAP) as u32
+}
+#[inline]
+fn wbuf_bitmap_granule(target: u32) -> usize { (target >> 4) as usize & 0xFFFF }
 static mut WBUF_INTRINSIC_HITS: u32 = 0;
 static mut WBUF_INTRINSIC_FALLBACKS: u32 = 0;
 static mut WBUF_INTRINSIC_CODEGEN_CALL32: u32 = 0;
@@ -143,6 +162,12 @@ pub(crate) fn wbuf_intrinsic_hot_min_target_ptr() -> u32 {
 pub(crate) fn wbuf_intrinsic_hot_max_target_ptr() -> u32 {
     std::ptr::addr_of!(WBUF_INTRINSIC_HOT_MAX_TARGET) as u32
 }
+pub(crate) fn wbuf_intrinsic_min_target_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_MIN_TARGET) as u32
+}
+pub(crate) fn wbuf_intrinsic_max_target_ptr() -> u32 {
+    std::ptr::addr_of!(WBUF_INTRINSIC_MAX_TARGET) as u32
+}
 
 #[no_mangle]
 pub unsafe fn jit_wbuf_intrinsic_set_enabled(enabled: u32) {
@@ -166,9 +191,10 @@ pub unsafe fn jit_wbuf_intrinsic_register(
         || ctrl_addr == 0
         || data_base == 0
         || capacity < 32
-        || kind > WBUF_KIND_SHADER_CONSTANT
+        || kind > WBUF_KIND_NO_ARGS
         || kind == WBUF_KIND_SCALAR && !(1..=8).contains(&arg_count)
         || kind == WBUF_KIND_SHADER_CONSTANT && arg_count != 4
+        || kind == WBUF_KIND_NO_ARGS && arg_count != 0
     {
         return 0;
     }
@@ -189,6 +215,8 @@ pub unsafe fn jit_wbuf_intrinsic_register(
             };
             WBUF_INTRINSIC_MIN_TARGET = WBUF_INTRINSIC_MIN_TARGET.min(target);
             WBUF_INTRINSIC_MAX_TARGET = WBUF_INTRINSIC_MAX_TARGET.max(target);
+            let g = wbuf_bitmap_granule(target);
+            WBUF_INTRINSIC_BITMAP[g >> 3] |= 1 << (g & 7);
             if was_empty {
                 WBUF_INTRINSIC_REGISTERED = WBUF_INTRINSIC_REGISTERED.wrapping_add(1);
             }
@@ -246,6 +274,7 @@ unsafe fn wbuf_page_has_code(page: u32) -> bool {
         jit_page_has_code(Page::page_of(page))
     }
 }
+static mut WBUF_WALKED: bool = false;
 
 #[inline]
 unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool {
@@ -261,10 +290,24 @@ unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool
     }
     let last = (addr + size - 1) & !0xFFF;
     let mut page = addr & !0xFFF;
+    let need = cpu::TLB_VALID
+        | cpu::TLB_IN_MAPPED_RANGE
+        | if *global_pointers::cpl == 3 { cpu::TLB_NO_USER } else { 0 }
+        | if for_writing { cpu::TLB_READONLY | cpu::TLB_HAS_CODE } else { 0 };
     loop {
+        let entry = cpu::tlb_data[(page >> 12) as usize];
+        if entry & need == cpu::TLB_VALID
+            && ((entry & !0xFFF) as u32 ^ page).wrapping_sub(memory::mem8 as u32) == page
+        {
+            if page == last {
+                return true;
+            }
+            page += 0x1000;
+            continue;
+        }
         if paging {
             match cpu::translate_address_no_fault(page as i32, for_writing) {
-                Some(phys) if phys == page => {},
+                Some(phys) if phys == page => WBUF_WALKED = true,
                 _ => return false,
             }
         }
@@ -273,6 +316,70 @@ unsafe fn wbuf_range_accessible(addr: u32, size: u32, for_writing: bool) -> bool
         }
         if page == last {
             return true;
+        }
+        page += 0x1000;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WbufAccess {
+    mem_size: u32,
+    paging: bool,
+    need_read: i32,
+    need_write: i32,
+}
+
+#[inline(always)]
+unsafe fn wbuf_access() -> WbufAccess {
+    let paging = *global_pointers::cr & cpu::CR0_PG != 0;
+    let user = if *global_pointers::cpl == 3 { cpu::TLB_NO_USER } else { 0 };
+    WbufAccess {
+        mem_size: *global_pointers::memory_size,
+        paging,
+        need_read: cpu::TLB_VALID | cpu::TLB_IN_MAPPED_RANGE | user,
+        need_write: cpu::TLB_VALID | cpu::TLB_IN_MAPPED_RANGE | user | cpu::TLB_READONLY | cpu::TLB_HAS_CODE,
+    }
+}
+
+#[inline(always)]
+unsafe fn wbuf_ok(acc: &WbufAccess, addr: u32, size: u32, for_writing: bool) -> bool {
+    let end = match addr.checked_add(size) {
+        Some(end) if end <= acc.mem_size => end,
+        _ => return false,
+    };
+    if size == 0 || !acc.paging && !for_writing {
+        return true;
+    }
+    let page = addr & !0xFFF;
+    if page == (end - 1) & !0xFFF {
+        let entry = cpu::tlb_data[(page >> 12) as usize];
+        let need = if for_writing { acc.need_write } else { acc.need_read };
+        if entry & need == cpu::TLB_VALID
+            && ((entry & !0xFFF) as u32 ^ page).wrapping_sub(memory::mem8 as u32) == page
+        {
+            return true;
+        }
+    }
+    wbuf_range_accessible(addr, size, for_writing)
+}
+
+#[inline]
+unsafe fn wbuf_range_fill_tlb(addr: u32, size: u32, for_writing: bool) {
+    if size == 0 || *global_pointers::cr & cpu::CR0_PG == 0 {
+        return;
+    }
+    let user = *global_pointers::cpl == 3;
+    let need = cpu::TLB_VALID
+        | if user { cpu::TLB_NO_USER } else { 0 }
+        | if for_writing { cpu::TLB_READONLY } else { 0 };
+    let last = (addr + size - 1) & !0xFFF;
+    let mut page = addr & !0xFFF;
+    loop {
+        if cpu::tlb_data[(page >> 12) as usize] & need != cpu::TLB_VALID {
+            let _ = cpu::translate_address(page as i32, for_writing, user, false, true);
+        }
+        if page == last {
+            return;
         }
         page += 0x1000;
     }
@@ -304,7 +411,8 @@ pub unsafe fn jit_wbuf_intrinsic_execute(target: u32, esp: u32) -> i32 {
     if WBUF_INTRINSIC_ENABLED == 0 {
         return -1;
     }
-    let cleanup = wbuf_intrinsic_execute_inner(target, esp);
+    WBUF_WALKED = false;
+    let cleanup = wbuf_intrinsic_execute_inner(target, esp, 0);
     if cleanup < 0 {
         WBUF_INTRINSIC_FALLBACKS = WBUF_INTRINSIC_FALLBACKS.wrapping_add(1);
     }
@@ -314,35 +422,307 @@ pub unsafe fn jit_wbuf_intrinsic_execute(target: u32, esp: u32) -> i32 {
     cleanup
 }
 
-/// Every guest range this may touch is validated — bounds AND paging — before the first byte
-/// moves, so a decline is indistinguishable from the CALL never having been intercepted.
-unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
-    let mut desc = WBUF_INTRINSIC_EMPTY;
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_execute_tail(target: u32, esp: u32) -> i32 {
+    if WBUF_INTRINSIC_ENABLED == 0 {
+        return -1;
+    }
+    WBUF_WALKED = false;
+    let cleanup = match esp.checked_add(4) {
+        Some(args) => wbuf_intrinsic_execute_inner(target, args, 4),
+        None => -1,
+    };
+    if cleanup < 0 {
+        WBUF_INTRINSIC_FALLBACKS = WBUF_INTRINSIC_FALLBACKS.wrapping_add(1);
+    }
+    else {
+        WBUF_INTRINSIC_HITS = WBUF_INTRINSIC_HITS.wrapping_add(1);
+    }
+    cleanup
+}
+
+pub const WBUF_CALL_CONDITION: u8 = 0xF0;
+pub const FTOL_CALL_CONDITION: u8 = 0xF2;
+const FTOL_LEAF: [u8; 9] = [0x83, 0xEC, 0x08, 0xDD, 0x0C, 0x24, 0x58, 0x5A, 0xC3];
+static mut FTOL_CALL_FUSION: bool = false;
+static mut FTOL_CALL_SITES_COMPILED: u32 = 0;
+static mut FTOL_CALL_SITE_HITS: u32 = 0;
+static mut FTOL_CALL_SITE_FALLBACKS: u32 = 0;
+pub static mut FTOL_CALL_RESULT_LO: i32 = 0;
+pub static mut FTOL_CALL_RESULT_HI: i32 = 0;
+
+#[no_mangle]
+pub fn set_jit_ftol_call_fusion(on: u32) { unsafe { FTOL_CALL_FUSION = on != 0 } }
+#[no_mangle]
+pub fn get_jit_ftol_call_fusion() -> u32 { unsafe { FTOL_CALL_FUSION as u32 } }
+#[no_mangle]
+pub unsafe fn jit_ftol_call_sites_get_compiled() -> u32 { FTOL_CALL_SITES_COMPILED }
+#[no_mangle]
+pub unsafe fn jit_ftol_call_sites_get_hits() -> u32 { FTOL_CALL_SITE_HITS }
+#[no_mangle]
+pub unsafe fn jit_ftol_call_sites_get_fallbacks() -> u32 { FTOL_CALL_SITE_FALLBACKS }
+
+pub(crate) unsafe fn ftol_call_site_candidate(call_target: i32) -> bool {
+    if !FTOL_CALL_FUSION {
+        return false;
+    }
+    let phys = match cpu::translate_address_read_no_side_effects(call_target) {
+        Ok(phys) => phys,
+        Err(()) => return false,
+    };
+    if phys & 0xFFF > 0x1000 - FTOL_LEAF.len() as u32 || memory::in_mapped_range(phys) {
+        return false;
+    }
+    for (i, &b) in FTOL_LEAF.iter().enumerate() {
+        if memory::read8(phys + i as u32) as u8 != b {
+            return false;
+        }
+    }
+    if !codegen_dry_run() {
+        FTOL_CALL_SITES_COMPILED = FTOL_CALL_SITES_COMPILED.wrapping_add(1);
+    }
+    true
+}
+
+#[no_mangle]
+pub unsafe fn jit_ftol_call_site(esp: u32) -> i32 {
+    if !FTOL_CALL_FUSION {
+        return -1;
+    }
+    let r = ftol_call_site_inner(esp);
+    if r < 0 {
+        FTOL_CALL_SITE_FALLBACKS = FTOL_CALL_SITE_FALLBACKS.wrapping_add(1);
+    }
+    else {
+        FTOL_CALL_SITE_HITS = FTOL_CALL_SITE_HITS.wrapping_add(1);
+    }
+    r
+}
+
+#[inline(always)]
+unsafe fn ftol_st0_truncated() -> i64 {
+    let sp = *global_pointers::fpu_stack_ptr;
+    if crate::softfloat::is_fpu_relaxed() && 0 == *global_pointers::fpu_stack_empty >> sp & 1 {
+        let st0 = *global_pointers::fpu_st.offset(sp as isize);
+        if st0.sign_exponent == crate::softfloat::RELAXED_TAG {
+            let f = f64::from_bits(st0.mantissa).trunc();
+            return if f.is_nan() || f >= 9223372036854775808.0 || f < -9223372036854775808.0 {
+                i64::MIN
+            }
+            else {
+                f as i64
+            };
+        }
+    }
+    crate::cpu::fpu::fpu_truncate_to_i64(crate::cpu::fpu::fpu_get_st0())
+}
+
+#[inline(always)]
+unsafe fn ftol_dst_without_code(dst: u32) -> bool {
+    let page = dst & !0xFFF;
+    if page == (dst + 7) & !0xFFF {
+        let entry = cpu::tlb_data[(page >> 12) as usize];
+        if entry & (cpu::TLB_VALID | cpu::TLB_HAS_CODE | cpu::TLB_READONLY | cpu::TLB_IN_MAPPED_RANGE)
+            == cpu::TLB_VALID
+            && ((entry & !0xFFF) as u32 ^ page).wrapping_sub(memory::mem8 as u32) == page
+        {
+            return true;
+        }
+    }
+    !jit_page_has_code(Page::page_of(dst)) && !jit_page_has_code(Page::page_of(dst + 7))
+}
+
+unsafe fn ftol_call_site_inner(esp: u32) -> i32 {
+    if *global_pointers::cr & (cpu::CR0_EM | cpu::CR0_TS) != 0 {
+        return -1;
+    }
+    let acc = wbuf_access();
+    if !wbuf_ok(&acc, esp, 4, false) {
+        return -1;
+    }
+    let ret = wbuf_read_u32(esp);
+    let site = match ret.checked_sub(5) {
+        Some(site) => site,
+        None => return -1,
+    };
+    if !wbuf_ok(&acc, site, 5, false) || *memory::mem8.add(site as usize) != 0xE8 {
+        return -1;
+    }
+    let target = ret.wrapping_add(wbuf_read_u32(site + 1));
+    if !wbuf_ok(&acc, target, FTOL_LEAF.len() as u32, false) {
+        return -1;
+    }
+    for (i, &b) in FTOL_LEAF.iter().enumerate() {
+        if *memory::mem8.add(target as usize + i) != b {
+            return -1;
+        }
+    }
+    let dst = match esp.checked_sub(8) {
+        Some(dst) => dst,
+        None => return -1,
+    };
+    if !wbuf_ok(&acc, dst, 8, true) || !ftol_dst_without_code(dst) {
+        return -1;
+    }
+    let value = ftol_st0_truncated();
+    wbuf_write_u32(dst, value as u32);
+    wbuf_write_u32(dst + 4, (value >> 32) as u32);
+    crate::cpu::fpu::fpu_pop();
+    cpu::mark_fpu_simd_dirty();
+    FTOL_CALL_RESULT_LO = value as i32;
+    FTOL_CALL_RESULT_HI = (value >> 32) as i32;
+    0
+}
+static mut WBUF_CALL_SITES: u32 = 1;
+static mut WBUF_CALL_SITES_COMPILED: u32 = 0;
+static mut WBUF_CALL_SITE_HITS: u32 = 0;
+static mut WBUF_CALL_SITE_FALLBACKS: u32 = 0;
+
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_set_enabled(enabled: u32) { WBUF_CALL_SITES = (enabled != 0) as u32; }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_enabled() -> u32 { WBUF_CALL_SITES }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_compiled() -> u32 { WBUF_CALL_SITES_COMPILED }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_hits() -> u32 { WBUF_CALL_SITE_HITS }
+#[no_mangle]
+pub unsafe fn jit_wbuf_call_sites_get_fallbacks() -> u32 { WBUF_CALL_SITE_FALLBACKS }
+
+unsafe fn wbuf_intrinsic_find(target: u32) -> WbufIntrinsicDesc {
     for hot in WBUF_INTRINSIC_HOT {
         if hot.target == target {
-            desc = hot;
-            break;
+            return hot;
         }
     }
     // The direct slots cover the common shader/draw targets. Keep the exact table as a
     // correctness-preserving secondary path: duplicate exports can legitimately make a
     // different same-name stub hot, and the outer min/max guard has already rejected the
     // overwhelming majority of ordinary indirect CALL targets.
-    if desc.target == 0 {
-        let start = wbuf_intrinsic_hash(target);
-        for probe in 0..WBUF_INTRINSIC_PROBES {
-            let candidate = WBUF_INTRINSIC_TABLE[(start + probe) & (WBUF_INTRINSIC_CAPACITY - 1)];
-            if candidate.target == target {
-                desc = candidate;
-                break;
-            }
-            if candidate.target == 0 {
-                break;
-            }
+    let start = wbuf_intrinsic_hash(target);
+    for probe in 0..WBUF_INTRINSIC_PROBES {
+        let candidate = WBUF_INTRINSIC_TABLE[(start + probe) & (WBUF_INTRINSIC_CAPACITY - 1)];
+        if candidate.target == target {
+            return candidate;
+        }
+        if candidate.target == 0 {
+            break;
         }
     }
+    WBUF_INTRINSIC_EMPTY
+}
+
+/// Compile-time filter for a direct CALL: true when its target is a `jmp dword [abs32]`
+/// import thunk whose slot currently holds a registered WBUF target. Only a hint for the
+/// code shape; `jit_wbuf_intrinsic_execute_call_site` re-checks every byte at run time.
+pub(crate) unsafe fn wbuf_call_site_candidate(call_target: i32) -> bool {
+    if WBUF_CALL_SITES == 0 || WBUF_INTRINSIC_ENABLED == 0 || WBUF_INTRINSIC_REGISTERED == 0 {
+        return false;
+    }
+    let stub = match cpu::translate_address_read_no_side_effects(call_target) {
+        Ok(phys) => phys,
+        Err(()) => return false,
+    };
+    if stub & 0xFFF > 0x1000 - 6 || !wbuf_guest_range_ok(stub, 6) || memory::in_mapped_range(stub) {
+        return false;
+    }
+    if memory::read8(stub) != 0xFF || memory::read8(stub + 1) != 0x25 {
+        return false;
+    }
+    let slot = memory::read32s(stub + 2);
+    let slot_phys = match cpu::translate_address_read_no_side_effects(slot) {
+        Ok(phys) => phys,
+        Err(()) => return false,
+    };
+    if slot_phys & 0xFFF > 0x1000 - 4
+        || !wbuf_guest_range_ok(slot_phys, 4)
+        || memory::in_mapped_range(slot_phys)
+    {
+        return false;
+    }
+    let target = memory::read32s(slot_phys) as u32;
+    if wbuf_intrinsic_find(target).target == 0 {
+        return false;
+    }
+    if !codegen_dry_run() {
+        WBUF_CALL_SITES_COMPILED = WBUF_CALL_SITES_COMPILED.wrapping_add(1);
+    }
+    true
+}
+
+/// Runs after a direct `CALL rel32` has pushed its return address. When the callee is still
+/// a `jmp dword [abs32]` thunk whose slot holds a registered target, executes that target
+/// exactly as the tail-JMP path would and returns the stack cleanup (the caller then pops the
+/// return address itself). -1 lets the CALL proceed into the thunk unchanged.
+#[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_execute_call_site(esp: u32) -> i32 {
+    if WBUF_INTRINSIC_ENABLED == 0 || WBUF_CALL_SITES == 0 {
+        return -1;
+    }
+    let cleanup = wbuf_call_site_inner(esp);
+    if cleanup < 0 {
+        WBUF_CALL_SITE_FALLBACKS = WBUF_CALL_SITE_FALLBACKS.wrapping_add(1);
+    }
+    else {
+        WBUF_CALL_SITE_HITS = WBUF_CALL_SITE_HITS.wrapping_add(1);
+        WBUF_INTRINSIC_HITS = WBUF_INTRINSIC_HITS.wrapping_add(1);
+    }
+    cleanup
+}
+
+unsafe fn wbuf_call_site_inner(esp: u32) -> i32 {
+    WBUF_WALKED = false;
+    let acc = wbuf_access();
+    if !wbuf_ok(&acc, esp, 4, false) {
+        return -1;
+    }
+    let ret = wbuf_read_u32(esp);
+    let site = match ret.checked_sub(5) {
+        Some(site) => site,
+        None => return -1,
+    };
+    if !wbuf_ok(&acc, site, 5, false) || *memory::mem8.add(site as usize) != 0xE8 {
+        return -1;
+    }
+    let stub = ret.wrapping_add(wbuf_read_u32(site + 1));
+    if !wbuf_ok(&acc, stub, 6, false)
+        || *memory::mem8.add(stub as usize) != 0xFF
+        || *memory::mem8.add(stub as usize + 1) != 0x25
+    {
+        return -1;
+    }
+    let slot = wbuf_read_u32(stub + 2);
+    if !wbuf_ok(&acc, slot, 4, false) {
+        return -1;
+    }
+    let target = wbuf_read_u32(slot);
+    if target < WBUF_INTRINSIC_MIN_TARGET || target > WBUF_INTRINSIC_MAX_TARGET {
+        return -1;
+    }
+    let cleanup = match esp.checked_add(4) {
+        Some(args) => wbuf_intrinsic_execute_with(&acc, target, args, 4),
+        None => -1,
+    };
+    if cleanup >= 0 && WBUF_WALKED {
+        wbuf_range_fill_tlb(site, 5, false);
+        wbuf_range_fill_tlb(stub, 6, false);
+        wbuf_range_fill_tlb(slot, 4, false);
+    }
+    cleanup
+}
+
+/// Every guest range this may touch is validated — bounds AND paging — before the first byte
+/// moves, so a decline is indistinguishable from the CALL never having been intercepted.
+unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 {
+    let acc = wbuf_access();
+    wbuf_intrinsic_execute_with(&acc, target, esp, lead)
+}
+
+#[inline(always)]
+unsafe fn wbuf_intrinsic_execute_with(acc: &WbufAccess, target: u32, esp: u32, lead: u32) -> i32 {
+    let desc = wbuf_intrinsic_find(target);
     // The control word is read AND written back, so it must be writable, not merely present.
-    if desc.target == 0 || !wbuf_range_accessible(desc.ctrl_addr, 4, true) {
+    if desc.target == 0 || !wbuf_ok(acc, desc.ctrl_addr, 4, true) {
         return -1;
     }
 
@@ -350,7 +730,11 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
     let arg_count = desc.meta >> 8 & 0xFF;
     let is_stdcall = desc.meta >> 16 & 1 != 0;
     let stack_bytes = arg_count * 4;
-    if !wbuf_range_accessible(esp, stack_bytes, false) {
+    let stack_base = match esp.checked_sub(lead) {
+        Some(base) => base,
+        None => return -1,
+    };
+    if !wbuf_ok(acc, stack_base, lead + stack_bytes, false) {
         return -1;
     }
 
@@ -363,6 +747,9 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
     let stride = if kind == WBUF_KIND_SCALAR {
         (arg_count + 1) * 4
     }
+    else if kind == WBUF_KIND_NO_ARGS {
+        8
+    }
     else {
         let data_ptr = wbuf_read_u32(esp + 8);
         let vec4_count = wbuf_read_u32(esp + 12);
@@ -370,7 +757,7 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
             return -1;
         }
         let payload_bytes = vec4_count * 16;
-        if !wbuf_range_accessible(data_ptr, payload_bytes, false) {
+        if !wbuf_ok(acc, data_ptr, payload_bytes, false) {
             return -1;
         }
         payload = (data_ptr, payload_bytes);
@@ -380,15 +767,22 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
         Some(dst) => dst,
         None => return -1,
     };
-    if stride > desc.capacity - head || !wbuf_range_accessible(dst, stride, true) {
+    if stride > desc.capacity - head || !wbuf_ok(acc, dst, stride, true) {
         return -1;
     }
     // The ring is guest-addressable and both source ranges are guest-controlled, so an
     // aliasing caller could otherwise make the copy read bytes this call is still writing.
     if wbuf_ranges_overlap(payload.0, payload.1, dst, stride)
-        || wbuf_ranges_overlap(esp, stack_bytes, dst, stride)
+        || wbuf_ranges_overlap(stack_base, lead + stack_bytes, dst, stride)
     {
         return -1;
+    }
+
+    if WBUF_WALKED {
+        wbuf_range_fill_tlb(desc.ctrl_addr, 4, true);
+        wbuf_range_fill_tlb(stack_base, lead + stack_bytes, false);
+        wbuf_range_fill_tlb(dst, stride, true);
+        wbuf_range_fill_tlb(payload.0, payload.1, false);
     }
 
     wbuf_write_u32(dst, desc.func_id);
@@ -396,6 +790,9 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32) -> i32 {
         for i in 0..arg_count {
             wbuf_write_u32(dst + 4 + i * 4, wbuf_read_u32(esp + i * 4));
         }
+    }
+    else if kind == WBUF_KIND_NO_ARGS {
+        wbuf_write_u32(dst + 4, 0);
     }
     else {
         let this_ptr = wbuf_read_u32(esp);
@@ -446,6 +843,7 @@ pub unsafe fn jit_wbuf_intrinsic_clear_registry() {
     WBUF_INTRINSIC_MIN_TARGET = u32::MAX;
     WBUF_INTRINSIC_MAX_TARGET = 0;
     WBUF_INTRINSIC_TABLE = [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_CAPACITY];
+    WBUF_INTRINSIC_BITMAP = [0; 8192];
     WBUF_INTRINSIC_HOT = [WBUF_INTRINSIC_EMPTY; WBUF_INTRINSIC_HOT_CAPACITY];
     WBUF_INTRINSIC_HOT_MIN_TARGET = u32::MAX;
     WBUF_INTRINSIC_HOT_MAX_TARGET = 0;
@@ -666,6 +1064,11 @@ fn guard_groups_for(state_flags: CachedStateFlags) -> bool {
 static mut HOT_EDGE_THRESHOLD: u32 = 256;
 static mut HOT_EDGE_EXTRA_PAGES: u32 = 5;
 static mut HOT_EDGE_MAX_JOINS: u32 = 256;
+static mut HOT_EDGE_PROMPT_REFORM: bool = true;
+#[no_mangle]
+pub fn set_jit_hot_edge_prompt_reform(on: u32) { unsafe { HOT_EDGE_PROMPT_REFORM = on != 0 } }
+#[no_mangle]
+pub fn get_jit_hot_edge_prompt_reform() -> u32 { unsafe { HOT_EDGE_PROMPT_REFORM as u32 } }
 // Sample one exit in 2^HOT_EDGE_SAMPLE_SHIFT: the per-exit cost is then one load and a branch.
 const HOT_EDGE_SAMPLE_SHIFT: u32 = 4;
 // Halve every counter each 2^16 samples (~1M exits), so "hot" means a sustained rate.
@@ -831,7 +1234,43 @@ fn hot_edge_form(src_page: Page, target: u32) {
         HOT_EDGE_STATS[0] += 1;
         HOT_EDGE_STATS[1] += 1;
     }
-    free_wasm_module_tree(&mut ctx, src_index);
+    if unsafe { HOT_EDGE_PROMPT_REFORM } {
+        free_for_reform(&mut ctx, src_index);
+    }
+    else {
+        free_wasm_module_tree(&mut ctx, src_index);
+    }
+}
+
+fn free_for_reform(ctx: &mut JitState, root: WasmTableIndex) {
+    let before: Vec<Page> = ctx.pages.keys().copied().collect();
+    free_wasm_module_tree(ctx, root);
+    for page in before {
+        if ctx.pages.contains_key(&page) {
+            continue;
+        }
+        if let Some((hotness, _)) = ctx.entry_points.get_mut(&page) {
+            *hotness = (*hotness).max(get_jit_threshold());
+        }
+    }
+}
+
+fn straddle_analysis(phys: u32, virt: i32, cpu: &CpuContext) -> Option<u32> {
+    let next_virt = (virt & !0xFFF).wrapping_add(0x1000);
+    let next_phys = cpu::translate_address_read_no_side_effects(next_virt).ok()?;
+    if next_phys & !0xFFF != (phys & !0xFFF) + 0x1000 || memory::in_mapped_range(next_phys) {
+        return None;
+    }
+    let mut c = CpuContext { eip: phys, ..cpu.clone() };
+    let limit = (phys & !0xFFF) + 0x1000 + 15;
+    let (analysis, fits) = crate::cpu_context::decode_within(limit, || analysis::analyze_step(&mut c));
+    if !fits || analysis.ty != AnalysisType::Normal || analysis.no_next_instruction || analysis.absolute_jump {
+        return None;
+    }
+    if c.eip - phys > 15 || c.eip <= (phys & !0xFFF) + 0x1000 {
+        return None;
+    }
+    Some(c.eip)
 }
 
 /// Analyse one instruction without reading past the end of its page. None = it would cross.
@@ -880,6 +1319,386 @@ static mut JIT_CHAIN_TIER2_ACCOUNTING: bool = true;
 // page is already in the module's page set. set_jit_config(13); budget idx 14 caps the
 // callee's total instruction count (leaf qualification).
 static mut JIT_RET_SPECULATION: bool = false;
+static mut JIT_RET_MEMO_INLINE: bool = false;
+static mut JIT_FWAIT_INLINE: bool = false;
+static mut JIT_MULTI_ENTRY_LOOP_SAFETY: bool = false;
+static mut JIT_SSE_SCALAR_INLINE: bool = false;
+static mut JIT_X87_LEAN: bool = false;
+static mut JIT_X87_TOP_LOCAL: bool = false;
+static mut JIT_X87_RUNS: bool = false;
+static mut JIT_CARRY8_INLINE: bool = false;
+static mut JIT_SSE_CONVERT_INLINE: bool = false;
+static mut JIT_PAGE_FALLTHROUGH: bool = false;
+static mut JIT_FIST64_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_fist64_inline(on: u32) { unsafe { JIT_FIST64_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_fist64_inline() -> u32 { unsafe { JIT_FIST64_INLINE as u32 } }
+pub fn fist64_inline_enabled() -> bool { unsafe { JIT_FIST64_INLINE } }
+static mut JIT_FLAG_LOCALS_AUTO: bool = false;
+static mut JIT_SMC_EXIT: bool = false;
+static mut JIT_FLAG_CARRY_NEUTRAL: bool = false;
+#[no_mangle]
+pub fn set_jit_flag_carry_neutral(on: u32) { unsafe { JIT_FLAG_CARRY_NEUTRAL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_flag_carry_neutral() -> u32 { unsafe { JIT_FLAG_CARRY_NEUTRAL as u32 } }
+pub fn flag_carry_neutral_enabled() -> bool { unsafe { JIT_FLAG_CARRY_NEUTRAL } }
+static mut JIT_COND_SKIP: bool = false;
+#[no_mangle]
+pub fn set_jit_cond_skip(on: u32) { unsafe { JIT_COND_SKIP = on != 0 } }
+#[no_mangle]
+pub fn get_jit_cond_skip() -> u32 { unsafe { JIT_COND_SKIP as u32 } }
+pub fn cond_skip_enabled() -> bool { unsafe { JIT_COND_SKIP } }
+static mut COND_SKIPS_COMPILED: u32 = 0;
+static mut JIT_X87_ENTRY_STATE: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_entry_state(on: u32) { unsafe { JIT_X87_ENTRY_STATE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_entry_state() -> u32 { unsafe { JIT_X87_ENTRY_STATE as u32 } }
+pub fn x87_entry_state_enabled() -> bool { unsafe { JIT_X87_ENTRY_STATE } }
+static mut JIT_PAGE_STRADDLE: bool = false;
+#[no_mangle]
+pub fn set_jit_page_straddle(on: u32) { unsafe { JIT_PAGE_STRADDLE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_page_straddle() -> u32 { unsafe { JIT_PAGE_STRADDLE as u32 } }
+pub fn page_straddle_enabled() -> bool { unsafe { JIT_PAGE_STRADDLE } }
+static mut JIT_X87_CMP_LEAN: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_cmp_lean(on: u32) { unsafe { JIT_X87_CMP_LEAN = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_cmp_lean() -> u32 { unsafe { JIT_X87_CMP_LEAN as u32 } }
+pub fn x87_cmp_lean_enabled() -> bool { unsafe { JIT_X87_CMP_LEAN } }
+static mut JIT_GG_THROUGH_RUNS: bool = false;
+#[no_mangle]
+pub fn set_jit_gg_through_runs(on: u32) { unsafe { JIT_GG_THROUGH_RUNS = on != 0 } }
+#[no_mangle]
+pub fn get_jit_gg_through_runs() -> u32 { unsafe { JIT_GG_THROUGH_RUNS as u32 } }
+pub fn gg_through_runs_enabled() -> bool { unsafe { JIT_GG_THROUGH_RUNS } }
+static mut JIT_ADC_CF_ONLY: bool = false;
+#[no_mangle]
+pub fn set_jit_adc_cf_only(on: u32) { unsafe { JIT_ADC_CF_ONLY = on != 0 } }
+#[no_mangle]
+pub fn get_jit_adc_cf_only() -> u32 { unsafe { JIT_ADC_CF_ONLY as u32 } }
+pub fn adc_cf_only_enabled() -> bool { unsafe { JIT_ADC_CF_ONLY } }
+static mut JIT_INCDEC_CF_KEEP: bool = false;
+#[no_mangle]
+pub fn set_jit_incdec_cf_keep(on: u32) { unsafe { JIT_INCDEC_CF_KEEP = on != 0 } }
+#[no_mangle]
+pub fn get_jit_incdec_cf_keep() -> u32 { unsafe { JIT_INCDEC_CF_KEEP as u32 } }
+pub fn incdec_cf_keep_enabled() -> bool { unsafe { JIT_INCDEC_CF_KEEP } }
+static mut JIT_LOOP_EIP_LAZY: bool = false;
+#[no_mangle]
+pub fn set_jit_loop_eip_lazy(on: u32) { unsafe { JIT_LOOP_EIP_LAZY = on != 0 } }
+#[no_mangle]
+pub fn get_jit_loop_eip_lazy() -> u32 { unsafe { JIT_LOOP_EIP_LAZY as u32 } }
+pub fn loop_eip_lazy_enabled() -> bool { unsafe { JIT_LOOP_EIP_LAZY } }
+static mut JIT_FLAGS_FAULT_MAT: bool = false;
+#[no_mangle]
+pub fn set_jit_flags_fault_mat(on: u32) { unsafe { JIT_FLAGS_FAULT_MAT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_flags_fault_mat() -> u32 { unsafe { JIT_FLAGS_FAULT_MAT as u32 } }
+pub fn flags_fault_mat_enabled() -> bool { unsafe { JIT_FLAGS_FAULT_MAT } }
+static mut FLAGS_FAULT_MAT_COMPILED: u32 = 0;
+#[no_mangle]
+pub fn jit_flags_fault_mat_compiled() -> u32 { unsafe { FLAGS_FAULT_MAT_COMPILED } }
+static mut JIT_REG8_LEAN: bool = false;
+#[no_mangle]
+pub fn set_jit_reg8_lean(on: u32) { unsafe { JIT_REG8_LEAN = on != 0 } }
+#[no_mangle]
+pub fn get_jit_reg8_lean() -> u32 { unsafe { JIT_REG8_LEAN as u32 } }
+pub fn reg8_lean_enabled() -> bool { unsafe { JIT_REG8_LEAN } }
+static mut JIT_ADC8_CF_DIRECT: bool = false;
+#[no_mangle]
+pub fn set_jit_adc8_cf_direct(on: u32) { unsafe { JIT_ADC8_CF_DIRECT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_adc8_cf_direct() -> u32 { unsafe { JIT_ADC8_CF_DIRECT as u32 } }
+pub fn adc8_cf_direct_enabled() -> bool { unsafe { JIT_ADC8_CF_DIRECT } }
+static mut JIT_PF_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_pf_inline(on: u32) { unsafe { JIT_PF_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_pf_inline() -> u32 { unsafe { JIT_PF_INLINE as u32 } }
+pub fn pf_inline_enabled() -> bool { unsafe { JIT_PF_INLINE } }
+static mut JIT_SSE_PACKED_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_sse_packed_inline(on: u32) { unsafe { JIT_SSE_PACKED_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_sse_packed_inline() -> u32 { unsafe { JIT_SSE_PACKED_INLINE as u32 } }
+pub fn sse_packed_inline_enabled() -> bool { unsafe { JIT_SSE_PACKED_INLINE } }
+static mut JIT_ALU16_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_alu16_inline(on: u32) { unsafe { JIT_ALU16_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_alu16_inline() -> u32 { unsafe { JIT_ALU16_INLINE as u32 } }
+pub fn alu16_inline_enabled() -> bool { unsafe { JIT_ALU16_INLINE } }
+static mut JIT_FLDCW_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_fldcw_inline(on: u32) { unsafe { JIT_FLDCW_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_fldcw_inline() -> u32 { unsafe { JIT_FLDCW_INLINE as u32 } }
+pub fn fldcw_inline_enabled() -> bool { unsafe { JIT_FLDCW_INLINE } }
+static mut JIT_MMX_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_mmx_inline(on: u32) { unsafe { JIT_MMX_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_mmx_inline() -> u32 { unsafe { JIT_MMX_INLINE as u32 } }
+pub fn mmx_inline_enabled() -> bool { unsafe { JIT_MMX_INLINE } }
+static mut JIT_MMX_LOGIC_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_mmx_logic_inline(on: u32) { unsafe { JIT_MMX_LOGIC_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_mmx_logic_inline() -> u32 { unsafe { JIT_MMX_LOGIC_INLINE as u32 } }
+pub fn mmx_logic_inline_enabled() -> bool { unsafe { JIT_MMX_LOGIC_INLINE } }
+static mut JIT_RMW_MISC_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_rmw_misc_inline(on: u32) { unsafe { JIT_RMW_MISC_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_rmw_misc_inline() -> u32 { unsafe { JIT_RMW_MISC_INLINE as u32 } }
+pub fn rmw_misc_inline_enabled() -> bool { unsafe { JIT_RMW_MISC_INLINE } }
+static mut JIT_OUT_DIRECT: bool = false;
+#[no_mangle]
+pub fn set_jit_out_direct(on: u32) { unsafe { JIT_OUT_DIRECT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_out_direct() -> u32 { unsafe { JIT_OUT_DIRECT as u32 } }
+pub fn out_direct_enabled() -> bool { unsafe { JIT_OUT_DIRECT && JIT_SMC_EXIT } }
+static mut JIT_GG_MEMBER_INLINE_FALLBACK: bool = false;
+#[no_mangle]
+pub fn set_jit_gg_member_inline_fallback(on: u32) { unsafe { JIT_GG_MEMBER_INLINE_FALLBACK = on != 0 } }
+#[no_mangle]
+pub fn get_jit_gg_member_inline_fallback() -> u32 { unsafe { JIT_GG_MEMBER_INLINE_FALLBACK as u32 } }
+pub fn gg_member_inline_fallback_enabled() -> bool { unsafe { JIT_GG_MEMBER_INLINE_FALLBACK } }
+static mut JIT_CVTTPS2PI_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_cvttps2pi_inline(on: u32) { unsafe { JIT_CVTTPS2PI_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_cvttps2pi_inline() -> u32 { unsafe { JIT_CVTTPS2PI_INLINE as u32 } }
+pub fn cvttps2pi_inline_enabled() -> bool { unsafe { JIT_CVTTPS2PI_INLINE } }
+static mut JIT_FRNDINT_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_frndint_inline(on: u32) { unsafe { JIT_FRNDINT_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_frndint_inline() -> u32 { unsafe { JIT_FRNDINT_INLINE as u32 } }
+pub fn frndint_inline_enabled() -> bool { unsafe { JIT_FRNDINT_INLINE } }
+static mut JIT_IDIV_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_idiv_inline(on: u32) { unsafe { JIT_IDIV_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_idiv_inline() -> u32 { unsafe { JIT_IDIV_INLINE as u32 } }
+pub fn idiv_inline_enabled() -> bool { unsafe { JIT_IDIV_INLINE } }
+static mut JIT_FLD80_INLINE: bool = false;
+#[no_mangle]
+pub fn set_jit_fld80_inline(on: u32) { unsafe { JIT_FLD80_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_fld80_inline() -> u32 { unsafe { JIT_FLD80_INLINE as u32 } }
+pub fn fld80_inline_enabled() -> bool { unsafe { JIT_FLD80_INLINE } }
+static mut JIT_SMC_EXIT_LOCAL: bool = false;
+#[no_mangle]
+pub fn set_jit_smc_exit_local(on: u32) { unsafe { JIT_SMC_EXIT_LOCAL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_smc_exit_local() -> u32 { unsafe { JIT_SMC_EXIT_LOCAL as u32 } }
+pub fn next_overwrites_all_but_cf(ctx: &JitContext) -> bool {
+    let addr = ctx.cpu.eip;
+    if addr > ctx.block_last_instruction || !ctx.cpu.state_flags.is_32() {
+        return false;
+    }
+    let mut a = addr;
+    if read_jit_u8(a) == 0x66 {
+        a += 1;
+    }
+    match read_jit_u8(a) {
+        0x40..=0x4F => true,
+        0xFE | 0xFF => {
+            let modrm = read_jit_u8(a + 1);
+            modrm >= 0xC0 && (modrm >> 3) & 7 <= 1
+        },
+        _ => false,
+    }
+}
+static mut STRADDLES_COMPILED: u32 = 0;
+#[no_mangle]
+pub fn jit_straddles_compiled() -> u32 { unsafe { STRADDLES_COMPILED } }
+pub fn block_is_straddle(block: &BasicBlock) -> bool {
+    Page::page_of(block.end_addr - 1) != Page::page_of(block.addr)
+}
+static mut X87_ENTRY_FACTS: Vec<(u32, bool, bool, bool)> = Vec::new();
+static mut X87_ENTRY_IN: Option<HashMap<u32, (bool, bool)>> = None;
+static mut X87_ENTRY_KNOWN: u32 = 0;
+#[no_mangle]
+pub fn jit_x87_entry_known_blocks() -> u32 { unsafe { X87_ENTRY_KNOWN } }
+#[allow(static_mut_refs)]
+fn x87_entry_in(addr: u32) -> (bool, bool) {
+    if codegen_dry_run() {
+        return (false, false);
+    }
+    unsafe {
+        match &X87_ENTRY_IN {
+            Some(m) => m.get(&addr).copied().unwrap_or((false, false)),
+            None => (false, false),
+        }
+    }
+}
+#[allow(static_mut_refs)]
+fn x87_entry_compute(basic_blocks: &HashMap<u32, BasicBlock>, entries: &HashSet<u32>) {
+    let facts: HashMap<u32, (bool, bool, bool)> = unsafe {
+        std::mem::take(&mut X87_ENTRY_FACTS)
+            .into_iter()
+            .map(|(a, cr0, kept, dirty)| (a, (cr0, kept, dirty)))
+            .collect()
+    };
+    let mut preds: HashMap<u32, Vec<u32>> = HashMap::new();
+    for b in basic_blocks.values() {
+        let succs: Vec<u32> = match b.ty {
+            BasicBlockType::Normal { next_block_addr, .. } => next_block_addr.into_iter().collect(),
+            BasicBlockType::ConditionalJump {
+                next_block_addr,
+                next_block_branch_taken_addr,
+                ..
+            } => next_block_addr.into_iter().chain(next_block_branch_taken_addr).collect(),
+            BasicBlockType::AbsoluteEip | BasicBlockType::Exit => Vec::new(),
+        };
+        for t in succs {
+            preds.entry(t).or_default().push(b.addr);
+        }
+    }
+    let mut state: HashMap<u32, (bool, bool)> = HashMap::new();
+    for b in basic_blocks.values() {
+        let known = !b.is_entry_block && !entries.contains(&b.addr) && preds.contains_key(&b.addr);
+        state.insert(b.addr, (known, known));
+    }
+    let out = |state: &HashMap<u32, (bool, bool)>, p: u32| -> (bool, bool) {
+        let (cr0_in, dirty_in) = state.get(&p).copied().unwrap_or((false, false));
+        match facts.get(&p) {
+            Some(&(cr0, kept, dirty)) => (cr0 || cr0_in && kept, dirty || dirty_in),
+            None => (false, false),
+        }
+    };
+    loop {
+        let mut changed = false;
+        let addrs: Vec<u32> = state.keys().copied().collect();
+        for a in addrs {
+            let (cr0_in, dirty_in) = state[&a];
+            if !cr0_in && !dirty_in {
+                continue;
+            }
+            let mut cr0 = cr0_in;
+            let mut dirty = dirty_in;
+            for &p in &preds[&a] {
+                let (pc, pd) = out(&state, p);
+                cr0 &= pc;
+                dirty &= pd;
+            }
+            if (cr0, dirty) != (cr0_in, dirty_in) {
+                state.insert(a, (cr0, dirty));
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    state.retain(|_, v| v.0 || v.1);
+    unsafe {
+        X87_ENTRY_KNOWN = X87_ENTRY_KNOWN.saturating_add(state.len() as u32);
+        X87_ENTRY_IN = Some(state);
+    }
+}
+#[no_mangle]
+pub fn jit_cond_skips_compiled() -> u32 { unsafe { COND_SKIPS_COMPILED } }
+static mut SMC_EXIT_PENDING: u8 = 0;
+static mut SMC_EXITS: u64 = 0;
+static mut SMC_PENDING_SET: u32 = 0;
+#[no_mangle]
+pub fn jit_smc_exits() -> u32 { unsafe { SMC_EXITS as u32 } }
+#[no_mangle]
+pub fn jit_smc_pending_set() -> u32 { unsafe { SMC_PENDING_SET } }
+pub fn smc_exits_addr() -> u32 { std::ptr::addr_of!(SMC_EXITS) as u32 }
+#[no_mangle]
+pub fn set_jit_smc_exit(on: u32) { unsafe { JIT_SMC_EXIT = on != 0 } }
+#[no_mangle]
+pub fn get_jit_smc_exit() -> u32 { unsafe { JIT_SMC_EXIT as u32 } }
+pub fn smc_exit_enabled() -> bool { unsafe { JIT_SMC_EXIT } }
+pub fn smc_exit_pending_addr() -> u32 { std::ptr::addr_of!(SMC_EXIT_PENDING) as u32 }
+#[no_mangle]
+pub fn set_jit_flag_locals_auto(on: u32) { unsafe { JIT_FLAG_LOCALS_AUTO = on != 0 } }
+#[no_mangle]
+pub fn get_jit_flag_locals_auto() -> u32 { unsafe { JIT_FLAG_LOCALS_AUTO as u32 } }
+pub fn flag_locals_auto_enabled() -> bool { unsafe { JIT_FLAG_LOCALS_AUTO } }
+#[no_mangle]
+pub fn set_jit_page_fallthrough(on: u32) { unsafe { JIT_PAGE_FALLTHROUGH = on != 0 } }
+#[no_mangle]
+pub fn get_jit_page_fallthrough() -> u32 { unsafe { JIT_PAGE_FALLTHROUGH as u32 } }
+pub fn page_fallthrough_enabled() -> bool { unsafe { JIT_PAGE_FALLTHROUGH } }
+#[no_mangle]
+pub fn set_jit_sse_convert_inline(on: u32) { unsafe { JIT_SSE_CONVERT_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_sse_convert_inline() -> u32 { unsafe { JIT_SSE_CONVERT_INLINE as u32 } }
+pub fn sse_convert_inline_enabled() -> bool { unsafe { JIT_SSE_CONVERT_INLINE } }
+#[no_mangle]
+pub fn set_jit_carry8_inline(on: u32) { unsafe { JIT_CARRY8_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_carry8_inline() -> u32 { unsafe { JIT_CARRY8_INLINE as u32 } }
+pub fn carry8_inline_enabled() -> bool { unsafe { JIT_CARRY8_INLINE } }
+#[no_mangle]
+pub fn set_jit_x87_runs(on: u32) { unsafe { JIT_X87_RUNS = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_runs() -> u32 { unsafe { JIT_X87_RUNS as u32 } }
+static mut X87_RUNS_COMPILED: u32 = 0;
+#[no_mangle]
+pub fn jit_x87_runs_compiled() -> u32 { unsafe { X87_RUNS_COMPILED } }
+pub fn x87_runs_note_compiled() {
+    if !codegen_dry_run() {
+        unsafe { X87_RUNS_COMPILED = X87_RUNS_COMPILED.saturating_add(1) }
+    }
+}
+static mut JIT_X87_RUN_TAIL: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_run_tail(on: u32) { unsafe { JIT_X87_RUN_TAIL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_run_tail() -> u32 { unsafe { JIT_X87_RUN_TAIL as u32 } }
+pub fn x87_run_tail_enabled() -> bool { unsafe { JIT_X87_RUN_TAIL } }
+static mut JIT_X87_RUN_GUARD_SHARE: bool = false;
+#[no_mangle]
+pub fn set_jit_x87_run_guard_share(on: u32) { unsafe { JIT_X87_RUN_GUARD_SHARE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_run_guard_share() -> u32 { unsafe { JIT_X87_RUN_GUARD_SHARE as u32 } }
+pub fn x87_run_guard_share_enabled() -> bool { unsafe { JIT_X87_RUN_GUARD_SHARE } }
+pub fn x87_runs_enabled() -> bool {
+    unsafe {
+        JIT_X87_RUNS
+            && !JIT_X87_TOP_LOCAL
+            && !JIT_X87_LOCALS
+            && JIT_READ_TLB_CACHE_MODE == 0
+            && crate::cpu::perm_map::get_perm_map_reads() == 0
+            && crate::softfloat::is_fpu_relaxed()
+    }
+}
+#[no_mangle]
+pub fn set_jit_x87_top_local(on: u32) { unsafe { JIT_X87_TOP_LOCAL = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_top_local() -> u32 { unsafe { JIT_X87_TOP_LOCAL as u32 } }
+#[no_mangle]
+pub fn set_jit_x87_lean(on: u32) { unsafe { JIT_X87_LEAN = on != 0 } }
+#[no_mangle]
+pub fn get_jit_x87_lean() -> u32 { unsafe { JIT_X87_LEAN as u32 } }
+pub fn x87_lean_enabled() -> bool { unsafe { JIT_X87_LEAN } }
+#[no_mangle]
+pub fn set_jit_sse_scalar_inline(on: u32) { unsafe { JIT_SSE_SCALAR_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_sse_scalar_inline() -> u32 { unsafe { JIT_SSE_SCALAR_INLINE as u32 } }
+pub fn sse_scalar_inline_enabled() -> bool { unsafe { JIT_SSE_SCALAR_INLINE } }
+#[no_mangle]
+pub fn set_jit_multi_entry_loop_safety(on: u32) { unsafe { JIT_MULTI_ENTRY_LOOP_SAFETY = on != 0 } }
+#[no_mangle]
+pub fn get_jit_multi_entry_loop_safety() -> u32 { unsafe { JIT_MULTI_ENTRY_LOOP_SAFETY as u32 } }
+#[no_mangle]
+pub fn set_jit_fwait_inline(on: u32) { unsafe { JIT_FWAIT_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_fwait_inline() -> u32 { unsafe { JIT_FWAIT_INLINE as u32 } }
+pub fn fwait_inline_enabled() -> bool { unsafe { JIT_FWAIT_INLINE } }
+#[no_mangle]
+pub fn set_jit_ret_memo_inline(on: u32) { unsafe { JIT_RET_MEMO_INLINE = on != 0 } }
+#[no_mangle]
+pub fn get_jit_ret_memo_inline() -> u32 { unsafe { JIT_RET_MEMO_INLINE as u32 } }
 static mut JIT_RET_SPEC_MAX_INSTR: u32 = 24;
 const RET_SPEC_MAX_CANDIDATES: usize = 4;
 
@@ -2332,7 +3151,12 @@ pub fn set_dispatch_stats(enabled: u32) { unsafe { DISPATCH_STATS = enabled != 0
 #[no_mangle]
 pub fn get_dispatch_stats() -> u32 { unsafe { DISPATCH_STATS as u32 } }
 
-pub const JIT_THRESHOLD: u32 = 200 * 1000;
+pub const JIT_THRESHOLD_DEFAULT: u32 = 200 * 1000;
+static mut JIT_THRESHOLD: u32 = JIT_THRESHOLD_DEFAULT;
+#[no_mangle]
+pub fn set_jit_threshold(value: u32) { unsafe { JIT_THRESHOLD = value.max(1) } }
+#[no_mangle]
+pub fn get_jit_threshold() -> u32 { unsafe { JIT_THRESHOLD } }
 
 // less branches will generate if-else, more will generate brtable
 pub const BRTABLE_CUTOFF: usize = 10;
@@ -2607,6 +3431,33 @@ pub enum InstructionOperand {
     Immediate(i32),
     Other,
 }
+impl Instruction {
+    fn through_neutral(self) -> Instruction {
+        let dest = |_: InstructionOperandDest| InstructionOperandDest::Other;
+        let source = |s: InstructionOperand| match s {
+            InstructionOperand::Immediate(i) => InstructionOperand::Immediate(i),
+            _ => InstructionOperand::Other,
+        };
+        match self {
+            Instruction::Cmp { dest: d, source: s, opsize } => {
+                Instruction::Cmp { dest: dest(d), source: source(s), opsize }
+            },
+            Instruction::Sub { dest: d, source: s, opsize, is_dec } => {
+                Instruction::Sub { dest: dest(d), source: source(s), opsize, is_dec }
+            },
+            Instruction::Add { dest: d, source: s, opsize, is_inc } => {
+                Instruction::Add { dest: dest(d), source: source(s), opsize, is_inc }
+            },
+            Instruction::AdcSbb { dest: d, source: s, opsize } => {
+                Instruction::AdcSbb { dest: dest(d), source: source(s), opsize }
+            },
+            Instruction::NonZeroShift { dest: d, opsize } => Instruction::NonZeroShift { dest: dest(d), opsize },
+            Instruction::Bitwise { dest: d, opsize } => Instruction::Bitwise { dest: dest(d), opsize },
+            Instruction::Other => Instruction::Other,
+        }
+    }
+}
+
 impl InstructionOperand {
     pub fn is_zero(&self) -> bool {
         match self {
@@ -2691,6 +3542,12 @@ pub struct JitContext<'a> {
     /// consecutive guest instruction is relaxed x87 arithmetic.
     pub fpu_pc_cache: Option<WasmLocal>,
     pub fpu_pc_cache_kept: bool,
+    pub cr0_fpu_ok: bool,
+    pub cr0_killed: bool,
+    pub block_last_instruction: u32,
+    pub cf_in_flags: bool,
+    pub cf_in_flags_next: bool,
+    pub flags_mat_until: u32,
     /// Set true by any x87 relaxed wrapper that leaves the block-scoped st-local
     /// cache coherent (it either updated the touched slot or invalidated all
     /// slots). Reset to false before each instruction; if an x87 opcode
@@ -2700,6 +3557,7 @@ pub struct JitContext<'a> {
     /// aka _ftol, FSQRT/FSIN/FCOS, FINCSTP/FDECSTP, FLD m80, FIADD-family, …)
     /// silently mutate the FPU stack / shift TOP behind stale cached values.
     pub x87_cache_kept: bool,
+    pub x87_run_left: u32,
     pub gg: codegen::GgCtx<'a>,
 }
 
@@ -2766,6 +3624,25 @@ fn skip_instruction_prefixes(mut addr: u32) -> u32 {
             _ => return addr,
         }
     }
+}
+
+fn cond_skip_at(addr: u32) -> bool {
+    let opcode = read_jit_u8(addr);
+    if !(0x70..=0x7F).contains(&opcode) || read_jit_u8(addr + 1) != 6 {
+        return false;
+    }
+    let skipped = addr + 2;
+    if Page::page_of(skipped + 6) != Page::page_of(addr) || is_near_end_of_page(skipped + 6) {
+        return false;
+    }
+    matches!(read_jit_u8(skipped), 0xD8 | 0xDC) && read_jit_u8(skipped + 1) == 0x05
+}
+
+fn opcode_is_flag_neutral(addr: u32) -> bool {
+    matches!(
+        decode_jit_opcode(addr).0,
+        0x88..=0x8B | 0x8D | 0xB0..=0xBF | 0xC6 | 0xC7 | 0x90 | 0x1B6 | 0x1B7 | 0x1BE | 0x1BF
+    )
 }
 
 fn decode_jit_opcode(addr: u32) -> (u32, u32) {
@@ -2933,6 +3810,145 @@ fn flags_dead_from_addr(
         // original single-block behavior.
         _ => false,
     }
+}
+
+fn fault_mat_step(addr: u32) -> Option<(bool, u8)> {
+    let (opcode, operand_addr) = decode_jit_opcode(addr);
+    let modrm = read_jit_u8(operand_addr);
+    let reg_only = modrm & 0xC0 == 0xC0;
+    let r = modrm >> 3 & 7;
+    let rm = modrm & 7;
+    let b8 = |x: u8| 1u8 << (x & 3);
+    let b32 = |x: u8| 1u8 << x;
+    match opcode {
+        0x88 => Some((!reg_only, if reg_only { b8(rm) } else { 0 })),
+        0x89 => Some((!reg_only, if reg_only { b32(rm) } else { 0 })),
+        0x8A => Some((!reg_only, b8(r))),
+        0x8B => Some((!reg_only, b32(r))),
+        0x8D if !reg_only => Some((false, b32(r))),
+        0xB0..=0xB7 => Some((false, b8(opcode as u8 & 7))),
+        0xB8..=0xBF => Some((false, b32(opcode as u8 & 7))),
+        0xC6 if r == 0 => Some((!reg_only, if reg_only { b8(rm) } else { 0 })),
+        0xC7 if r == 0 => Some((!reg_only, if reg_only { b32(rm) } else { 0 })),
+        0x90 => Some((false, 0)),
+        0x1B6 | 0x1B7 | 0x1BE | 0x1BF => Some((!reg_only, b32(r))),
+        _ => None,
+    }
+}
+
+fn flags_dead_through_faults(cpu: &CpuContext, current_addr: u32, block: &BasicBlock) -> Option<(u32, u8)> {
+    if !matches!(classify_flag_class(current_addr), FlagClass::Overwrite { .. }) {
+        return None;
+    }
+    let mut addr = instruction_end(cpu, current_addr);
+    let mut clobber = 0u8;
+    let mut faults = false;
+    let mut steps = 0;
+    while addr > current_addr && addr < block.end_addr && steps < FLAG_LIVENESS_WALK_LIMIT {
+        if let FlagClass::Overwrite { non_faulting } = classify_flag_class(addr) {
+            return if faults || !non_faulting { Some((addr, clobber)) } else { None };
+        }
+        let (f, w) = fault_mat_step(addr)?;
+        faults |= f;
+        clobber |= w;
+        addr = instruction_end(cpu, addr);
+        steps += 1;
+    }
+    None
+}
+
+fn read_jit_u32(addr: u32) -> u32 {
+    read_jit_u8(addr) as u32
+        | (read_jit_u8(addr + 1) as u32) << 8
+        | (read_jit_u8(addr + 2) as u32) << 16
+        | (read_jit_u8(addr + 3) as u32) << 24
+}
+
+fn flags_mat_recipe(ctx: &JitContext, addr: u32, clobber: u8) -> Option<PendingFlags> {
+    use crate::wasmgen::wasm_builder::{FlagRecon, RECON_ADD, RECON_AND, RECON_SUB};
+    if !ctx.cpu.state_flags.is_32() {
+        return None;
+    }
+    #[derive(PartialEq, Clone, Copy)]
+    enum K {
+        Add,
+        Sub,
+        Cmp,
+        Logic,
+        Test,
+    }
+    let alu = |g: u8| match g {
+        0 => Some(K::Add),
+        1 | 4 | 6 => Some(K::Logic),
+        5 => Some(K::Sub),
+        7 => Some(K::Cmp),
+        _ => None,
+    };
+    let op = read_jit_u8(addr);
+    let modrm = read_jit_u8(addr + 1);
+    let reg_only = modrm & 0xC0 == 0xC0;
+    let (k, d, s_reg, imm): (K, u8, Option<u8>, i32) = match op {
+        0x01 | 0x09 | 0x21 | 0x29 | 0x31 | 0x39 if reg_only => {
+            (alu(op >> 3)?, modrm & 7, Some(modrm >> 3 & 7), 0)
+        },
+        0x85 if reg_only => (K::Test, modrm & 7, Some(modrm >> 3 & 7), 0),
+        0x03 | 0x0B | 0x23 | 0x2B | 0x33 | 0x3B if reg_only => {
+            (alu(op >> 3)?, modrm >> 3 & 7, Some(modrm & 7), 0)
+        },
+        0x05 | 0x0D | 0x25 | 0x2D | 0x35 | 0x3D => (alu(op >> 3)?, 0, None, read_jit_u32(addr + 1) as i32),
+        0xA9 => (K::Test, 0, None, read_jit_u32(addr + 1) as i32),
+        0x81 if reg_only => (alu(modrm >> 3 & 7)?, modrm & 7, None, read_jit_u32(addr + 2) as i32),
+        0x83 if reg_only => (alu(modrm >> 3 & 7)?, modrm & 7, None, read_jit_u8(addr + 2) as i8 as i32),
+        0xF7 if reg_only && modrm >> 3 & 7 == 0 => (K::Test, modrm & 7, None, read_jit_u32(addr + 2) as i32),
+        _ => return None,
+    };
+    if clobber & (1 << d) != 0 {
+        return None;
+    }
+    if let Some(s) = s_reg {
+        if clobber & (1 << s) != 0 || s == d && (k == K::Add || k == K::Sub) {
+            return None;
+        }
+    }
+    let dl = ctx.register_locals[d as usize].idx();
+    let src = |op: u8| -> (Option<(u8, u8)>, Option<(i32, u8)>) {
+        match s_reg {
+            Some(s) => (Some((ctx.register_locals[s as usize].idx(), op)), None),
+            None => (None, Some((imm, op))),
+        }
+    };
+    let plain = FlagRecon { a: dl, b: None, k: None };
+    let with = |op: u8| {
+        let (b, kk) = src(op);
+        FlagRecon { a: dl, b, k: kk }
+    };
+    let logic_changed = cpu::FLAGS_ALL & !cpu::FLAG_CARRY & !cpu::FLAG_OVERFLOW & !cpu::FLAG_ADJUST;
+    let logic_clear = cpu::FLAG_CARRY | cpu::FLAG_OVERFLOW | cpu::FLAG_ADJUST;
+    Some(match k {
+        K::Add => PendingFlags { op1: Some(with(RECON_SUB)), result: plain, size: cpu::OPSIZE_32, changed: cpu::FLAGS_ALL, clear: 0 },
+        K::Sub => PendingFlags {
+            op1: Some(with(RECON_ADD)),
+            result: plain,
+            size: cpu::OPSIZE_32,
+            changed: cpu::FLAGS_ALL | cpu::FLAG_SUB,
+            clear: 0,
+        },
+        K::Cmp => PendingFlags {
+            op1: Some(plain),
+            result: with(RECON_SUB),
+            size: cpu::OPSIZE_32,
+            changed: cpu::FLAGS_ALL | cpu::FLAG_SUB,
+            clear: 0,
+        },
+        K::Logic => PendingFlags { op1: None, result: plain, size: cpu::OPSIZE_32, changed: logic_changed, clear: logic_clear },
+        K::Test => PendingFlags {
+            op1: None,
+            result: if s_reg == Some(d) { plain } else { with(RECON_AND) },
+            size: cpu::OPSIZE_32,
+            changed: logic_changed,
+            clear: logic_clear,
+        },
+    })
 }
 
 fn should_elide_current_flags(
@@ -3542,9 +4558,55 @@ fn jit_find_basic_blocks(
                 match analyze_step_within_page(&mut cpu) {
                     Some(analysis) => analysis,
                     None => {
-                        // Straddles the page end: the block ends before it, the interpreter
-                        // runs it with the real two-page fetch.
-                        profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                        let straddle_virt = (to_visit & !0xFFF) + (addr_before_instruction & 0xFFF) as i32;
+                        let next_page = Page::page_of(addr_before_instruction + 0x1000);
+                        let straddle = if page_straddle_enabled() && cpu.state_flags.is_32() {
+                            straddle_analysis(addr_before_instruction, straddle_virt, &cpu)
+                                .filter(|_| {
+                                    !page_blacklist.contains(&next_page)
+                                        && (pages.contains(&next_page) || (pages.len() as u32) < max_pages)
+                                })
+                        }
+                        else {
+                            None
+                        };
+                        match straddle {
+                            Some(end) if current_block.number_of_instructions == 0 => {
+                                pages.insert(next_page);
+                                current_block.number_of_instructions = 1;
+                                current_block.last_instruction_addr = addr_before_instruction;
+                                current_block.end_addr = end;
+                                let end_virt = straddle_virt + (end - addr_before_instruction) as i32;
+                                current_block.ty = BasicBlockType::Normal {
+                                    next_block_addr: follow_jump(
+                                        end_virt,
+                                        ctx,
+                                        &mut pages,
+                                        &mut page_blacklist,
+                                        max_pages,
+                                        &mut marked_as_entry,
+                                        &mut to_visit_stack,
+                                        Some(Page::page_of(phys_addr)),
+                                        &mut join,
+                                    ),
+                                    jump_offset: 0,
+                                    jump_offset_is_32: true,
+                                };
+                            },
+                            Some(_) => {
+                                to_visit_stack.push(straddle_virt);
+                                current_block.ty = BasicBlockType::Normal {
+                                    next_block_addr: Some(addr_before_instruction),
+                                    jump_offset: 0,
+                                    jump_offset_is_32: true,
+                                };
+                            },
+                            None => {
+                                // Straddles the page end: the block ends before it, the interpreter
+                                // runs it with the real two-page fetch.
+                                profiler::stat_increment(stat::COMPILE_CUT_OFF_AT_END_OF_PAGE);
+                            },
+                        }
                         break;
                     },
                 }
@@ -3614,6 +4676,12 @@ fn jit_find_basic_blocks(
                         }
                     }
                 },
+                AnalysisType::Jump {
+                    condition: Some(_),
+                    ..
+                } if cond_skip_enabled()
+                    && next_on_page
+                    && cond_skip_at(addr_before_instruction) => {},
                 AnalysisType::Jump {
                     offset,
                     is_32,
@@ -3686,6 +4754,76 @@ fn jit_find_basic_blocks(
                         to_visit_stack.push(current_virt_addr);
                     }
 
+                    if has_next_instruction
+                        && is_32
+                        && cpu.ssize_32()
+                        && cpu.cs_offset == 0
+                        && memory::read8(addr_before_instruction) == 0xE8
+                        && unsafe { ftol_call_site_candidate(jump_target) }
+                    {
+                        let next_block_addr = if !next_on_page
+                            || !tails && is_near_end_of_page(current_address)
+                        {
+                            None
+                        }
+                        else {
+                            Some(current_address)
+                        };
+                        current_block.ty = BasicBlockType::ConditionalJump {
+                            next_block_addr,
+                            next_block_branch_taken_addr: follow_jump(
+                                jump_target,
+                                ctx,
+                                &mut pages,
+                                &mut page_blacklist,
+                                max_pages,
+                                &mut marked_as_entry,
+                                &mut to_visit_stack,
+                                Some(Page::page_of(phys_addr)),
+                                &mut join,
+                            ),
+                            condition: FTOL_CALL_CONDITION,
+                            jump_offset: offset,
+                            jump_offset_is_32: is_32,
+                        };
+                        break;
+                    }
+
+                    if has_next_instruction
+                        && is_32
+                        && cpu.ssize_32()
+                        && cpu.cs_offset == 0
+                        && memory::read8(addr_before_instruction) == 0xE8
+                        && unsafe { wbuf_call_site_candidate(jump_target) }
+                    {
+                        let next_block_addr = if !next_on_page
+                            || !tails && is_near_end_of_page(current_address)
+                        {
+                            None
+                        }
+                        else {
+                            Some(current_address)
+                        };
+                        current_block.ty = BasicBlockType::ConditionalJump {
+                            next_block_addr,
+                            next_block_branch_taken_addr: follow_jump(
+                                jump_target,
+                                ctx,
+                                &mut pages,
+                                &mut page_blacklist,
+                                max_pages,
+                                &mut marked_as_entry,
+                                &mut to_visit_stack,
+                                Some(Page::page_of(phys_addr)),
+                                &mut join,
+                            ),
+                            condition: WBUF_CALL_CONDITION,
+                            jump_offset: offset,
+                            jump_offset_is_32: is_32,
+                        };
+                        break;
+                    }
+
                     current_block.ty = BasicBlockType::Normal {
                         next_block_addr: follow_jump(
                             jump_target,
@@ -3702,6 +4840,24 @@ fn jit_find_basic_blocks(
                         jump_offset_is_32: is_32,
                     };
 
+                    break;
+                },
+                AnalysisType::BlockBoundary
+                    if out_direct_enabled()
+                        && has_next_instruction
+                        && next_on_page
+                        && !analysis.absolute_jump
+                        && (tails || !is_near_end_of_page(current_address))
+                        && read_jit_u8(addr_before_instruction) == 0xEF
+                        && cpu.state_flags.is_32() =>
+                {
+                    marked_as_entry.insert(current_virt_addr);
+                    to_visit_stack.push(current_virt_addr);
+                    current_block.ty = BasicBlockType::Normal {
+                        next_block_addr: Some(current_address),
+                        jump_offset: 0,
+                        jump_offset_is_32: true,
+                    };
                     break;
                 },
                 AnalysisType::BlockBoundary => {
@@ -3798,6 +4954,31 @@ fn jit_find_basic_blocks(
 
                     break;
                 },
+            }
+
+            if !next_on_page
+                && tails
+                && page_fallthrough_enabled()
+                && has_next_instruction
+                && cpu.state_flags.is_32()
+                && matches!(analysis.ty, AnalysisType::Normal)
+            {
+                current_block.ty = BasicBlockType::Normal {
+                    next_block_addr: follow_jump(
+                        current_virt_addr,
+                        ctx,
+                        &mut pages,
+                        &mut page_blacklist,
+                        max_pages,
+                        &mut marked_as_entry,
+                        &mut to_visit_stack,
+                        Some(Page::page_of(phys_addr)),
+                        &mut join,
+                    ),
+                    jump_offset: 0,
+                    jump_offset_is_32: true,
+                };
+                break;
             }
 
             if !next_on_page || !tails && is_near_end_of_page(current_address) {
@@ -4028,7 +5209,7 @@ pub fn jit_force_generate_unsafe(virt_addr: i32) {
         cpu::translate_address_read(virt_addr).unwrap(),
         cpu::get_seg_cs() as u32,
         cpu::get_state_flags(),
-        JIT_THRESHOLD,
+        get_jit_threshold(),
     );
     dbg_assert!(get_jit_state().compiling.is_some());
 }
@@ -4246,6 +5427,7 @@ fn jit_analyze_and_generate(
         )
         .0
     };
+    unsafe { X87_ENTRY_IN = None };
     dbg_assert!(!entries.is_empty());
 
     let mut page_info = HashMap::new();
@@ -5067,6 +6249,99 @@ fn gen_chain_or_exit_to_known_successor(
 /// Attribute this activation's local guest-instruction count to its module at a real
 /// module exit. Cross-module chain exits fold the same operation into their existing
 /// lookup helper to avoid a second wasm call on the hottest edge.
+fn gen_ret_memo_inline_probe(ctx: &mut JitContext, state_flags: CachedStateFlags) {
+    if !unsafe { JIT_RET_MEMO_INLINE } || unsafe { JIT_TIER2_THRESHOLD } != 0 {
+        return;
+    }
+    let miss = ctx.builder.block_void();
+
+    ctx.builder.load_fixed_u8(std::ptr::addr_of!(TIER2_UNGATED) as u32);
+    ctx.builder.br_if(miss);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(WRONG_ENTRY_REFUSE) as u32);
+    ctx.builder.br_if(miss);
+    ctx.builder.load_fixed_u8(std::ptr::addr_of!(RET_CACHE_HASH_MIX) as u32);
+    ctx.builder.br_if(miss);
+
+    let hp = unsafe { hypercall::hp_ptr() as u32 };
+    ctx.builder.load_fixed_i32(hp);
+    let limit = ctx.builder.set_new_local();
+    ctx.builder.get_local(&limit);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+        ctx.builder.load_fixed_i32(hp + 0x008);
+        ctx.builder.br_if(miss);
+        ctx.builder.const_i32(100_003);
+        ctx.builder.set_local(&limit);
+    ctx.builder.block_end();
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
+    ctx.builder.sub_i32();
+    ctx.builder.get_local(&limit);
+    ctx.builder.geu_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.free_local(limit);
+    ctx.builder.load_fixed_u8(global_pointers::in_hlt as u32);
+    ctx.builder.br_if(miss);
+
+    ctx.builder.const_i32(std::ptr::addr_of!(RET_CACHE) as u32 as i32);
+    ctx.builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
+    let eip = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(2);
+    ctx.builder.shr_u_i32();
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(RET_CACHE_MASK) as u32);
+    ctx.builder.and_i32();
+    ctx.builder.const_i32(std::mem::size_of::<RetMemo>() as i32);
+    ctx.builder.mul_i32();
+    ctx.builder.add_i32();
+    let entry = ctx.builder.set_new_local();
+
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(0);
+    ctx.builder.get_local(&eip);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.free_local(eip);
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(4);
+    ctx.builder.const_i32(state_flags.to_u32() as i32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(12);
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(RET_CACHE_EPOCH) as u32);
+    ctx.builder.ne_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.get_local(&entry);
+    ctx.builder.load_aligned_i32(8);
+    let packed = ctx.builder.tee_new_local();
+    ctx.builder.const_i32(0);
+    ctx.builder.lt_i32();
+    ctx.builder.br_if(miss);
+    ctx.builder.free_local(entry);
+
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.const_i32(cpu::WASM_TABLE_OFFSET as i32);
+    ctx.builder.sub_i32();
+    let table_index = ctx.builder.set_new_local();
+    gen_direct_chain_entry_accounting(ctx, &table_index);
+    ctx.builder.free_local(table_index);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::RET_CHAIN_HIT);
+    codegen::gen_dispatch_stat_increment(ctx.builder, stat::RET_MEMO_HIT);
+
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(0xFFFF);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&packed);
+    ctx.builder.const_i32(16);
+    ctx.builder.shr_u_i32();
+    ctx.builder.return_call_indirect_fn1();
+    ctx.builder.free_local(packed);
+
+    ctx.builder.block_end();
+}
+
 pub fn gen_tier2_note_retired(ctx: &mut JitContext) {
     if unsafe { JIT_TIER2_THRESHOLD } == 0 {
         return;
@@ -5123,6 +6398,7 @@ fn jit_generate_module_guard_groups(
         })
         .collect();
 
+    unsafe { X87_ENTRY_FACTS.clear() };
     unsafe { CODEGEN_DRY_RUN = true };
     let (_, recorded_ok) = jit_generate_module(
         structure.clone(),
@@ -5135,6 +6411,9 @@ fn jit_generate_module_guard_groups(
         None,
     );
     unsafe { CODEGEN_DRY_RUN = false };
+    if x87_entry_state_enabled() {
+        x87_entry_compute(basic_blocks, &entry_set);
+    }
     let log = std::mem::take(&mut builder.gg.log);
     gg_stat_add(0, 1);
     for ev in &log {
@@ -5253,10 +6532,25 @@ fn jit_generate_module(
         }
     }
 
+    if unsafe { JIT_SMC_EXIT_LOCAL && JIT_SMC_EXIT } {
+        builder.const_i32(0);
+        let l = builder.set_new_local();
+        builder.smc_local = Some(l.idx());
+        std::mem::forget(l);
+    }
+
+    if unsafe { JIT_X87_TOP_LOCAL } && crate::softfloat::is_fpu_relaxed() {
+        builder.const_i32(0);
+        let l = builder.set_new_local();
+        builder.x87_top_local = Some(l.idx());
+        builder.x87_top_ready = false;
+        std::mem::forget(l);
+    }
+
     // Flag-locals (idx 21): lazy-flag tuple lives in wasm locals for the whole
     // module — initialized from the memory globals here, spilled back at every
     // exit epilogue and around every non-whitelisted helper call (builder funnel).
-    if flag_locals_enabled() {
+    if flag_locals_enabled() || flag_locals_auto_enabled() && !module_has_x87(basic_blocks, &cpu) {
         let addrs: [u32; 5] = [
             global_pointers::last_op1 as u32,
             global_pointers::last_result as u32,
@@ -5314,7 +6608,14 @@ fn jit_generate_module(
         perm_map_off: None,
         fpu_pc_cache: None,
         fpu_pc_cache_kept: false,
+        cr0_fpu_ok: false,
+        cr0_killed: false,
+        block_last_instruction: 0,
+        cf_in_flags: false,
+        cf_in_flags_next: false,
+        flags_mat_until: 0,
         x87_cache_kept: false,
+        x87_run_left: 0,
         gg,
     };
 
@@ -5605,6 +6906,8 @@ fn jit_generate_module(
                         if ret_chaining_enabled() {
                             codegen::gen_move_registers_from_locals_to_memory(ctx);
                             codegen::gen_update_instruction_counter(ctx);
+
+                            gen_ret_memo_inline_probe(ctx, state_flags);
 
                             ctx.builder.const_i32(state_flags.to_u32() as i32);
                             ctx.builder.const_i32(ctx.wasm_table_index as i32);
@@ -6132,7 +7435,20 @@ fn jit_generate_module(
                 let label = ctx.builder.loop_void();
                 codegen::gen_profiler_stat_increment(ctx.builder, stat::LOOP);
 
-                if entries.len() == 1 {
+                if entries.len() == 1 && loop_eip_lazy_enabled() && !cfg!(feature = "profiler") {
+                    let addr = entries[0];
+                    profiler::stat_increment(stat::COMPILE_WITH_LOOP_SAFETY);
+                    if unsafe { JIT_USE_LOOP_SAFETY } {
+                        ctx.builder.get_local(&ctx.instruction_counter);
+                        ctx.builder.const_i32(cpu::LOOP_COUNTER);
+                        ctx.builder.geu_i32();
+                        ctx.builder.if_void();
+                        codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
+                        ctx.builder.br(exit_label);
+                        ctx.builder.block_end();
+                    }
+                }
+                else if entries.len() == 1 {
                     let addr = entries[0];
                     codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
                     profiler::stat_increment(stat::COMPILE_WITH_LOOP_SAFETY);
@@ -6151,6 +7467,23 @@ fn jit_generate_module(
                             ctx.builder.br_if(exit_label);
                         }
                     }
+                }
+                else if unsafe { JIT_USE_LOOP_SAFETY && JIT_MULTI_ENTRY_LOOP_SAFETY } {
+                    ctx.builder.get_local(&ctx.instruction_counter);
+                    ctx.builder.const_i32(cpu::LOOP_COUNTER);
+                    ctx.builder.geu_i32();
+                    ctx.builder.if_void();
+                    for &addr in entries.iter() {
+                        let index = *index_for_addr.get(&addr).unwrap();
+                        ctx.builder.get_local(target_block);
+                        ctx.builder.const_i32(index.into());
+                        ctx.builder.eq_i32();
+                        ctx.builder.if_void();
+                        codegen::gen_set_eip_low_bits(ctx.builder, addr as i32 & 0xFFF);
+                        ctx.builder.br(exit_label);
+                        ctx.builder.block_end();
+                    }
+                    ctx.builder.block_end();
                 }
 
                 let mut olds = HashMap::new();
@@ -6335,6 +7668,47 @@ fn jit_generate_module(
 }
 
 /// True if the instruction at `eip` is an x87 escape, after prefixes.
+fn opcode_may_write_cr0(eip: u32) -> bool {
+    let mut addr = eip;
+    for _ in 0..4 {
+        match read_jit_u8(addr) {
+            0x26 | 0x2E | 0x36 | 0x3E | 0x64 | 0x65 | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 => {
+                addr = addr.wrapping_add(1);
+            },
+            0x0F => {
+                return match read_jit_u8(addr.wrapping_add(1)) {
+                    0x01 | 0x06 | 0x22 => true,
+                    _ => false,
+                }
+            },
+            0x9A | 0xCC | 0xCD | 0xCE | 0xCF | 0xEA | 0xFF => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn module_has_x87(basic_blocks: &HashMap<u32, BasicBlock>, cpu: &CpuContext) -> bool {
+    let mut total = 0u32;
+    let mut x87 = 0u32;
+    for block in basic_blocks.values() {
+        let mut addr = block.addr;
+        while addr < block.end_addr {
+            total += 1;
+            if opcode_is_x87(addr) || read_jit_u8(addr) == 0x9B {
+                x87 += 1;
+            }
+            let mut next = CpuContext { eip: addr, ..*cpu };
+            analysis::analyze_step(&mut next);
+            if next.eip <= addr {
+                break;
+            }
+            addr = next.eip;
+        }
+    }
+    x87 * 20 > total
+}
+
 fn opcode_is_x87(eip: u32) -> bool {
     let mut addr = eip;
     for _ in 0..4 {
@@ -6386,6 +7760,12 @@ fn jit_generate_basic_block(
     };
 
     profiler::stat_increment(stat::COMPILE_BASIC_BLOCK);
+    let (cr0_in, dirty_in) = x87_entry_in(block.addr);
+    ctx.block_last_instruction = block.last_instruction_addr;
+    ctx.cr0_fpu_ok = cr0_in;
+    ctx.cr0_killed = false;
+    let mut instructions_done = 0u32;
+    ctx.builder.x87_top_ready = false;
 
     let start_addr = block.addr;
     let last_instruction_addr = block.last_instruction_addr;
@@ -6401,6 +7781,13 @@ fn jit_generate_basic_block(
 
     if ctx.gg.mode != codegen::GgMode::Off {
         ctx.builder.gg.log.push(analysis::GgEvent::Block(block.addr));
+    }
+
+    if block_is_straddle(block) {
+        codegen::gen_straddle_check(ctx, start_addr);
+        if !codegen_dry_run() {
+            unsafe { STRADDLES_COMPILED = STRADDLES_COMPILED.saturating_add(1) }
+        }
     }
 
     ctx.builder.get_local(&ctx.instruction_counter);
@@ -6457,9 +7844,12 @@ fn jit_generate_basic_block(
     ctx.cpu.eip = start_addr;
     ctx.current_instruction = Instruction::Other;
     ctx.previous_instruction = Instruction::Other;
-    ctx.fpu_simd_dirty_marked = false;
+    ctx.fpu_simd_dirty_marked = dirty_in;
     ctx.elide_current_flags = false;
     let mut instruction_index_in_block: u32 = 0;
+    ctx.builder.pending_flags = None;
+    ctx.flags_mat_until = 0;
+    let mut cond_skip_open: Option<(bool, bool)> = None;
 
     loop {
         // Eight bytes, not four: the operand-form census needs the SIB byte, and a
@@ -6488,12 +7878,71 @@ fn jit_generate_basic_block(
             }
         }
 
+        if cond_skip_open.is_none()
+            && cond_skip_enabled()
+            && ctx.cpu.eip != last_instruction_addr
+            && ctx.x87_run_left == 0
+            && cond_skip_at(ctx.cpu.eip)
+        {
+            let condition = read_jit_u8(ctx.cpu.eip) as u8;
+            gen_cond_skip_fence(ctx);
+            if ctx.builder.x87_top_local.is_some() && !ctx.builder.x87_top_ready {
+                ctx.builder.x87_top_init();
+            }
+            codegen::gen_condition_fn_negated(ctx, condition);
+            ctx.builder.if_void();
+            if !codegen_dry_run() {
+                unsafe { COND_SKIPS_COMPILED = COND_SKIPS_COMPILED.saturating_add(1) }
+            }
+            cond_skip_open = Some((ctx.cr0_fpu_ok, ctx.fpu_simd_dirty_marked));
+            ctx.cpu.eip += 2;
+            ctx.previous_instruction = Instruction::Other;
+            ctx.current_instruction = Instruction::Other;
+            instructions_done += 1;
+            continue;
+        }
+
+        if ctx.x87_run_left == 0
+            && x87_runs_enabled()
+            && cond_skip_open.is_none()
+            && ctx.cpu.eip != last_instruction_addr
+        {
+            ctx.cpu.prefixes = 0;
+            if ctx.cpu.asize_32() {
+                let include_last = x87_run_tail_enabled()
+                    && !needs_eip_updated
+                    && matches!(block.ty, BasicBlockType::Normal { .. });
+                let run = x87_run_scan(ctx.cpu.eip, last_instruction_addr, include_last);
+                if run.len() >= 2 {
+                    ctx.x87_run_left = run.len() as u32;
+                    codegen::gen_x87_run(ctx, &run);
+                }
+            }
+        }
+
         let wasm_length_before = ctx.builder.instruction_body_length();
+        ctx.builder.code_write_call_seen = false;
 
         ctx.start_of_current_instruction = ctx.cpu.eip;
         let start_eip = ctx.cpu.eip;
         ctx.elide_current_flags =
             should_elide_current_flags(&*ctx.cpu, start_eip, block, basic_blocks, loop_heads);
+        let mut flags_mat: Option<(PendingFlags, u32)> = None;
+        if !ctx.elide_current_flags
+            && flags_fault_mat_enabled()
+            && dead_flag_elision_enabled()
+            && cond_skip_open.is_none()
+        {
+            if let Some((until, clobber)) = flags_dead_through_faults(&*ctx.cpu, start_eip, block) {
+                if let Some(p) = flags_mat_recipe(ctx, start_eip, clobber) {
+                    ctx.elide_current_flags = true;
+                    flags_mat = Some((p, until));
+                    if !codegen_dry_run() {
+                        unsafe { FLAGS_FAULT_MAT_COMPILED = FLAGS_FAULT_MAT_COMPILED.wrapping_add(1) }
+                    }
+                }
+            }
+        }
         // Relaxed x87 wrappers set this when they keep the st cache coherent.
         ctx.x87_cache_kept = false;
         ctx.fpu_pc_cache_kept = false;
@@ -6510,8 +7959,35 @@ fn jit_generate_basic_block(
         ctx.smc_instructions_remaining =
             block.number_of_instructions.saturating_sub(instruction_index_in_block);
         instruction_index_in_block += 1;
-        jit_instructions::jit_instruction(ctx, &mut instruction_flags);
+        if ctx.builder.x87_top_local.is_some() && !ctx.builder.x87_top_ready && opcode_is_x87(ctx.cpu.eip) {
+            ctx.builder.x87_top_init();
+        }
+        if fwait_inline_enabled() && read_jit_u8(ctx.cpu.eip) == 0x9B {
+            ctx.cpu.prefixes = 0;
+            ctx.start_of_current_instruction = ctx.cpu.eip;
+            ctx.cpu.read_imm8();
+            codegen::gen_fwait_inline(ctx);
+        }
+        else {
+            ctx.cf_in_flags = mem::replace(&mut ctx.cf_in_flags_next, false);
+            jit_instructions::jit_instruction(ctx, &mut instruction_flags);
+            ctx.cf_in_flags = false;
+        }
+        if ctx.flags_mat_until == start_eip {
+            ctx.builder.pending_flags = None;
+            ctx.flags_mat_until = 0;
+        }
+        if let Some((p, until)) = flags_mat {
+            ctx.builder.pending_flags = Some(p);
+            ctx.flags_mat_until = until;
+        }
         let end_eip = ctx.cpu.eip;
+        if ctx.cr0_fpu_ok && opcode_may_write_cr0(start_eip) {
+            ctx.cr0_fpu_ok = false;
+        }
+        if opcode_may_write_cr0(start_eip) {
+            ctx.cr0_killed = true;
+        }
 
         // The PC predicate is deliberately narrower than the generic ST cache:
         // it survives only through an uninterrupted run of relaxed arithmetic.
@@ -6529,6 +8005,37 @@ fn jit_generate_basic_block(
             codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
         }
         ctx.builder.gg.in_insn = false;
+        if ctx.x87_run_left > 0 {
+            ctx.x87_run_left -= 1;
+            if ctx.x87_run_left == 0 {
+                codegen::gen_x87_run_join(ctx);
+            }
+        }
+        instructions_done += 1;
+        if let Some((cr0_fpu_ok, fpu_simd_dirty_marked)) = cond_skip_open.take() {
+            gen_cond_skip_fence(ctx);
+            ctx.builder.else_();
+            ctx.builder.get_local(&ctx.instruction_counter);
+            ctx.builder.const_i32(1);
+            ctx.builder.sub_i32();
+            ctx.builder.set_local(&ctx.instruction_counter);
+            ctx.builder.block_end();
+            ctx.cr0_fpu_ok = cr0_fpu_ok;
+            ctx.fpu_simd_dirty_marked = fpu_simd_dirty_marked;
+            ctx.current_instruction = Instruction::Other;
+        }
+        if smc_exit_enabled()
+            && ctx.builder.code_write_call_seen
+            && ctx.x87_run_left == 0
+            && (start_eip != last_instruction_addr
+                || matches!(block.ty, BasicBlockType::Normal { jump_offset: 0, .. }))
+        {
+            codegen::gen_smc_exit_check(
+                ctx,
+                page_offset_of_end(start_addr, end_eip),
+                block.number_of_instructions - instructions_done,
+            );
+        }
 
         let instruction_length = end_eip - start_eip;
         let was_block_boundary = instruction_flags & JIT_INSTR_BLOCK_BOUNDARY_FLAG != 0;
@@ -6575,8 +8082,173 @@ fn jit_generate_basic_block(
             break;
         }
 
-        ctx.previous_instruction = mem::replace(&mut ctx.current_instruction, Instruction::Other);
+        let produced = mem::replace(&mut ctx.current_instruction, Instruction::Other);
+        if flag_carry_neutral_enabled()
+            && matches!(produced, Instruction::Other)
+            && opcode_is_flag_neutral(start_eip)
+        {
+            let carried = mem::replace(&mut ctx.previous_instruction, Instruction::Other);
+            ctx.previous_instruction = carried.through_neutral();
+        }
+        else {
+            ctx.previous_instruction = produced;
+        }
     }
+    if codegen_dry_run() && x87_entry_state_enabled() {
+        unsafe {
+            X87_ENTRY_FACTS.push((block.addr, ctx.cr0_fpu_ok, !ctx.cr0_killed, ctx.fpu_simd_dirty_marked));
+        }
+    }
+}
+
+fn gen_cond_skip_fence(ctx: &mut JitContext) {
+    codegen::gen_x87_local_cache_free_all(ctx);
+    codegen::gen_push32_write_cache_free(ctx);
+    codegen::gen_read_tlb_cache_free(ctx);
+    codegen::gen_perm_map_off_free(ctx);
+    codegen::gen_fpu_pc_cache_free(ctx);
+    if ctx.gg.mode != codegen::GgMode::Off {
+        ctx.builder.gg.log.push(analysis::GgEvent::Barrier);
+    }
+}
+
+fn x87_run_modrm_length(addr: u32) -> u32 {
+    let modrm = read_jit_u8(addr);
+    if modrm >= 0xC0 {
+        return 1;
+    }
+    let mode = modrm >> 6;
+    let rm = modrm & 7;
+    let mut len = 1;
+    if rm == 4 {
+        let sib = read_jit_u8(addr + 1);
+        len += 1;
+        if mode == 0 && sib & 7 == 5 {
+            len += 4;
+        }
+    }
+    else if mode == 0 && rm == 5 {
+        len += 4;
+    }
+    match mode {
+        1 => len + 1,
+        2 => len + 4,
+        _ => len,
+    }
+}
+
+fn x87_run_decode(addr: u32) -> Option<codegen::X87RunOp> {
+    use codegen::{FpuFastBinOp as B, X87RunMem as M, X87RunOp as O};
+    let opcode = read_jit_u8(addr);
+    let modrm = read_jit_u8(addr + 1);
+    let reg = (modrm >> 3 & 7) as u32;
+    let rm = (modrm & 7) as u32;
+    let is_mem = modrm < 0xC0;
+    let binop = |r: u32| match r {
+        0 => Some(B::Add),
+        1 => Some(B::Mul),
+        4 => Some(B::Sub),
+        5 => Some(B::SubR),
+        6 => Some(B::Div),
+        7 => Some(B::DivR),
+        _ => None,
+    };
+    match (opcode, is_mem, reg) {
+        (0xD8, true, 2) => Some(O::ComMem(M::M32, 0)),
+        (0xD8, true, 3) => Some(O::ComMem(M::M32, 1)),
+        (0xD8, false, 2) => Some(O::ComSti(rm, 0)),
+        (0xD8, false, 3) => Some(O::ComSti(rm, 1)),
+        (0xD8, true, r) => binop(r).map(|op| O::BinMem(op, M::M32)),
+        (0xD8, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: 0, pop: false }),
+        (0xD9, true, 0) => Some(O::PushMem(M::M32)),
+        (0xD9, false, 0) => Some(O::PushSti(rm)),
+        (0xD9, false, 1) => Some(O::Fxch(rm)),
+        (0xD9, true, 2) => Some(O::StoreMem { m64: false, pop: false }),
+        (0xD9, true, 3) => Some(O::StoreMem { m64: false, pop: true }),
+        (0xD9, false, 4) if rm == 0 => Some(O::Chs),
+        (0xD9, false, 4) if rm == 1 => Some(O::Abs),
+        (0xD9, false, 5) if rm == 0 => Some(O::PushConst(1.0)),
+        (0xD9, false, 5) if rm == 6 => Some(O::PushConst(0.0)),
+        (0xDA, true, 2) => Some(O::ComMem(M::I32, 0)),
+        (0xDA, true, 3) => Some(O::ComMem(M::I32, 1)),
+        (0xDA, false, 5) if rm == 1 => Some(O::ComSti(1, 2)),
+        (0xDA, true, r) => binop(r).map(|op| O::BinMem(op, M::I32)),
+        (0xDB, true, 0) => Some(O::PushMem(M::I32)),
+        (0xDB, true, 5)
+            if crate::cpu::fpu::get_fpu_fld80_exact_fast() != 0
+                && crate::cpu::fpu::get_fpu_fld80_relaxed() == 0 =>
+        {
+            Some(O::PushMem(M::M80))
+        },
+        (0xDC, true, 2) => Some(O::ComMem(M::M64, 0)),
+        (0xDC, true, 3) => Some(O::ComMem(M::M64, 1)),
+        (0xDC, false, 2) => Some(O::ComSti(rm, 0)),
+        (0xDC, false, 3) => Some(O::ComSti(rm, 1)),
+        (0xDC, true, r) => binop(r).map(|op| O::BinMem(op, M::M64)),
+        (0xDC, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: rm, pop: false }),
+        (0xDD, true, 0) => Some(O::PushMem(M::M64)),
+        (0xDD, true, 2) => Some(O::StoreMem { m64: true, pop: false }),
+        (0xDD, true, 3) => Some(O::StoreMem { m64: true, pop: true }),
+        (0xDD, false, 2) => Some(O::StoreSti { i: rm, pop: false }),
+        (0xDD, false, 3) => Some(O::StoreSti { i: rm, pop: true }),
+        (0xDD, false, 5) => Some(O::ComSti(rm, 1)),
+        (0xDE, false, 3) if rm == 1 => Some(O::ComSti(1, 2)),
+        (0xDF, false, 4) if rm == 0 => Some(O::Fnstsw),
+        (0xDE, false, r) => binop(r).map(|op| O::BinSti { op, sti: rm, target: rm, pop: true }),
+        _ => None,
+    }
+}
+
+fn x87_run_scan(start: u32, last_instruction_addr: u32, include_last: bool) -> Vec<codegen::X87RunInsn> {
+    let mut run = Vec::new();
+    let mut model = codegen::X87RunModel::new();
+    let mut addr = start;
+    let mut stored = false;
+    let mut ops = 0;
+    while run.len() < 16 {
+        let is_last = addr == last_instruction_addr;
+        if is_last && !include_last {
+            break;
+        }
+        if read_jit_u8(addr) == 0x9B && fwait_inline_enabled() && !run.is_empty() {
+            run.push(codegen::X87RunInsn { addr, op: codegen::X87RunOp::Wait });
+            addr += 1;
+            if is_last {
+                break;
+            }
+            continue;
+        }
+        if !(0xD8..=0xDF).contains(&read_jit_u8(addr)) {
+            break;
+        }
+        let op = match x87_run_decode(addr) {
+            Some(op) => op,
+            None => break,
+        };
+        let len = 1 + x87_run_modrm_length(addr + 1);
+        if Page::page_of(addr) != Page::page_of(addr + len - 1)
+            || !is_last && addr + len > last_instruction_addr
+        {
+            break;
+        }
+        if stored && matches!(op, codegen::X87RunOp::PushMem(codegen::X87RunMem::M80)) {
+            break;
+        }
+        if !model.step(&op) {
+            break;
+        }
+        stored |= matches!(op, codegen::X87RunOp::StoreMem { .. });
+        ops += 1;
+        run.push(codegen::X87RunInsn { addr, op });
+        addr += len;
+        if matches!(op, codegen::X87RunOp::Fnstsw) || is_last {
+            break;
+        }
+    }
+    if ops < 2 {
+        run.clear();
+    }
+    run
 }
 
 pub fn jit_increase_hotness_and_maybe_compile(
@@ -6606,7 +8278,7 @@ pub fn jit_increase_hotness_and_maybe_compile(
     }
 
     *hotness += heat;
-    if *hotness >= JIT_THRESHOLD {
+    if *hotness >= get_jit_threshold() {
         if is_compiling {
             return;
         }
@@ -6816,6 +8488,10 @@ fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
     {
         profiler::stat_increment(stat::INVALIDATE_PAGE_HAD_CODE);
         did_have_code = true;
+        unsafe {
+            SMC_EXIT_PENDING = 1;
+            SMC_PENDING_SET = SMC_PENDING_SET.wrapping_add(1);
+        }
 
         // ONE forest walk for primary + hidden: the captured hidden list and the
         // primary's tree overlap (see free_wasm_module_forest) — separate walks
@@ -7151,6 +8827,145 @@ fn jit_codegen_fingerprint() -> u64 {
         if JIT_HOT_EDGE_REGIONS {
             add(0x7A11_0002);
             add(HOT_EDGE_EXTRA_PAGES);
+        }
+        if WBUF_CALL_SITES != 0 {
+            add(0x7A11_0004);
+        }
+        if JIT_RET_MEMO_INLINE {
+            add(0x7A11_0005);
+        }
+        if JIT_FWAIT_INLINE {
+            add(0x7A11_0006);
+        }
+        if JIT_MULTI_ENTRY_LOOP_SAFETY {
+            add(0x7A11_0007);
+        }
+        if JIT_SSE_SCALAR_INLINE {
+            add(0x7A11_0008);
+        }
+        if JIT_X87_LEAN {
+            add(0x7A11_0009);
+        }
+        if JIT_X87_TOP_LOCAL {
+            add(0x7A11_000A);
+        }
+        if JIT_X87_RUNS {
+            add(0x7A11_000B);
+        }
+        if JIT_CARRY8_INLINE {
+            add(0x7A11_000C);
+        }
+        if JIT_SSE_CONVERT_INLINE {
+            add(0x7A11_000D);
+        }
+        if JIT_PAGE_FALLTHROUGH {
+            add(0x7A11_000E);
+        }
+        if JIT_FIST64_INLINE {
+            add(0x7A11_000F);
+        }
+        if JIT_FLAG_LOCALS_AUTO {
+            add(0x7A11_0010);
+        }
+        if FTOL_CALL_FUSION {
+            add(0x7A11_0011);
+        }
+        if JIT_SMC_EXIT {
+            add(0x7A11_0012);
+        }
+        if JIT_FLAG_CARRY_NEUTRAL {
+            add(0x7A11_0013);
+        }
+        if JIT_COND_SKIP {
+            add(0x7A11_0014);
+        }
+        if JIT_X87_ENTRY_STATE {
+            add(0x7A11_0015);
+        }
+        if JIT_PAGE_STRADDLE {
+            add(0x7A11_0016);
+        }
+        if JIT_X87_RUN_TAIL {
+            add(0x7A11_0040);
+        }
+        if JIT_X87_RUN_GUARD_SHARE {
+            add(0x7A11_0041);
+        }
+        if JIT_X87_CMP_LEAN {
+            add(0x7A11_0017);
+        }
+        if JIT_GG_THROUGH_RUNS {
+            add(0x7A11_0018);
+        }
+        if JIT_ADC_CF_ONLY {
+            add(0x7A11_0019);
+        }
+        if JIT_INCDEC_CF_KEEP {
+            add(0x7A11_001B);
+        }
+        if JIT_LOOP_EIP_LAZY {
+            add(0x7A11_0021);
+        }
+        if JIT_FLAGS_FAULT_MAT {
+            add(0x7A11_0022);
+        }
+        if JIT_REG8_LEAN {
+            add(0x7A11_0023);
+        }
+        if JIT_SMC_EXIT_LOCAL && JIT_SMC_EXIT {
+            add(0x7A11_0024);
+        }
+        if JIT_ADC8_CF_DIRECT {
+            add(0x7A11_0025);
+        }
+        if JIT_PF_INLINE {
+            add(0x7A11_0026);
+        }
+        if JIT_SSE_PACKED_INLINE {
+            add(0x7A11_0027);
+        }
+        if JIT_ALU16_INLINE {
+            add(0x7A11_0028);
+        }
+        if JIT_FLDCW_INLINE {
+            add(0x7A11_0029);
+        }
+        if JIT_MMX_INLINE {
+            add(0x7A11_002A);
+        }
+        if JIT_GG_MEMBER_INLINE_FALLBACK {
+            add(0x7A11_002B);
+        }
+        if JIT_CVTTPS2PI_INLINE {
+            add(0x7A11_002C);
+        }
+        if JIT_FRNDINT_INLINE {
+            add(0x7A11_002D);
+        }
+        if JIT_IDIV_INLINE {
+            add(0x7A11_002E);
+        }
+        if JIT_FLD80_INLINE {
+            add(0x7A11_002F);
+        }
+        if JIT_WBUF_BITMAP {
+            add(0x7A11_0031);
+        }
+        if JIT_MMX_LOGIC_INLINE {
+            add(0x7A11_0032);
+        }
+        if JIT_RMW_MISC_INLINE {
+            add(0x7A11_0033);
+        }
+        if JIT_OUT_DIRECT {
+            add(0x7A11_0035);
+        }
+        if JIT_THRESHOLD != JIT_THRESHOLD_DEFAULT {
+            add(0x7A11_0034);
+            add(JIT_THRESHOLD);
+        }
+        if crate::cpu::fpu::get_fpu_fld80_relaxed() != 0 {
+            add(0x7A11_0030);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

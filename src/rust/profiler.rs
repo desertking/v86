@@ -210,6 +210,8 @@ pub enum stat {
     RET_MEMO_COLD,
     RET_META_HIT,
     RET_CHAIN_BUDGET,
+    X87_RUN_FAST,
+    X87_RUN_SLOW,
 }
 
 #[allow(non_upper_case_globals)]
@@ -292,6 +294,8 @@ pub fn profiler_dispatch_stat_get(index: u32) -> f64 {
         24 => stat::READ_TLB_CACHE_FILL,
         25 => stat::PERM_MAP_READ_HIT,
         26 => stat::PERM_MAP_READ_MISS,
+        27 => stat::X87_RUN_FAST,
+        28 => stat::X87_RUN_SLOW,
         _ => return 0.0,
     };
     unsafe { stat_array[stat as usize] as f64 }

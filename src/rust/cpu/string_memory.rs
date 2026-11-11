@@ -4,8 +4,9 @@
 //! a time, so the cost of proving a span safe is paid per page rather than per byte.
 //!
 //! Semantics are the scalar handlers', not the C standard's, wherever the two differ: the
-//! case fold is ASCII-only because ours is, and the scan stops at the same 0x100001-unit
-//! cap. Declining (`None`) is always safe — the caller keeps its own loop.
+//! case fold is ASCII-only because ours is. A scan that runs past LIMIT units declines, and
+//! the scalar loop finishes the string with no length cap, as the CRT does. Declining
+//! (`None`) is always safe — the caller keeps its own loop.
 
 use std::ptr::{addr_of, copy_nonoverlapping, read_unaligned};
 
@@ -14,7 +15,7 @@ use crate::cpu::{bulk_memory::resident_span, memory};
 #[cfg(target_feature = "simd128")]
 use std::arch::wasm32::*;
 
-/// Units scanned before giving up, matching the scalar handlers' `i > 0x100000` break.
+/// Units the page-chunked scan covers before it declines to the uncapped scalar loop.
 const LIMIT: u32 = 0x100001;
 
 /// Host kill switch: restores the per-character loops without a rebuild.
@@ -170,7 +171,7 @@ unsafe fn scan<const WIDE: bool, const REVERSE: bool>(src: u32, target: u32) -> 
         }
         offset += count;
     }
-    // Past the cap: decline and let the scalar handler apply its own give-up behaviour.
+    // Past LIMIT: decline; the scalar handler scans the rest of the string.
     None
 }
 
