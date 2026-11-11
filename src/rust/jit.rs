@@ -2612,7 +2612,9 @@ pub fn entry_eip_census_evictions() -> f64 { unsafe { entry_eip_evictions as f64
 pub fn entry_eip_census_samples() -> f64 { unsafe { entry_eip_samples as f64 } }
 pub fn dispatch_stats_enabled() -> bool { unsafe { DISPATCH_STATS } }
 fn ret_chaining_enabled() -> bool { unsafe { JIT_RET_CHAINING } }
-fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING } }
+fn block_chaining_enabled() -> bool { unsafe { JIT_BLOCK_CHAINING && !JIT_HOT_EDGE_REGIONS } }
+#[no_mangle]
+pub fn get_jit_block_chaining_effective() -> u32 { block_chaining_enabled() as u32 }
 fn ret_speculation_enabled() -> bool { unsafe { JIT_RET_SPECULATION } }
 fn dead_flag_elision_enabled() -> bool { unsafe { JIT_DEAD_FLAG_ELISION } }
 
