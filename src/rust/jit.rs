@@ -1277,7 +1277,7 @@ pub fn page_offset_of_end(start: u32, end: u32) -> i32 { end.wrapping_sub(start 
 // current module, resolve the already-written runtime EIP through DISPATCH_META
 // and tail-call the destination module instead of returning to cycle_internal.
 // Gated at COMPILE time — toggle via set_jit_config(4) and clear the JIT cache.
-static mut JIT_BLOCK_CHAINING: bool = false;
+static mut JIT_BLOCK_CHAINING: bool = true;
 // RET/AbsoluteEip dynamic chaining: when the in-module AbsoluteEip
 // re-dispatch misses, attempt a cross-module tail-call at the runtime eip instead of
 // exiting to main_loop. Gated at COMPILE time — toggle via
