@@ -1205,6 +1205,160 @@ unsafe fn hc_safe_write8(addr: i32, value: i32) -> Result<(), ()> {
     crate::cpu::cpu::safe_write8(addr, value).map_err(|_| ())
 }
 
+/// Guest RAM for the CRT string leaves, reached without faulting. A page that does not
+/// translate, or translates outside RAM (the VGA hole, MMIO above RAM, the LFB), declines the
+/// hypercall instead: Windows would raise an access violation there, and the JS fallback
+/// owns that. No #PF is injected. A read of a page that does translate then goes through the
+/// ordinary translation, which cannot fault any more, so the TLB is filled and the accessed
+/// bit set as by the guest's own read; that keeps the page-chunked path warm for the next
+/// call. A write probe changes nothing: no dirty bit is set before the copy actually writes.
+unsafe fn hc_ram_phys(addr: u32, write: bool) -> Option<u32> {
+    let phys = if *crate::cpu::global_pointers::cr & crate::cpu::cpu::CR0_PG != 0 {
+        let phys = crate::cpu::cpu::translate_address_no_fault(addr as i32, write)?;
+        if !write {
+            let _ = crate::cpu::cpu::translate_address_read(addr as i32);
+        }
+        phys
+    }
+    else {
+        addr
+    };
+    if memory::in_mapped_range(phys) {
+        return None;
+    }
+    Some(phys)
+}
+
+/// Unit `i` (a byte, or a little-endian wchar) of the string at `base`, or `None` to decline.
+/// A scan never runs longer than guest RAM has units, and an address that would wrap at
+/// 2^32 declines, so every loop over this terminates.
+unsafe fn hc_ram_unit<const WIDE: bool>(base: u32, i: u32) -> Option<u32> {
+    let stride = if WIDE { 2 } else { 1 };
+    if i >= *crate::cpu::global_pointers::memory_size / stride {
+        return None;
+    }
+    let addr = base.checked_add(i.checked_mul(stride)?)?;
+    let lo = memory::read8_no_mmap_check(hc_ram_phys(addr, false)?) as u32;
+    if !WIDE {
+        return Some(lo);
+    }
+    let hi = memory::read8_no_mmap_check(hc_ram_phys(addr.checked_add(1)?, false)?) as u32;
+    Some(lo | hi << 8)
+}
+
+/// Length in units up to the terminator, or `None` to decline.
+unsafe fn hc_ram_strlen<const WIDE: bool>(base: u32) -> Option<u32> {
+    let mut i = 0u32;
+    while hc_ram_unit::<WIDE>(base, i)? != 0 {
+        i += 1;
+    }
+    Some(i)
+}
+
+/// Every page of `[start, start + bytes)` is writable RAM, checked without faulting.
+unsafe fn hc_ram_writable(start: u32, bytes: u32) -> bool {
+    if bytes == 0 {
+        return true;
+    }
+    let Some(end) = start.checked_add(bytes - 1) else { return false; };
+    let mut page = start & !0xFFF;
+    loop {
+        if hc_ram_phys(page.max(start), true).is_none() {
+            return false;
+        }
+        if page == end & !0xFFF {
+            return true;
+        }
+        page += 0x1000;
+    }
+}
+
+fn hc_spans_overlap(a: u32, a_len: u32, b: u32, b_len: u32) -> bool {
+    (a as u64) < b as u64 + b_len as u64 && (b as u64) < a as u64 + a_len as u64
+}
+
+/// Copies `units + 1` units (the terminator included) after the caller proved the source
+/// readable and the destination writable. The spans must not overlap.
+unsafe fn hc_ram_copy<const WIDE: bool>(dst: u32, src: u32, units: u32) -> bool {
+    let stride = if WIDE { 2 } else { 1 };
+    for i in 0..=units {
+        let Some(ch) = hc_ram_unit::<WIDE>(src, i) else { return false; };
+        let at = (dst + i * stride) as i32;
+        let written = if WIDE { hc_safe_write16(at, ch as i32) } else { hc_safe_write8(at, ch as i32) };
+        if written.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+/// strcpy/wcscpy past the page-chunked path: the whole string is measured first, then the
+/// destination is checked writable, so a decline leaves guest memory untouched.
+unsafe fn hc_ram_strcpy<const WIDE: bool>(dst: u32, src: u32) -> bool {
+    let stride = if WIDE { 2 } else { 1 };
+    let Some(n) = hc_ram_strlen::<WIDE>(src) else { return false; };
+    let bytes = (n + 1) * stride;
+    if hc_spans_overlap(dst, bytes, src, bytes) || !hc_ram_writable(dst, bytes) {
+        return false;
+    }
+    hc_ram_copy::<WIDE>(dst, src, n)
+}
+
+fn hc_ascii_lower(c: u32) -> u32 {
+    if c >= 0x41 && c <= 0x5A { c + 0x20 } else { c }
+}
+
+/// strcmp/_stricmp/_wcsicmp past the page-chunked path, or `None` to decline.
+unsafe fn hc_ram_compare<const WIDE: bool, const FOLD: bool>(s1: u32, s2: u32) -> Option<i32> {
+    let mut i = 0u32;
+    loop {
+        let c1 = hc_ram_unit::<WIDE>(s1, i)?;
+        let c2 = hc_ram_unit::<WIDE>(s2, i)?;
+        let (l1, l2) = if FOLD { (hc_ascii_lower(c1), hc_ascii_lower(c2)) } else { (c1, c2) };
+        if l1 != l2 {
+            return Some(l1 as i32 - l2 as i32);
+        }
+        if c1 == 0 {
+            return Some(0);
+        }
+        i += 1;
+    }
+}
+
+/// strstr/wcsstr past the page-chunked path: naive O(n*m), matching MSVCRT and the JS
+/// implementation. `None` declines.
+unsafe fn hc_ram_strstr<const WIDE: bool>(haystack: u32, needle: u32) -> Option<u32> {
+    let stride = if WIDE { 2 } else { 1 };
+    let first = hc_ram_unit::<WIDE>(needle, 0)?;
+    if first == 0 {
+        return Some(haystack);
+    }
+    let mut i = 0u32;
+    loop {
+        let hc = hc_ram_unit::<WIDE>(haystack, i)?;
+        if hc == 0 {
+            return Some(0);
+        }
+        if hc == first {
+            let mut j = 1u32;
+            let matched = loop {
+                let nc = hc_ram_unit::<WIDE>(needle, j)?;
+                if nc == 0 {
+                    break true;
+                }
+                if hc_ram_unit::<WIDE>(haystack, i.checked_add(j)?)? != nc {
+                    break false;
+                }
+                j += 1;
+            };
+            if matched {
+                return Some(haystack + i * stride);
+            }
+        }
+        i += 1;
+    }
+}
+
 /// wcslen(wchar_t* str): count of wchar_t until NUL
 unsafe fn handle_wcslen() -> bool {
     let esp = read_reg32(ESP);
@@ -1220,15 +1374,7 @@ unsafe fn handle_wcslen() -> bool {
         write_reg32(EAX, n as i32);
         return true;
     }
-    let mut len: u32 = 0;
-    loop {
-        let ch = match hc_safe_read16(str_ptr + len as i32 * 2) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        if ch == 0 { break; }
-        len += 1;
-    }
+    let Some(len) = hc_ram_strlen::<true>(str_ptr as u32) else { return false; };
     write_reg32(EAX, len as i32);
     true
 }
@@ -1252,15 +1398,8 @@ unsafe fn handle_wcscpy() -> bool {
         write_reg32(EAX, dst);
         return true;
     }
-    let mut i: u32 = 0;
-    loop {
-        let ch = match hc_safe_read16(src + i as i32 * 2) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if hc_safe_write16(dst + i as i32 * 2, ch).is_err() { return false; }
-        if ch == 0 { break; }
-        i += 1;
+    if !hc_ram_strcpy::<true>(dst as u32, src as u32) {
+        return false;
     }
     write_reg32(EAX, dst);
     true
@@ -1281,26 +1420,16 @@ unsafe fn handle_wcscat() -> bool {
         write_reg32(EAX, dst);
         return true;
     }
-    // Find end of dst
-    let mut dst_len: u32 = 0;
-    loop {
-        let ch = match hc_safe_read16(dst + dst_len as i32 * 2) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if ch == 0 { break; }
-        dst_len += 1;
+    let (Some(dst_len), Some(src_len)) = (hc_ram_strlen::<true>(dst as u32), hc_ram_strlen::<true>(src as u32)) else {
+        return false;
+    };
+    let tail = dst as u32 + dst_len * 2;
+    let bytes = (src_len + 1) * 2;
+    if hc_spans_overlap(tail, bytes, src as u32, bytes) || !hc_ram_writable(tail, bytes) {
+        return false;
     }
-    // Copy src
-    let mut i: u32 = 0;
-    loop {
-        let ch = match hc_safe_read16(src + i as i32 * 2) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if hc_safe_write16(dst + (dst_len + i) as i32 * 2, ch).is_err() { return false; }
-        if ch == 0 { break; }
-        i += 1;
+    if !hc_ram_copy::<true>(tail, src as u32, src_len) {
+        return false;
     }
     write_reg32(EAX, dst);
     true
@@ -1321,23 +1450,7 @@ unsafe fn handle_wcsicmp() -> bool {
         write_reg32(EAX, d);
         return true;
     }
-    let mut i: u32 = 0;
-    let result = loop {
-        let c1 = match hc_safe_read16(s1 + i as i32 * 2) {
-            Ok(v) => v as u32,
-            Err(_) => return false,
-        };
-        let c2 = match hc_safe_read16(s2 + i as i32 * 2) {
-            Ok(v) => v as u32,
-            Err(_) => return false,
-        };
-        // ASCII tolower
-        let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
-        let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
-        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
-        if c1 == 0 { break 0i32; }
-        i += 1;
-    };
+    let Some(result) = hc_ram_compare::<true, true>(s1 as u32, s2 as u32) else { return false; };
     write_reg32(EAX, result);
     true
 }
@@ -1363,11 +1476,8 @@ unsafe fn handle_wcschr() -> bool {
     }
     let mut i: u32 = 0;
     loop {
-        let ch = match hc_safe_read16(str_ptr + i as i32 * 2) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if ch == target {
+        let Some(ch) = hc_ram_unit::<true>(str_ptr as u32, i) else { return false; };
+        if ch == target as u32 {
             write_reg32(EAX, str_ptr + i as i32 * 2);
             return true;
         }
@@ -1394,45 +1504,8 @@ unsafe fn handle_wcsstr() -> bool {
         write_reg32(EAX, 0);
         return true;
     }
-    // Empty needle → return haystack (C standard).
-    let first = match hc_safe_read16(needle) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    if first == 0 {
-        write_reg32(EAX, haystack);
-        return true;
-    }
-    let mut i: u32 = 0;
-    loop {
-        let hc = match hc_safe_read16(haystack + i as i32 * 2) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if hc == 0 { break; }
-        if hc == first {
-            let mut j: u32 = 1;
-            let matched = loop {
-                let nc = match hc_safe_read16(needle + j as i32 * 2) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                if nc == 0 { break true; }
-                let h2 = match hc_safe_read16(haystack + (i + j) as i32 * 2) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                if h2 != nc { break false; }
-                j += 1;
-            };
-            if matched {
-                write_reg32(EAX, haystack + i as i32 * 2);
-                return true;
-            }
-        }
-        i += 1;
-    }
-    write_reg32(EAX, 0);
+    let Some(found) = hc_ram_strstr::<true>(haystack as u32, needle as u32) else { return false; };
+    write_reg32(EAX, found as i32);
     true
 }
 
@@ -1626,15 +1699,7 @@ unsafe fn handle_strlen() -> bool {
         write_reg32(EAX, n as i32);
         return true;
     }
-    let mut len: u32 = 0;
-    loop {
-        let ch = match hc_safe_read8(str_ptr + len as i32) {
-            Ok(v) => v,
-            Err(_) => break,
-        };
-        if ch == 0 { break; }
-        len += 1;
-    }
+    let Some(len) = hc_ram_strlen::<false>(str_ptr as u32) else { return false; };
     write_reg32(EAX, len as i32);
     true
 }
@@ -1654,20 +1719,7 @@ unsafe fn handle_strcmp() -> bool {
         write_reg32(EAX, d);
         return true;
     }
-    let mut i: u32 = 0;
-    let result = loop {
-        let c1 = match hc_safe_read8(s1 + i as i32) {
-            Ok(v) => v as u32,
-            Err(_) => return false,
-        };
-        let c2 = match hc_safe_read8(s2 + i as i32) {
-            Ok(v) => v as u32,
-            Err(_) => return false,
-        };
-        if c1 != c2 { break (c1 as i32) - (c2 as i32); }
-        if c1 == 0 { break 0i32; }
-        i += 1;
-    };
+    let Some(result) = hc_ram_compare::<false, false>(s1 as u32, s2 as u32) else { return false; };
     write_reg32(EAX, result);
     true
 }
@@ -1691,15 +1743,8 @@ unsafe fn handle_strcpy() -> bool {
         write_reg32(EAX, dst);
         return true;
     }
-    let mut i: u32 = 0;
-    loop {
-        let ch = match hc_safe_read8(src + i as i32) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if hc_safe_write8(dst + i as i32, ch).is_err() { return false; }
-        if ch == 0 { break; }
-        i += 1;
+    if !hc_ram_strcpy::<false>(dst as u32, src as u32) {
+        return false;
     }
     write_reg32(EAX, dst);
     true
@@ -1720,22 +1765,7 @@ unsafe fn handle_stricmp() -> bool {
         write_reg32(EAX, d);
         return true;
     }
-    let mut i: u32 = 0;
-    let result = loop {
-        let c1 = match hc_safe_read8(s1 + i as i32) {
-            Ok(v) => v as u32,
-            Err(_) => return false,
-        };
-        let c2 = match hc_safe_read8(s2 + i as i32) {
-            Ok(v) => v as u32,
-            Err(_) => return false,
-        };
-        let l1 = if c1 >= 0x41 && c1 <= 0x5A { c1 + 0x20 } else { c1 };
-        let l2 = if c2 >= 0x41 && c2 <= 0x5A { c2 + 0x20 } else { c2 };
-        if l1 != l2 { break (l1 as i32) - (l2 as i32); }
-        if c1 == 0 { break 0i32; }
-        i += 1;
-    };
+    let Some(result) = hc_ram_compare::<false, true>(s1 as u32, s2 as u32) else { return false; };
     write_reg32(EAX, result);
     true
 }
@@ -1842,45 +1872,8 @@ unsafe fn handle_strstr() -> bool {
         write_reg32(EAX, 0);
         return true;
     }
-    // Empty needle → return haystack (matches JS `sub.length === 0`).
-    let first = match hc_safe_read8(needle) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    if first == 0 {
-        write_reg32(EAX, haystack);
-        return true;
-    }
-    let mut i: u32 = 0;
-    loop {
-        let hc = match hc_safe_read8(haystack + i as i32) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        if hc == 0 { break; }
-        if hc == first {
-            let mut j: u32 = 1;
-            let matched = loop {
-                let nc = match hc_safe_read8(needle + j as i32) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                if nc == 0 { break true; }
-                let h2 = match hc_safe_read8(haystack + (i + j) as i32) {
-                    Ok(v) => v,
-                    Err(_) => return false,
-                };
-                if h2 != nc { break false; }
-                j += 1;
-            };
-            if matched {
-                write_reg32(EAX, haystack + i as i32);
-                return true;
-            }
-        }
-        i += 1;
-    }
-    write_reg32(EAX, 0);
+    let Some(found) = hc_ram_strstr::<false>(haystack as u32, needle as u32) else { return false; };
+    write_reg32(EAX, found as i32);
     true
 }
 
