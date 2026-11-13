@@ -3296,6 +3296,11 @@ pub unsafe fn cycle_internal() {
     let initial_eip = *instruction_pointer;
     // Which ADDRESS the dispatcher re-entered at (roadmap 07). No-op unless DISPATCH_STATS.
     jit::note_entry_eip(initial_eip as u32);
+    // Exit-site sampling: the dispatch entry is the fallback attribution for an interpreted
+    // block or a module exit that stores no site of its own.
+    if jit::exit_site_sampling_enabled() {
+        jit::JIT_EXIT_SITE_EIP = initial_eip as u32;
+    }
     // dbg_on_instruction stays: it's gated by DBG_ENABLED (off by default), the guest debugger's
     // interpreter hook.
     // BottleShip: when ONLY breakpoints are active (no step-trace), restrict the per-block hook to
