@@ -3631,11 +3631,16 @@ pub unsafe fn main_loop() -> f64 {
     loop {
         do_many_cycles_native();
 
-        // If cycle_limit was lowered for preemption → lean yield. Same when EIP is
-        // parked on the spin loop: without this the outer loop would re-enter
+        // If cycle_limit was lowered for preemption → lean yield. Same when the host
+        // dropped the limit to 0 during this pass (an urgent exit requested from a port
+        // handler): every further pass would retire nothing until TIME_PER_FRAME. And
+        // when EIP is parked on the spin loop: without this the outer loop would re-enter
         // do_many_cycles_native (which exits immediately at the park address) in a
         // hot loop until TIME_PER_FRAME.
-        if is_preempt_mode || hypercall::eip_at_park(*instruction_pointer as u32) {
+        if is_preempt_mode
+            || hypercall::read_cycle_limit() == 0
+            || hypercall::eip_at_park(*instruction_pointer as u32)
+        {
             let now = js::microtick();
             js::run_hardware_timers(*acpi_enabled, now);
             handle_irqs();
