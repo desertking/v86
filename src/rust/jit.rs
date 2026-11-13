@@ -14,6 +14,7 @@ use crate::cpu::global_pointers;
 use crate::cpu::hypercall;
 use crate::cpu::memory;
 use crate::cpu_context::CpuContext;
+use crate::jit_block_map;
 use crate::jit_instructions;
 use crate::opstats;
 use crate::page::Page;
@@ -502,6 +503,34 @@ pub fn get_jit_exit_site_sampling() -> u32 { unsafe { JIT_EXIT_SITE_SAMPLING as 
 #[no_mangle]
 pub fn jit_exit_site_eip() -> u32 { unsafe { JIT_EXIT_SITE_EIP } }
 pub fn exit_site_sampling_enabled() -> bool { unsafe { JIT_EXIT_SITE_SAMPLING } }
+
+// x87 80-bit memory forms in relaxed FPU mode. FLD m80 converts inline when the image is
+// exactly representable as f64 (zero, or a normal value with the integer bit set, the low
+// 11 significand bits clear and the exponent in the f64 normal range); every other image
+// takes the helper and keeps its full 80-bit value. FSTP m80 writes a relaxed register
+// inline (zero or a normal f64, which convert exactly) and leaves everything else to the
+// helper, and it no longer ends the basic block. Code-shaping; default off emits
+// byte-identical modules. Changing the mode clears the JIT cache, so no module compiled
+// under one mode is captured for AOT under another.
+// Mode 2 is a deliberately wrong build for the differential's negative control: FLD m80
+// also converts images whose low significand bits are set, truncating them.
+static mut JIT_X87_M80_INLINE: u32 = 0;
+
+#[no_mangle]
+pub fn set_jit_x87_m80_inline(mode: u32) {
+    let mode = if mode > 2 { 1 } else { mode };
+    unsafe {
+        if JIT_X87_M80_INLINE == mode {
+            return;
+        }
+        JIT_X87_M80_INLINE = mode;
+    }
+    jit_clear_cache_js();
+}
+#[no_mangle]
+pub fn get_jit_x87_m80_inline() -> u32 { unsafe { JIT_X87_M80_INLINE } }
+pub fn x87_m80_inline_enabled() -> bool { unsafe { JIT_X87_M80_INLINE != 0 } }
+pub fn x87_m80_inline_mutated() -> bool { unsafe { JIT_X87_M80_INLINE == 2 } }
 
 // Hot-edge region formation. A module stops growing at a page whose entries are already
 // compiled elsewhere (page_blacklist) or at MAX_PAGES, so a hot direct CALL/JMP between two
@@ -5235,6 +5264,7 @@ fn jit_generate_module(
     gg_plan: Option<&analysis::GgPlan>,
 ) -> (Vec<(u32, u16)>, bool) {
     builder.reset();
+    jit_block_map::begin_module();
     builder.branch_hint_mask = branch_hint_mask();
     builder.branch_hint_offset_fuzz = unsafe { JIT_BRANCH_HINT_OFFSET_FUZZ };
 
@@ -5428,6 +5458,10 @@ fn jit_generate_module(
         .collect();
 
     while let Some(block) = work.pop_front() {
+        jit_block_map::mark(ctx.builder.instruction_body_length(), match &block {
+            Work::WasmStructure(WasmStructure::BasicBlock(addr)) => basic_blocks.get(addr),
+            _ => None,
+        });
         let next_addr: Option<Vec<u32>> = work.iter().find_map(|x| match x {
             Work::WasmStructure(l) => Some(l.head().collect()),
             _ => None,
@@ -6261,6 +6295,7 @@ fn jit_generate_module(
     }
 
     dbg_assert!(label_for_addr.is_empty());
+    jit_block_map::mark(ctx.builder.instruction_body_length(), None);
 
     {
         ctx.builder.block_end(); // default case for the brtable
@@ -6332,6 +6367,7 @@ fn jit_generate_module(
         name[start..].reverse();
     }
 
+    jit_block_map::end_module(ctx.builder.instruction_body_length());
     ctx.builder.finish();
 
     let entries = Vec::from_iter(entry_blocks.iter().map(|addr| {
@@ -7172,6 +7208,10 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_EXIT_SITE_SAMPLING {
             add(0x7A11_0004);
+        }
+        if JIT_X87_M80_INLINE != 0 {
+            add(0x7A11_0005);
+            add(JIT_X87_M80_INLINE);
         }
         if JIT_HOT_EDGE_REGIONS {
             add(0x7A11_0002);
