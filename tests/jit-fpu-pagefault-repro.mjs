@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // #PF DURING custom-jitted FPU/BCD ops and an ordinary dword load: fnstenv/fldenv
-// (32-bit), fld tbyte, fbld, fbstp, plus page-crossing fnstenv. These go through the pre-validated
+// (32-bit), fld tbyte, fbld, fbstp, plus page-crossing fnstenv, fstp tbyte and fld tbyte
+// (also with jit_x87_m80_inline on, relaxed and strict). These go through the pre-validated
 // gen_{readable,writable}_or_pagefault path in the JIT (a4ec212b port): the address
 // is checked BEFORE the de-faulted helper runs, and a #PF must exit the compiled
 // block through exit_with_fault_label with all register locals spilled.
@@ -40,7 +41,7 @@ const MEM_SIZE = 16 * 1024 * 1024, TIMEOUT_MS = 30000;
 const GDT_OFF = 0xE00, GDTR_OFF = 0xE20, IDT_OFF = 0xE30, IDTR_OFF = 0xEB8;
 const PF_HANDLER_OFF = 0xF00;      // #PF handler, fixed offset
 
-const N_CASES = 8;
+const N_CASES = 10;
 
 function build_image()
 {
@@ -208,6 +209,24 @@ function build_image()
     emit(0x3D); u32(0x13579BDF);
     value_err_if_ne();
 
+    // ---- case 9: page-crossing fstp tbyte at FAULT_PAGE-4 (6 of 10 bytes unmapped) ----
+    unmap();
+    run_case(0xC0DE0090, FAULT_PAGE - 4, () => {
+        emit(0xD9, 0xE8);                              // fld1
+        emit(0xDB, 0x3A);                              // fstp tbyte [edx]
+    });
+    emit(0x0F, 0xB7, 0x05); u32(FAULT_PAGE + 4);       // movzx eax, word [sign/exponent]
+    emit(0x3D); u32(0x3FFF);
+    value_err_if_ne();
+
+    // ---- case 10: page-crossing fld tbyte at FAULT_PAGE-4 (the image case 9 stored) ----
+    unmap();
+    run_case(0xC0DE00A0, FAULT_PAGE - 4, () => emit(0xDB, 0x2A, 0xDD, 0xD8)); // fld tbyte [edx]; fstp st0
+    emit(0xDB, 0x2D); u32(FAULT_PAGE - 4);             // fld tbyte [FAULT_PAGE-4]
+    emit(0xDB, 0x1D); u32(D_INT_TMP);                  // fistp dword [tmp]
+    emit(0x81, 0x3D); u32(D_INT_TMP); u32(1);
+    value_err_if_ne();
+
     // ---- results -> registers; halt ----
     emit(0x8B, 0x35); u32(D_FAULTS);                   // mov esi, [faults]
     emit(0x8B, 0x3D); u32(D_MARKER_ERR);               // mov edi, [marker_errors]
@@ -243,7 +262,7 @@ function build_image()
     return buf;
 }
 
-function run({ jit })
+function run({ jit, relaxed = null, m80 = 0 })
 {
     return new Promise((resolve) => {
         const buf = build_image();
@@ -267,6 +286,11 @@ function run({ jit })
             if(jit && (!ex.fastmem_read_map_reset || !ex.fastmem_read_map_set)) {
                 throw new Error("read-map exports missing; rebuild v86.wasm");
             }
+            if(relaxed !== null) ex.set_relaxed_fpu(relaxed ? 1 : 0);
+            if(m80) {
+                if(!ex.set_jit_x87_m80_inline) throw new Error("set_jit_x87_m80_inline missing");
+                ex.set_jit_x87_m80_inline(m80);
+            }
             if(jit) {
                 ex.fastmem_read_map_reset();
                 ex.fastmem_read_map_set(BASE >> 12, (0x400000 - BASE) >> 12, 1);
@@ -286,4 +310,10 @@ const ri = await run({ jit: false });
 show("interp", ri);
 const rj = await run({ jit: true });
 show("JIT", rj);
-process.exit(ok(ri) && ok(rj) ? 0 : 1);
+const rr = await run({ jit: true, relaxed: true });
+show("JIT relaxed", rr);
+const rm = await run({ jit: true, relaxed: true, m80: 1 });
+show("JIT m80 on", rm);
+const rs = await run({ jit: true, relaxed: false, m80: 1 });
+show("JIT m80 strict", rs);
+process.exit(ok(ri) && ok(rj) && ok(rr) && ok(rm) && ok(rs) ? 0 : 1);

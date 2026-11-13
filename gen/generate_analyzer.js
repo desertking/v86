@@ -266,6 +266,13 @@ function gen_instruction_body_after_fixed_g(encoding, size)
             );
         }
 
+        if(encoding.mem_boundary_unless)
+        {
+            mem_postfix.push(
+                `if !${encoding.mem_boundary_unless} { analysis.ty = analysis::AnalysisType::BlockBoundary; }`
+            );
+        }
+
         if(encoding.reg_ud)
         {
             reg_postfix.push(
