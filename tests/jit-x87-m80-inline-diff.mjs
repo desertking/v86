@@ -5,10 +5,14 @@
 // unnormals, denormals, pseudo-denormals, zeros, infinities, NaNs, the 0x7FFE image and the
 // exponent edges of the f64 range) and of f64 values runs through four copy chains in a hot
 // loop under three control words:
-//   m80 -> m80, m80 -> m64, m64 -> m80, and m80 -> FLD ST(0) -> two FSTP m80.
+//   m80 -> m80, m80 -> m64, m64 -> m80, and m80 -> FLD ST(0) -> two FSTP m80;
+//   then, with the m80 value still live: FXAM and the tag word (FNSTENV); FLD m80 onto a full
+//   stack (#IS overflow) and FSTP m80 from an empty one (#IS underflow), with the status words.
 // Oracles: the strict interpreter and the relaxed interpreter. Every JIT arm must write the
 // same bytes and end with the same status, control and tag words. The switch-on arm must
-// also take the inline store (FPU_RELAXED_HIT rises against switch off).
+// also take the inline store (FPU_RELAXED_HIT at least 10x switch off), and FSTP m80 must stop
+// ending the basic block: with dispatch stats on, the blocks executed drop well below the
+// switch-off run, and with the switch off they stay where the base has them.
 // Negative control: mode 2 converts images whose low significand bits are set, which
 // truncates them, so its output must differ from the oracle.
 //
@@ -23,7 +27,9 @@ const DATA = BASE + 0x2000;
 const SRC80 = DATA, SRC64 = DATA + 0x400;
 const OUTA = DATA + 0x800, OUTB = DATA + 0xC00, OUTC = DATA + 0x1000, OUTD = DATA + 0x1400, OUTE = DATA + 0x1800;
 const CW = DATA + 0x1C00, STS = DATA + 0x1C04, ENV = DATA + 0x1C10;
-const OUT_LO = OUTA, OUT_HI = ENV + 28;
+const OUTF = DATA + 0x2000, OUTG = DATA + 0x2100, OUTH = DATA + 0x2200, OUTI = DATA + 0x2400, OUTJ = DATA + 0x2600;
+const ENVT = DATA + 0x2800;
+const OUT_LO = OUTA, OUT_HI = OUTJ + 0x100;
 const OUTER = 4000;
 const ALIAS = 24;
 const MEM_SIZE = 16 * 1024 * 1024;
@@ -122,6 +128,26 @@ function buildImage(cw)
     emit(0xD9, 0xC0);                       // fld st(0)
     emit(0xDB, 0xBE); imm32(OUTD);          // fstp tbyte [esi+OUTD]
     emit(0xDB, 0xBE); imm32(OUTE);          // fstp tbyte [esi+OUTE]
+    emit(0xDB, 0xAE); imm32(SRC80);         // fld tbyte [esi+SRC80]
+    emit(0xD9, 0xE5);                       // fxam
+    emit(0xDF, 0xE0);                       // fnstsw ax
+    emit(0x66, 0x89, 0x83); imm32(OUTF);    // mov [ebx+OUTF], ax
+    emit(0xD9, 0x35); imm32(ENVT);          // fnstenv [ENVT] (tag word with the loaded register live)
+    emit(0xA1); imm32(ENVT + 8);            // mov eax, [ENVT+8]
+    emit(0x89, 0x83); imm32(OUTG);          // mov [ebx+OUTG], eax
+    emit(0xD9, 0x2D); imm32(CW);            // fldcw [CW] (fnstenv masked everything)
+    emit(0xDD, 0xD8);                       // fstp st(0)
+    for(let k = 0; k < 8; k++) emit(0xD9, 0xE8); // fld1 x8: the stack is full
+    emit(0xDB, 0xAE); imm32(SRC80);         // fld tbyte [esi+SRC80]: #IS overflow
+    emit(0xDF, 0xE0);                       // fnstsw ax
+    emit(0x66, 0x89, 0x83); imm32(OUTH);    // mov [ebx+OUTH], ax
+    emit(0xDB, 0xE3);                       // fninit
+    emit(0xD9, 0x2D); imm32(CW);            // fldcw [CW]
+    emit(0xDB, 0xBE); imm32(OUTI);          // fstp tbyte [esi+OUTI]: #IS underflow, empty stack
+    emit(0xDF, 0xE0);                       // fnstsw ax
+    emit(0x66, 0x89, 0x83); imm32(OUTJ);    // mov [ebx+OUTJ], ax
+    emit(0xDB, 0xE3);                       // fninit
+    emit(0xD9, 0x2D); imm32(CW);            // fldcw [CW]
     emit(0x83, 0xC6, 0x10);                 // add esi, 16
     emit(0x83, 0xC3, 0x08);                 // add ebx, 8
     emit(0x81, 0xFE); imm32(32 * 16);       // cmp esi, 512
@@ -136,7 +162,7 @@ function buildImage(cw)
     return buf;
 }
 
-function run(cw, { jit, relaxed, mode = 0, x87Locals = false })
+function run(cw, { jit, relaxed, mode = 0, x87Locals = false, stats = false })
 {
     return new Promise(resolve => {
         const emulator = new V86({ autostart: false, memory_size: MEM_SIZE, wasm_path: WASM_PATH,
@@ -154,6 +180,7 @@ function run(cw, { jit, relaxed, mode = 0, x87Locals = false })
                 sw: cpu.mem8[STS] | cpu.mem8[STS + 1] << 8,
                 cwOut: env.getUint16(0, true), swEnv: env.getUint16(4, true), tag: env.getUint16(8, true),
                 hit: typeof ex.profiler_fpu_relaxed_hit_get === "function" ? Number(ex.profiler_fpu_relaxed_hit_get()) : -1,
+                blocks: typeof ex.profiler_dispatch_stat_get === "function" ? Number(ex.profiler_dispatch_stat_get(0)) : -1,
                 hasSwitch: typeof ex.set_jit_x87_m80_inline === "function",
             });
         };
@@ -166,6 +193,7 @@ function run(cw, { jit, relaxed, mode = 0, x87Locals = false })
                 ex.set_fpu_relaxed_stats?.(1);
                 ex.set_jit_x87_m80_inline?.(mode);
                 ex.set_jit_config?.(10, x87Locals ? 1 : 0);
+                ex.set_dispatch_stats?.(stats ? 1 : 0);
             };
             apply();
             ex.profiler_init?.();
@@ -197,6 +225,8 @@ for(const cw of [0x037F, 0x027F, 0x007F])
     const onLocals = await run(cw, { jit: true, relaxed: true, mode: 1, x87Locals: true });
     const onStrict = await run(cw, { jit: true, relaxed: false, mode: 1 });
     const mutated = await run(cw, { jit: true, relaxed: true, mode: 2 });
+    const offBlocks = await run(cw, { jit: true, relaxed: true, mode: 0, stats: true });
+    const onBlocks = await run(cw, { jit: true, relaxed: true, mode: 1, stats: true });
 
     say(on.hasSwitch, `${tag} the engine has set_jit_x87_m80_inline`);
     const diffs = [];
@@ -208,7 +238,9 @@ for(const cw of [0x037F, 0x027F, 0x007F])
     say(same(relaxedInterp, on), `${tag} JIT switch on = interpreter ${firstDiff(relaxedInterp, on)}`);
     say(same(relaxedInterp, onLocals), `${tag} JIT switch on + x87 locals = interpreter ${firstDiff(relaxedInterp, onLocals)}`);
     say(same(strictInterp, onStrict), `${tag} JIT switch on, strict FPU = strict interpreter ${firstDiff(strictInterp, onStrict)}`);
-    say(on.hit > off.hit, `${tag} inline store taken: relaxed hits ${off.hit} -> ${on.hit}`);
+    say(on.hit > 10 * off.hit, `${tag} inline store taken: relaxed hits ${off.hit} -> ${on.hit}`);
+    say(offBlocks.blocks > 0 && onBlocks.blocks > 0 && onBlocks.blocks * 2 < offBlocks.blocks && same(relaxedInterp, onBlocks),
+        `${tag} FSTP m80 no longer ends the block: blocks executed ${offBlocks.blocks} (off) -> ${onBlocks.blocks} (on)`);
     say(!same(relaxedInterp, mutated), `${tag} negative control (low-bit test dropped) diverges at ${firstDiff(relaxedInterp, mutated)}`);
 }
 console.log(ok ? "PASS jit-x87-m80-inline-diff" : "FAIL jit-x87-m80-inline-diff");

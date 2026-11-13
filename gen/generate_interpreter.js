@@ -236,7 +236,7 @@ function gen_instruction_body_after_fixed_g(encoding, size)
         (!encoding.custom && encoding.e) ?
         ["after_block_boundary();"] :
         encoding.mem_boundary_unless ?
-        [`if !${encoding.mem_boundary_unless} { after_block_boundary(); }`] : [];
+        [`if !${encoding.mem_boundary_unless} || modrm_byte >= 0xC0 { after_block_boundary(); }`] : [];
 
     if(encoding.task_switch_test || encoding.sse)
     {

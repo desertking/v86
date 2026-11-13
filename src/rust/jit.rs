@@ -509,13 +509,23 @@ pub fn exit_site_sampling_enabled() -> bool { unsafe { JIT_EXIT_SITE_SAMPLING } 
 // takes the helper and keeps its full 80-bit value. FSTP m80 writes a relaxed register
 // inline (zero or a normal f64, which convert exactly) and leaves everything else to the
 // helper, and it no longer ends the basic block. Code-shaping; default off emits
-// byte-identical modules. Needs a JIT cache clear to take effect on compiled pages.
+// byte-identical modules. Changing the mode clears the JIT cache, so no module compiled
+// under one mode is captured for AOT under another.
 // Mode 2 is a deliberately wrong build for the differential's negative control: FLD m80
 // also converts images whose low significand bits are set, truncating them.
 static mut JIT_X87_M80_INLINE: u32 = 0;
 
 #[no_mangle]
-pub fn set_jit_x87_m80_inline(mode: u32) { unsafe { JIT_X87_M80_INLINE = if mode > 2 { 1 } else { mode } } }
+pub fn set_jit_x87_m80_inline(mode: u32) {
+    let mode = if mode > 2 { 1 } else { mode };
+    unsafe {
+        if JIT_X87_M80_INLINE == mode {
+            return;
+        }
+        JIT_X87_M80_INLINE = mode;
+    }
+    jit_clear_cache_js();
+}
 #[no_mangle]
 pub fn get_jit_x87_m80_inline() -> u32 { unsafe { JIT_X87_M80_INLINE } }
 pub fn x87_m80_inline_enabled() -> bool { unsafe { JIT_X87_M80_INLINE != 0 } }

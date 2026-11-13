@@ -4152,9 +4152,13 @@ pub fn instr_DB_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
     ctx.builder.free_local(address_local);
 }
 pub fn instr_DB_7_reg_jit(ctx: &mut JitContext, r: u32) {
-    codegen::gen_move_registers_from_locals_to_memory(ctx);
-    codegen::gen_fn1_const(ctx.builder, "instr_DB_7_reg", r);
-    codegen::gen_move_registers_from_memory_to_locals(ctx);
+    if !crate::jit::x87_m80_inline_enabled() {
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+        codegen::gen_fn1_const(ctx.builder, "instr_DB_7_reg", r);
+        codegen::gen_move_registers_from_memory_to_locals(ctx);
+        return;
+    }
+    codegen::gen_trigger_ud(ctx);
 }
 
 pub fn instr_DB_6_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte) {
