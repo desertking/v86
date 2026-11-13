@@ -483,6 +483,26 @@ pub fn set_jit_page_tails(on: u32) { unsafe { JIT_PAGE_TAILS = on != 0 } }
 pub fn get_jit_page_tails() -> u32 { unsafe { JIT_PAGE_TAILS as u32 } }
 fn page_tails_enabled() -> bool { unsafe { JIT_PAGE_TAILS } }
 
+// Exit-site sampling for the harness EIP profiler. A JS sampler can only read CPU state between
+// slices, and a slice ends at the first budget check after its instruction budget runs out:
+// a module exit or chain attempt, which has already written the TARGET's address into
+// instruction_pointer. Sampled EIPs therefore name the block entered next, not the activation
+// that spent the budget. With this on, every real module exit stores its own exit instruction
+// (a physical address, equal to the virtual one under an identity map) into
+// JIT_EXIT_SITE_EIP, and cycle_internal stores the dispatch entry first, so the slot always
+// names the last activation that ran. Code-shaping and folded into the fingerprint only when
+// on; needs a JIT cache clear to reach already-compiled modules.
+static mut JIT_EXIT_SITE_SAMPLING: bool = false;
+pub static mut JIT_EXIT_SITE_EIP: u32 = 0;
+
+#[no_mangle]
+pub fn set_jit_exit_site_sampling(on: u32) { unsafe { JIT_EXIT_SITE_SAMPLING = on != 0 } }
+#[no_mangle]
+pub fn get_jit_exit_site_sampling() -> u32 { unsafe { JIT_EXIT_SITE_SAMPLING as u32 } }
+#[no_mangle]
+pub fn jit_exit_site_eip() -> u32 { unsafe { JIT_EXIT_SITE_EIP } }
+pub fn exit_site_sampling_enabled() -> bool { unsafe { JIT_EXIT_SITE_SAMPLING } }
+
 // Hot-edge region formation. A module stops growing at a page whose entries are already
 // compiled elsewhere (page_blacklist) or at MAX_PAGES, so a hot direct CALL/JMP between two
 // such pages leaves the module on every execution: spill, return to cycle_internal, dispatch,
@@ -4911,6 +4931,7 @@ fn gen_chain_or_exit_to_known_successor(
             ctx.builder.store_aligned_i32(0);
         }
         codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+        codegen::gen_sample_exit_site(ctx.builder, last_instruction_addr);
         ctx.builder.br(ctx.exit_label);
         return;
     }
@@ -5281,7 +5302,7 @@ fn jit_generate_module(
         builder.get_local(&instruction_counter);
         builder.const_i32(cpu::LOOP_COUNTER);
         builder.geu_i32();
-        if cfg!(feature = "profiler") {
+        if cfg!(feature = "profiler") || exit_site_sampling_enabled() {
             builder.if_void();
             codegen::gen_debug_track_jit_exit(builder, 0);
             builder.br(exit_label);
@@ -6141,7 +6162,7 @@ fn jit_generate_module(
                         ctx.builder.get_local(&ctx.instruction_counter);
                         ctx.builder.const_i32(cpu::LOOP_COUNTER);
                         ctx.builder.geu_i32();
-                        if cfg!(feature = "profiler") {
+                        if cfg!(feature = "profiler") || exit_site_sampling_enabled() {
                             ctx.builder.if_void();
                             codegen::gen_debug_track_jit_exit(ctx.builder, addr);
                             ctx.builder.br(exit_label);
@@ -6251,6 +6272,7 @@ fn jit_generate_module(
         // module exit: the interpreter re-resolves the eip through the normal
         // cache path (worst case: recompile). `unreachable` turned this race
         // into a fatal wasm trap. Debug builds still flag it via check_dispatcher_target.
+        codegen::gen_sample_exit_site(ctx.builder, 0);
         ctx.builder.br(ctx.exit_label);
     }
     {
@@ -7147,6 +7169,9 @@ fn jit_codegen_fingerprint() -> u64 {
     unsafe {
         if JIT_PAGE_TAILS {
             add(0x7A11_0001);
+        }
+        if JIT_EXIT_SITE_SAMPLING {
+            add(0x7A11_0004);
         }
         if JIT_HOT_EDGE_REGIONS {
             add(0x7A11_0002);
