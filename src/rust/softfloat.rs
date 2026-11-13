@@ -578,12 +578,11 @@ impl F80 {
 }
 
 fn round_ties_even(f: f64) -> f64 {
-    let rounded = f.round();
     if (f - f.trunc()).abs() == 0.5 {
         2.0 * (f / 2.0).round()
     }
     else {
-        rounded
+        f.round()
     }
 }
 

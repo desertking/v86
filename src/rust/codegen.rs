@@ -6247,6 +6247,24 @@ pub fn gen_debug_track_jit_exit(builder: &mut WasmBuilder, address: u32) {
     if cfg!(feature = "profiler") {
         gen_fn1_const(builder, "track_jit_exit", address);
     }
+    gen_sample_exit_site(builder, address);
+}
+
+/// Every real module exit passes here (directly or via gen_debug_track_jit_exit). Emits
+/// nothing unless exit-site sampling is on; `address` 0 means the exit has no static
+/// instruction, so the runtime EIP (an address inside this module) stands in.
+pub fn gen_sample_exit_site(builder: &mut WasmBuilder, address: u32) {
+    if !jit::exit_site_sampling_enabled() {
+        return;
+    }
+    builder.const_i32(std::ptr::addr_of!(jit::JIT_EXIT_SITE_EIP) as u32 as i32);
+    if address == 0 {
+        builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
+    }
+    else {
+        builder.const_i32(address as i32);
+    }
+    builder.store_aligned_i32(0);
 }
 
 #[derive(Clone, Copy, PartialEq)]

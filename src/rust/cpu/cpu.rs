@@ -3296,6 +3296,11 @@ pub unsafe fn cycle_internal() {
     let initial_eip = *instruction_pointer;
     // Which ADDRESS the dispatcher re-entered at (roadmap 07). No-op unless DISPATCH_STATS.
     jit::note_entry_eip(initial_eip as u32);
+    // Exit-site sampling: the dispatch entry is the fallback attribution for an interpreted
+    // block or a module exit that stores no site of its own.
+    if jit::exit_site_sampling_enabled() {
+        jit::JIT_EXIT_SITE_EIP = initial_eip as u32;
+    }
     // dbg_on_instruction stays: it's gated by DBG_ENABLED (off by default), the guest debugger's
     // interpreter hook.
     // BottleShip: when ONLY breakpoints are active (no step-trace), restrict the per-block hook to
@@ -3552,15 +3557,6 @@ unsafe fn jit_run_interpreted(mut phys_addr: u32) {
         dbg_assert!(*prefixes == 0);
 
         if jit_block_boundary
-            && opcode == 0x9B
-            && *instruction_pointer == start_eip + 1
-            && jit::fwait_inline_enabled()
-            && jit::get_jit_x87_runs() != 0
-        {
-            jit_block_boundary = false;
-        }
-
-        if jit_block_boundary
             || Page::page_of(start_eip as u32) != Page::page_of(*instruction_pointer as u32)
                 // Limit the number of iterations, as jumps within the same page are not counted as
                 // block boundaries for the interpreter, but only on the next backwards jump
@@ -3640,13 +3636,15 @@ pub unsafe fn main_loop() -> f64 {
     loop {
         do_many_cycles_native();
 
-        // If cycle_limit was lowered for preemption → lean yield. Same when EIP is
-        // parked on the spin loop: without this the outer loop would re-enter
+        // If cycle_limit was lowered for preemption → lean yield. Same when the host
+        // dropped the limit to 0 during this pass (an urgent exit requested from a port
+        // handler): every further pass would retire nothing until TIME_PER_FRAME. And
+        // when EIP is parked on the spin loop: without this the outer loop would re-enter
         // do_many_cycles_native (which exits immediately at the park address) in a
         // hot loop until TIME_PER_FRAME.
         if is_preempt_mode
-            || hypercall::eip_at_park(*instruction_pointer as u32)
             || hypercall::read_cycle_limit() == 0
+            || hypercall::eip_at_park(*instruction_pointer as u32)
         {
             let now = js::microtick();
             js::run_hardware_timers(*acpi_enabled, now);
@@ -3753,15 +3751,11 @@ pub unsafe fn do_many_cycles_native() {
     // so thunk-stub tails (OUT + RET N into the spin loop) execute normally first —
     // exiting mid-stub instead breaks the async-park ESP bookkeeping (observed as
     // "async RET N mismatch" → stack-EIP fault → guest SEH ExitProcess(0)).
-    let urgent_exit = crate::jit::budget0_exit_enabled();
     while (*instruction_counter).wrapping_sub(initial_instruction_counter) < limit
         && !*in_hlt
         && !hypercall::eip_at_park(*instruction_pointer as u32)
     {
         cycle_internal();
-        if urgent_exit && hypercall::read_cycle_limit() == 0 {
-            break;
-        }
     }
 }
 
@@ -4246,16 +4240,6 @@ pub unsafe fn safe_write_slow_jit(
 ) -> i32 {
     let eip_offset_in_page = smc_unpack_eip(packed_eip);
     let crosses_page = (addr & 0xFFF) + bitsize / 8 > 0x1000;
-    if memory::SMC_SILENT && !crosses_page {
-        let entry = tlb_data[(addr as u32 >> 12) as usize];
-        let user = if *cpl == 3 { TLB_NO_USER } else { 0 };
-        if entry & (TLB_VALID | user | TLB_READONLY | TLB_IN_MAPPED_RANGE) == TLB_VALID {
-            let phys = (entry & !0xFFF ^ addr) as u32 - memory::mem8 as u32;
-            if memory::is_silent(phys, (bitsize / 8) as u32, value_low, value_high) {
-                return ((phys as i32 + memory::mem8 as i32) ^ addr) & !0xFFF;
-            }
-        }
-    }
     // Both halves are translated (and dirtied / SMC-checked) before any byte is stored.
     let addr_low = match translate_address_write_jit(addr, packed_eip) {
         Err(()) => {
@@ -4359,7 +4343,7 @@ pub unsafe fn safe_write8(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            if !memory::is_silent(phys_addr, 1, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+            jit::jit_dirty_page(Page::page_of(phys_addr));
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4381,7 +4365,7 @@ pub unsafe fn safe_write16(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            if !memory::is_silent(phys_addr, 2, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+            jit::jit_dirty_page(Page::page_of(phys_addr));
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4406,7 +4390,7 @@ pub unsafe fn safe_write32(addr: i32, value: i32) -> OrPageFault<()> {
     }
     else {
         if !can_skip_dirty_page {
-            if !memory::is_silent(phys_addr, 4, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+            jit::jit_dirty_page(Page::page_of(phys_addr));
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4429,7 +4413,7 @@ pub unsafe fn safe_write64(addr: i32, value: u64) -> OrPageFault<()> {
         }
         else {
             if !can_skip_dirty_page {
-                if !memory::is_silent(phys_addr, 8, value, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+                jit::jit_dirty_page(Page::page_of(phys_addr));
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4453,7 +4437,7 @@ pub unsafe fn safe_write128(addr: i32, value: reg128) -> OrPageFault<()> {
         }
         else {
             if !can_skip_dirty_page {
-                if !memory::is_silent(phys_addr, 16, value.u64[0], value.u64[1]) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+                jit::jit_dirty_page(Page::page_of(phys_addr));
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4476,7 +4460,7 @@ pub unsafe fn safe_read_write8(addr: i32, instruction: &dyn Fn(i32) -> i32) {
     }
     else {
         if !can_skip_dirty_page {
-            if !memory::is_silent(phys_addr, 1, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+            jit::jit_dirty_page(Page::page_of(phys_addr));
         }
         else {
             dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4503,7 +4487,7 @@ pub unsafe fn safe_read_write16(addr: i32, instruction: &dyn Fn(i32) -> i32) {
         }
         else {
             if !can_skip_dirty_page {
-                if !memory::is_silent(phys_addr, 2, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+                jit::jit_dirty_page(Page::page_of(phys_addr));
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
@@ -4531,7 +4515,7 @@ pub unsafe fn safe_read_write32(addr: i32, instruction: &dyn Fn(i32) -> i32) {
         }
         else {
             if !can_skip_dirty_page {
-                if !memory::is_silent(phys_addr, 4, value as u32 as u64, 0) { jit::jit_dirty_page(Page::page_of(phys_addr)); }
+                jit::jit_dirty_page(Page::page_of(phys_addr));
             }
             else {
                 dbg_assert!(!jit::jit_page_has_code(Page::page_of(phys_addr as u32)));
