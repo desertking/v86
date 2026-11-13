@@ -124,6 +124,22 @@ const SCENARIOS = {
             f.op(0xC3);                         // ret, first byte of the next page
         },
     },
+    // FSTP m80 written inline (jit_x87_m80_inline, relaxed FPU): byte 5 of the stored image is
+    // the `add eax, imm32` opcode and bytes 6-9 its imm32, so the store rewrites the site.
+    fstp80: {
+        m80: true,
+        w: f => {
+            f.op(0xC7, 0x05, ...d32(DATA + 0x40), ...d32(0));        // mov dword [S], 0
+            f.op(0x89, 0xCA, 0x81, 0xE2, ...d32(0x7FFF));            // mov edx, ecx; and edx, 0x7FFF
+            f.op(0x81, 0xCA, ...d32(0x8000), 0xC1, 0xE2, 0x10);      // or edx, 0x8000; shl edx, 16
+            f.op(0x81, 0xCA, ...d32(0x0500));                        // or edx, 0x0500
+            f.op(0x89, 0x15, ...d32(DATA + 0x44));                   // mov [S+4], edx
+            f.op(0x66, 0xC7, 0x05, ...d32(DATA + 0x48), 0xFF, 0x3F); // mov word [S+8], 0x3FFF
+            f.op(0xDB, 0x2D, ...d32(DATA + 0x40));                   // fld tbyte [S]
+            f.op(0xDB, 0x3D); f.abs("site", -5);                     // fstp tbyte [site-5]
+        },
+        t: f => { f.op(0xEB, 0x05); f.pad(5); f.site(); f.op(0xC3); },
+    },
 };
 const NATURAL = new Set(["rep"]);        // closed without the bail: the module exits right after
 
@@ -188,7 +204,7 @@ function buildImage(name) {
     // MASK: maskmovq writes bytes whose mask byte has bit 7 -- the low four (the imm32).
     dv.setUint32(MASK - BASE, 0x80808080, true); dv.setUint32(MASK - BASE + 4, 0, true);
     dv.setUint32(HI - BASE, 0x90909090, true); dv.setUint32(HI - BASE + 4, 0, true);
-    return { img };
+    return { img, m80: !!sc.m80 };
 }
 
 let currentFinish = null;
@@ -217,6 +233,11 @@ function run(build, cfg) {
         emulator.add_listener("emulator-loaded", () => {
             cpu = emulator.v86.cpu; w = cpu.wm.exports;
             cpu.reboot_internal(); cpu.reset_memory();
+            if (build.m80) {
+                if (!w.set_jit_x87_m80_inline) { resolve({ status: "NO-M80" }); return; }
+                w.set_relaxed_fpu(1);
+                w.set_jit_x87_m80_inline(1);
+            }
             if (cfg.jit) {
                 if (!w.jit_set_smc_bail) { resolve({ status: "NO-SWITCH" }); return; }
                 const knobs = new Map([[5, 1], [11, 1], [12, 1], [13, 1], [22, 1]]);
@@ -253,6 +274,7 @@ for (const name of only.length ? only : Object.keys(SCENARIOS)) {
     const interp = await run(build, { jit: false });
     const on = await run(build, { jit: true, bail: 1, gg });
     if (on.status === "NO-SWITCH") { fail(`${name}: engine has no jit_set_smc_bail`); continue; }
+    if (interp.status === "NO-M80") { fail(`${name}: engine has no set_jit_x87_m80_inline`); continue; }
     const off = await run(build, { jit: true, bail: 0, gg });
     const nocount = await run(build, { jit: true, bail: 2, gg });
     if (interp.status !== "done") { fail(`${name}: interpreter did not finish (${interp.status})`); continue; }
