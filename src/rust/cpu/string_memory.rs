@@ -4,8 +4,10 @@
 //! a time, so the cost of proving a span safe is paid per page rather than per byte.
 //!
 //! Semantics are the scalar handlers', not the C standard's, wherever the two differ: the
-//! case fold is ASCII-only because ours is, and the scan stops at the same 0x100001-unit
-//! cap. Declining (`None`) is always safe — the caller keeps its own loop.
+//! case fold is ASCII-only because ours is. There is no length cap: every chunk is proven
+//! resident RAM by `resident_span` (identity-mapped, below `memory_size`, no MMIO), so a scan
+//! ends at the terminator or declines at the first page it cannot prove. Declining (`None`)
+//! is always safe — the caller keeps its own loop.
 
 use std::ptr::{addr_of, copy_nonoverlapping, read_unaligned};
 
@@ -13,9 +15,6 @@ use crate::cpu::{bulk_memory::resident_span, memory};
 
 #[cfg(target_feature = "simd128")]
 use std::arch::wasm32::*;
-
-/// Units scanned before giving up, matching the scalar handlers' `i > 0x100000` break.
-const LIMIT: u32 = 0x100001;
 
 /// Host kill switch: restores the per-character loops without a rebuild.
 static mut ENABLED: bool = true;
@@ -107,9 +106,9 @@ unsafe fn scan<const WIDE: bool, const REVERSE: bool>(src: u32, target: u32) -> 
     let stride = step::<WIDE>();
     let mut offset = 0u32;
     let mut last = 0;
-    while offset < LIMIT {
+    loop {
         let start = src.checked_add(offset.checked_mul(stride)?)?;
-        let count = page_units::<WIDE>(start).min(LIMIT - offset);
+        let count = page_units::<WIDE>(start);
         let p = checked_ptr(start, count * stride, false)?;
         let mut i = 0u32;
         // An empty string or a hit on the first unit is common enough to be worth settling
@@ -170,8 +169,6 @@ unsafe fn scan<const WIDE: bool, const REVERSE: bool>(src: u32, target: u32) -> 
         }
         offset += count;
     }
-    // Past the cap: decline and let the scalar handler apply its own give-up behaviour.
-    None
 }
 
 pub unsafe fn try_length<const WIDE: bool>(src: u32) -> Option<u32> {
@@ -194,11 +191,11 @@ unsafe fn compare<const WIDE: bool, const FOLD: bool>(a: u32, b: u32) -> Option<
     }
     let stride = step::<WIDE>();
     let mut offset = 0u32;
-    while offset < LIMIT {
+    loop {
         let left = a.checked_add(offset.checked_mul(stride)?)?;
         let right = b.checked_add(offset.checked_mul(stride)?)?;
         // Two operands, two page edges: the chunk is the shorter remainder.
-        let count = page_units::<WIDE>(left).min(page_units::<WIDE>(right)).min(LIMIT - offset);
+        let count = page_units::<WIDE>(left).min(page_units::<WIDE>(right));
         let p = checked_ptr(left, count * stride, false)?;
         let q = checked_ptr(right, count * stride, false)?;
         let mut i = 0u32;
@@ -255,7 +252,6 @@ unsafe fn compare<const WIDE: bool, const FOLD: bool>(a: u32, b: u32) -> Option<
         }
         offset += count;
     }
-    None
 }
 
 pub unsafe fn try_compare<const WIDE: bool, const FOLD: bool>(a: u32, b: u32) -> Option<i32> {
