@@ -473,6 +473,62 @@ const both = res.both;
 if(both.fallbacks === 0) fail("no decline was exercised");
 if(both.misses === 0) fail("the unregistered stub inside the span was not counted as a probe miss");
 
+// Counter contract, through the helper exports directly: a registered target that declines
+// counts as a fallback, an unregistered target inside the span as a probe miss, with and
+// without an armed debugger breakpoint (which declines registered targets only).
+function counters()
+{
+    return new Promise((resolve, reject) => {
+        const emulator = new V86({ autostart: false, memory_size: MEM_SIZE, disable_jit: 0, log_level: 0,
+                                   wasm_path: process.env.V86_WASM_PATH || undefined });
+        emulator.add_listener("emulator-loaded", () => {
+            try {
+                const cpu = emulator.v86.cpu;
+                const ex = cpu.wm.exports;
+                cpu.reboot_internal();
+                cpu.reset_memory();
+                const dv = new DataView(cpu.mem8.buffer, cpu.mem8.byteOffset, cpu.mem8.byteLength);
+                const REG = 0x101000, UNREG = 0x101010, FULL = 0x101020, ESP = 0x190000 - 16;
+                ex.jit_wbuf_intrinsic_clear_registry();
+                ex.jit_wbuf_intrinsic_set_enabled(1);
+                if(!ex.jit_wbuf_intrinsic_register(REG, 0x11, 0, 1, 1, CTRL_MAIN, DATA_MAIN, CAP_MAIN)) fail("register");
+                if(!ex.jit_wbuf_intrinsic_register(FULL, 0x12, 0, 1, 1, CTRL_FULL, DATA_FULL, CAP_FULL)) fail("register");
+                dv.setUint32(CTRL_FULL, CAP_FULL, true);
+                dv.setUint32(ESP, 0x1234, true);
+                dv.setUint32(ESP + 4, 0x5678, true);
+                const read = () => [ex.jit_wbuf_intrinsic_get_hits() >>> 0, ex.jit_wbuf_intrinsic_get_fallbacks() >>> 0,
+                                    ex.jit_wbuf_intrinsic_get_probe_misses() >>> 0];
+                const step = (fn, target, expectRet, expectDelta, label) => {
+                    const before = read();
+                    const head = dv.getUint32(CTRL_MAIN, true);
+                    const ret = fn === "tail" ? ex.jit_wbuf_intrinsic_execute_tail(target, ESP) | 0
+                                              : ex.jit_wbuf_intrinsic_execute(target, ESP + 4) | 0;
+                    const after = read();
+                    const delta = after.map((v, i) => v - before[i]);
+                    if(ret !== expectRet || delta.join() !== expectDelta.join())
+                        fail(`counter contract, ${label} (${fn}): returned ${ret}, hits/fallbacks/misses delta ${delta}`);
+                    if(expectRet < 0 && dv.getUint32(CTRL_MAIN, true) !== head) fail(`counter contract, ${label}: declined call moved the ring`);
+                };
+                for(const fn of ["call", "tail"]) {
+                    ex.dbg_clear(); ex.dbg_enable(0);
+                    step(fn, REG, 4, [1, 0, 0], "registered, no debugger");
+                    step(fn, UNREG, -2, [0, 0, 1], "unregistered, no debugger");
+                    step(fn, FULL, -1, [0, 1, 0], "registered, ring full");
+                    ex.dbg_enable(1); ex.dbg_add_bp(0x7000);
+                    step(fn, REG, -1, [0, 1, 0], "registered, breakpoint armed");
+                    step(fn, UNREG, -2, [0, 0, 1], "unregistered, breakpoint armed");
+                    ex.dbg_clear(); ex.dbg_enable(0);
+                }
+                resolve();
+            }
+            catch(error) { reject(error); }
+            finally { try { emulator.destroy?.(); } catch {} }
+        });
+    });
+}
+await counters();
+console.log("  counter contract: fallbacks = registered and declined, probe misses = unregistered, with and without a breakpoint");
+
 const neg = [
     ["wrong funcId", { wrong_id: true }],
     ["no cleanup", { no_cleanup: true }],

@@ -397,9 +397,6 @@ unsafe fn wbuf_intrinsic_count(cleanup: i32) -> i32 {
 /// Every guest range this may touch is validated — bounds AND paging — before the first byte
 /// moves, so a decline is indistinguishable from the CALL never having been intercepted.
 unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 {
-    if cpu::DBG_ENABLED && cpu::DBG_BP_COUNT != 0 {
-        return -1;
-    }
     let mut desc = WBUF_INTRINSIC_EMPTY;
     for hot in WBUF_INTRINSIC_HOT {
         if hot.target == target {
@@ -426,6 +423,9 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 
     }
     if desc.target == 0 {
         return WBUF_NOT_REGISTERED;
+    }
+    if cpu::DBG_ENABLED && cpu::DBG_BP_COUNT != 0 {
+        return -1;
     }
     // The control word is read AND written back, so it must be writable, not merely present.
     if !wbuf_range_accessible(desc.ctrl_addr, 4, true) {
