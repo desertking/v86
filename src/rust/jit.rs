@@ -14,6 +14,7 @@ use crate::cpu::global_pointers;
 use crate::cpu::hypercall;
 use crate::cpu::memory;
 use crate::cpu_context::CpuContext;
+use crate::jit_block_map;
 use crate::jit_instructions;
 use crate::opstats;
 use crate::page::Page;
@@ -5235,6 +5236,7 @@ fn jit_generate_module(
     gg_plan: Option<&analysis::GgPlan>,
 ) -> (Vec<(u32, u16)>, bool) {
     builder.reset();
+    jit_block_map::begin_module();
     builder.branch_hint_mask = branch_hint_mask();
     builder.branch_hint_offset_fuzz = unsafe { JIT_BRANCH_HINT_OFFSET_FUZZ };
 
@@ -5428,6 +5430,10 @@ fn jit_generate_module(
         .collect();
 
     while let Some(block) = work.pop_front() {
+        jit_block_map::mark(ctx.builder.instruction_body_length(), match &block {
+            Work::WasmStructure(WasmStructure::BasicBlock(addr)) => basic_blocks.get(addr),
+            _ => None,
+        });
         let next_addr: Option<Vec<u32>> = work.iter().find_map(|x| match x {
             Work::WasmStructure(l) => Some(l.head().collect()),
             _ => None,
@@ -6261,6 +6267,7 @@ fn jit_generate_module(
     }
 
     dbg_assert!(label_for_addr.is_empty());
+    jit_block_map::mark(ctx.builder.instruction_body_length(), None);
 
     {
         ctx.builder.block_end(); // default case for the brtable
@@ -6332,6 +6339,7 @@ fn jit_generate_module(
         name[start..].reverse();
     }
 
+    jit_block_map::end_module(ctx.builder.instruction_body_length());
     ctx.builder.finish();
 
     let entries = Vec::from_iter(entry_blocks.iter().map(|addr| {

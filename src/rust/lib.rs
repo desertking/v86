@@ -17,6 +17,7 @@ mod control_flow;
 mod cpu_context;
 mod gen;
 mod jit;
+mod jit_block_map;
 mod jit_instructions;
 mod leb;
 mod modrm;
