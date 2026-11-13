@@ -1303,6 +1303,7 @@ impl WasmBuilder {
     pub fn and_i32(&mut self) { self.instruction_body.push(op::OP_I32AND); }
     pub fn or_i32(&mut self) { self.instruction_body.push(op::OP_I32OR); }
     pub fn or_i64(&mut self) { self.instruction_body.push(op::OP_I64OR); }
+    pub fn and_i64(&mut self) { self.instruction_body.push(op::OP_I64AND); }
     pub fn xor_i32(&mut self) { self.instruction_body.push(op::OP_I32XOR); }
     pub fn mul_i32(&mut self) { self.instruction_body.push(op::OP_I32MUL); }
     pub fn mul_i64(&mut self) { self.instruction_body.push(op::OP_I64MUL); }

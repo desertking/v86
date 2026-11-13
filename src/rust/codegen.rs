@@ -5320,6 +5320,94 @@ pub fn gen_fpu_relaxed_store_m32(ctx: &mut JitContext, modrm_byte: ModrmByte, po
     ctx.builder.free_local(address_local);
 }
 
+// FSTP m80 with a relaxed register: zero and normal f64 values convert to the 80-bit image
+// exactly (integer bit set, the 52 fraction bits on top of the 64-bit significand, exponent
+// rebiased), so the bytes equal what fpu_store_m80 writes. Denormals, infinities, NaNs and
+// registers that do not hold a relaxed value take the helper. The caller has checked that all
+// ten bytes are writable, so neither path can fault.
+pub fn gen_fpu_relaxed_fstp_m80(ctx: &mut JitContext, address_local: &WasmLocal) {
+    gen_mark_fpu_simd_dirty_once(ctx);
+    let st0_addr = gen_fpu_st_addr(ctx, 0);
+    gen_fpu_relaxed_st_ok(ctx, 0, &st0_addr);
+    ctx.builder.if_void();
+    let bits = gen_fpu_load_relaxed_st_bits(ctx, 0, &st0_addr);
+    ctx.builder.get_local_i64(&bits.local);
+    ctx.builder.const_i64(52);
+    ctx.builder.shr_u_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0x7FF);
+    ctx.builder.and_i32();
+    let exp = ctx.builder.set_new_local();
+    ctx.builder.get_local_i64(&bits.local);
+    ctx.builder.const_i64(0x7FFF_FFFF_FFFF_FFFF);
+    ctx.builder.and_i64();
+    ctx.builder.const_i64(0);
+    ctx.builder.eq_i64();
+    let zero = ctx.builder.set_new_local();
+    ctx.builder.get_local(&exp);
+    ctx.builder.const_i32(1);
+    ctx.builder.sub_i32();
+    ctx.builder.const_i32(0x7FE);
+    ctx.builder.ltu_i32();
+    ctx.builder.get_local(&zero);
+    ctx.builder.or_i32();
+    ctx.builder.if_void();
+    gen_fpu_relaxed_record_hit(ctx);
+    ctx.builder.get_local(&zero);
+    ctx.builder.if_i64();
+    ctx.builder.const_i64(0);
+    ctx.builder.else_();
+    ctx.builder.get_local_i64(&bits.local);
+    ctx.builder.const_i64(11);
+    ctx.builder.shl_i64();
+    ctx.builder.const_i64(i64::MIN);
+    ctx.builder.or_i64();
+    ctx.builder.block_end();
+    let mantissa = ctx.builder.set_new_local_i64();
+    ctx.builder.get_local_i64(&bits.local);
+    ctx.builder.const_i64(48);
+    ctx.builder.shr_u_i64();
+    ctx.builder.wrap_i64_to_i32();
+    ctx.builder.const_i32(0x8000);
+    ctx.builder.and_i32();
+    ctx.builder.get_local(&zero);
+    ctx.builder.if_i32();
+    ctx.builder.const_i32(0);
+    ctx.builder.else_();
+    ctx.builder.get_local(&exp);
+    ctx.builder.const_i32(16383 - 1023);
+    ctx.builder.add_i32();
+    ctx.builder.block_end();
+    ctx.builder.or_i32();
+    let sign_exponent = ctx.builder.set_new_local();
+    gen_safe_write64(ctx, address_local, &mantissa);
+    ctx.builder.get_local(address_local);
+    ctx.builder.const_i32(8);
+    ctx.builder.add_i32();
+    let hi_addr = ctx.builder.set_new_local();
+    gen_safe_write16(ctx, &hi_addr, &sign_exponent);
+    ctx.builder.free_local(hi_addr);
+    ctx.builder.free_local(sign_exponent);
+    ctx.builder.free_local_i64(mantissa);
+    gen_fpu_relaxed_pop(ctx);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_fallback(ctx);
+    ctx.builder.get_local(address_local);
+    ctx.builder.call_fn1("instr_DB_7_mem");
+    gen_x87_local_cache_invalidate_all_runtime(ctx);
+    ctx.builder.block_end();
+    ctx.builder.free_local(zero);
+    ctx.builder.free_local(exp);
+    gen_free_fpu_bits(ctx, bits);
+    ctx.builder.else_();
+    gen_fpu_relaxed_record_fallback(ctx);
+    ctx.builder.get_local(address_local);
+    ctx.builder.call_fn1("instr_DB_7_mem");
+    gen_x87_local_cache_invalidate_all_runtime(ctx);
+    ctx.builder.block_end();
+    ctx.builder.free_local(st0_addr);
+}
+
 pub fn gen_fpu_relaxed_store_m64(ctx: &mut JitContext, modrm_byte: ModrmByte, pop: bool) {
     if !crate::softfloat::is_fpu_relaxed() {
         let address_local = gen_modrm_resolve_into_local(ctx, modrm_byte);
