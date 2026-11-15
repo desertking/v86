@@ -2223,7 +2223,7 @@ unsafe fn handle_sleep() -> bool {
 }
 
 /// TlsGetValue(dwTlsIndex) — stdcall(1).
-/// Reads TLS slot from guest TEB memory: TEB+0x2C → TLS array ptr, then array[index*4].
+/// Reads an inline dynamic TLS slot at TEB+0xE10+index*4; TEB+0x2C is implicit TLS.
 /// Sets LastError to 0 on success (Windows behavior).
 /// Falls through to JS for out-of-range indices or memory faults.
 unsafe fn handle_tls_get_value() -> bool {
@@ -2244,16 +2244,15 @@ unsafe fn handle_tls_get_value() -> bool {
         return false;
     }
 
-    // TEB+0x2C = ThreadLocalStoragePointer → address of TLS array
-    // Use direct memory read — TEB is in identity-mapped HEAP, TLB never has these pages
-    // (all guest TEB access is HLE via FS:), so safe_read32s always faults → JS fallback.
-    let tls_array_ptr = memory::read32_no_mmap_check(teb_base + 0x2C) as u32;
-    if tls_array_ptr == 0 {
+    // Native TEB.TlsSlots[64] is inline. ThreadLocalStoragePointer at +0x2C
+    // belongs to implicit module TLS and must not be used for these indices.
+    // The TEB is in identity-mapped HEAP, as with the previous dynamic TLS backing.
+    let slot = teb_base.wrapping_add(0xE10 + index * 4);
+    let mem_size = *crate::cpu::global_pointers::memory_size;
+    if slot < teb_base || slot > mem_size.saturating_sub(4) {
         return false;
     }
-
-    // Read TLS slot value (direct memory — same identity-mapped HEAP region)
-    let value = memory::read32_no_mmap_check(tls_array_ptr + index * 4);
+    let value = memory::read32_no_mmap_check(slot);
 
     // SetLastError(0) — TlsGetValue clears last error on success
     *(hp_mut().add(OFF_HC_LAST_ERROR) as *mut u32) = 0;
@@ -2264,9 +2263,9 @@ unsafe fn handle_tls_get_value() -> bool {
 }
 
 /// TlsSetValue(dwTlsIndex, lpTlsValue) — stdcall(2).
-/// Stores into the same TEB+0x2C array handle_tls_get_value reads, which is also the
-/// JS scheduler's storage for slots 0..63. Declines (JS answers) for an index JS has not
-/// allocated, an expansion index, or a thread whose TEB/TLS array is not published.
+/// Stores into the same inline TEB.TlsSlots[64] that handle_tls_get_value reads.
+/// Declines (JS answers) for an index JS has not allocated, an expansion index,
+/// or a thread whose TEB is not published.
 unsafe fn handle_tls_set_value() -> bool {
     let esp = read_reg32(ESP);
     let index = match safe_read32s(esp + 4) {
@@ -2289,14 +2288,10 @@ unsafe fn handle_tls_set_value() -> bool {
     if teb_base == 0 {
         return false;
     }
-    let tls_array_ptr = memory::read32_no_mmap_check(teb_base + 0x2C) as u32;
-    if tls_array_ptr == 0 {
-        return false;
-    }
     // A raw store outside guest RAM would be dropped silently; let JS report it instead.
-    let slot = tls_array_ptr.wrapping_add(index * 4);
+    let slot = teb_base.wrapping_add(0xE10 + index * 4);
     let mem_size = *crate::cpu::global_pointers::memory_size;
-    if slot < tls_array_ptr || slot.wrapping_add(4) > mem_size {
+    if slot < teb_base || slot > mem_size.saturating_sub(4) {
         return false;
     }
 
