@@ -337,6 +337,9 @@ pub static mut tlb_data: [i32; 0x100000] = [0; 0x100000];
 /// notice it — `tools/validate-tlb-mirror.mjs` fails the build if a second writer appears.
 #[inline]
 pub unsafe fn set_tlb_entry(page: i32, entry: i32) {
+    if crate::fn_census::enabled() {
+        crate::fn_census::note_tlb_write(page, entry);
+    }
     tlb_data[page as usize] = entry;
     crate::cpu::perm_map::perm_map[page as usize] = crate::cpu::perm_map::perm_byte_of(page, entry);
 }
@@ -1073,6 +1076,9 @@ pub unsafe fn call_interrupt_vector(
     is_software_int: bool,
     error_code: Option<i32>,
 ) {
+    if !is_software_int && crate::fn_census::enabled() {
+        crate::fn_census::note_exception(interrupt_nr);
+    }
     if *protected_mode {
         if vm86_mode() && *cr.offset(4) & CR4_VME != 0 {
             panic!("Unimplemented: VME");
@@ -5107,6 +5113,7 @@ pub unsafe fn check_page_switch(block_addr: u32, next_block_addr: u32) {
 
 #[no_mangle]
 pub unsafe fn reset_cpu() {
+    crate::fn_census::note_cpu_reset();
     for i in 0..8 {
         *segment_is_null.offset(i) = false;
         *segment_limits.offset(i) = 0;

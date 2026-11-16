@@ -2575,8 +2575,13 @@ struct JitState {
     // reorder the page walk -- changing which pages a stock module admits under its cap.
     region_joins: HashMap<Page, Vec<Page>, FixedHasher>,
     region_join_done: HashSet<(Page, Page), FixedHasher>,
+    fn_census: crate::fn_census::Census,
     #[cfg(debug_assertions)]
     wasm_table_index_to_page: HashMap<WasmTableIndex, HashSet<Page>>,
+}
+
+pub fn with_fn_census<R>(f: impl FnOnce(&mut crate::fn_census::Census) -> R) -> R {
+    f(&mut get_jit_state().fn_census)
 }
 
 fn check_jit_state_invariants(ctx: &mut JitState) {
@@ -2678,6 +2683,7 @@ impl JitState {
             tier2_blocked_pages: HashSet::new(),
             region_joins: HashMap::default(),
             region_join_done: HashSet::default(),
+            fn_census: crate::fn_census::Census::new(),
 
             #[cfg(debug_assertions)]
             wasm_table_index_to_page: HashMap::new(),
@@ -3466,7 +3472,7 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(
     -1
 }
 
-type FixedHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+pub type FixedHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
 
 struct JoinBudget {
     // pages admitted past the page cap by hot-edge joins
@@ -6962,6 +6968,15 @@ fn free_wasm_module_forest(ctx: &mut JitState, roots: Vec<WasmTableIndex>) {
 
 /// Register a write in this page: Delete all present code
 fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
+    if crate::fn_census::enabled() {
+        crate::fn_census::note_page_dirty(&mut ctx.fn_census, page);
+    }
+    jit_dirty_page_instrumentation_ctx(ctx, page)
+}
+
+pub fn jit_dirty_page_instrumentation(page: Page) { jit_dirty_page_instrumentation_ctx(&mut get_jit_state(), page) }
+
+fn jit_dirty_page_instrumentation_ctx(ctx: &mut JitState, page: Page) {
     let mut did_have_code = false;
 
     if let Some(PageInfo {
@@ -7066,7 +7081,7 @@ fn jit_clear_cache(ctx: &mut JitState) {
     }
 
     for page in pages_with_code {
-        jit_dirty_page_ctx(ctx, page);
+        jit_dirty_page_instrumentation_ctx(ctx, page);
     }
 }
 
@@ -7321,6 +7336,10 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if JIT_WBUF_FULL_RANGE {
             add(0x7A11_0007);
+        }
+        if crate::fn_census::enabled() {
+            add(0x7A11_0008);
+            add(crate::fn_census::SCHEMA_VERSION);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);

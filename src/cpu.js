@@ -824,6 +824,11 @@ CPU.prototype.set_state = function(state)
 
     this.full_clear_tlb();
 
+    if(this.wm.exports["fn_census_note_restore"])
+    {
+        this.wm.exports["fn_census_note_restore"]();
+    }
+
     this.jit_clear_cache();
 };
 
