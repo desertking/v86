@@ -15,7 +15,9 @@
 // is byte-identical and the TLB writer, the exception path and the page invalidation path
 // each take one untaken branch. Rows live in JitState, the window generation and stats next
 // to the TLB they observe; CPU reset and state restore bump the census generation so a
-// reader can refuse a window across them.
+// reader can refuse a window across them. Every map uses the fixed hasher: a RandomState
+// created here would reseed the HashSets the page walk creates after it, and change which
+// pages a stock module admits even with the census off.
 //
 // The window generation is 64-bit and saturates: a proof taken under an older generation
 // never compares equal again, and an exhausted generation refuses new proofs. The mutation
@@ -28,6 +30,7 @@ use crate::cpu::memory;
 use crate::cpu_context::{self, CpuContext};
 use crate::page::Page;
 use crate::state_flags::CachedStateFlags;
+use crate::jit::FixedHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -157,28 +160,28 @@ static mut CAP_WINDOW_PAGES: u32 = 3;
 
 pub struct Census {
     rows: Vec<u32>,
-    index: HashMap<u32, u32>,
+    index: HashMap<u32, u32, FixedHasher>,
     ranges: Vec<(u32, u32)>,
     owners: BTreeMap<u32, (u32, u32)>,
-    page_rows: HashMap<Page, Vec<u32>>,
+    page_rows: HashMap<Page, Vec<u32>, FixedHasher>,
 }
 
 impl Census {
     pub fn new() -> Census {
         Census {
             rows: Vec::new(),
-            index: HashMap::new(),
+            index: HashMap::default(),
             ranges: Vec::new(),
             owners: BTreeMap::new(),
-            page_rows: HashMap::new(),
+            page_rows: HashMap::default(),
         }
     }
     fn clear(&mut self) {
         self.rows = Vec::new();
-        self.index = HashMap::new();
+        self.index = HashMap::default();
         self.ranges = Vec::new();
         self.owners = BTreeMap::new();
-        self.page_rows = HashMap::new();
+        self.page_rows = HashMap::default();
     }
     fn row(&mut self, i: u32) -> &mut [u32] {
         let s = i as usize * ROW_WORDS;
@@ -839,9 +842,9 @@ fn analyse(entry: u32, sf: CachedStateFlags) -> (Ctx, u32) {
             return (c, 0);
         },
     };
-    let mut seen: HashMap<u32, FlowState> = HashMap::new();
+    let mut seen: HashMap<u32, FlowState, FixedHasher> = HashMap::default();
     let mut work: Vec<(u32, FlowState)> = vec![(entry, FlowState { esp: Some(0), ebp: None, x87: Some(0), saved_ebp: None })];
-    let mut block_starts: HashSet<u32> = HashSet::new();
+    let mut block_starts: HashSet<u32, FixedHasher> = HashSet::default();
     let mut ebp_is_frame_anywhere = false;
     let relaxed = crate::softfloat::get_relaxed_fpu() != 0;
 
