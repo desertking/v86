@@ -4326,10 +4326,17 @@ pub fn instr16_E8_jit(ctx: &mut JitContext, _imm: u32) {
     codegen::gen_push16(ctx, &value_local);
     ctx.builder.free_local(value_local);
 }
-pub fn instr32_E8_jit(ctx: &mut JitContext, _imm: u32) {
+pub fn instr32_E8_jit(ctx: &mut JitContext, imm: u32) {
     codegen::gen_get_real_eip(ctx);
     let value_local = ctx.builder.set_new_local();
     codegen::gen_push32(ctx, &value_local);
+    if crate::fn_census::enabled() {
+        ctx.builder.get_local(&value_local);
+        ctx.builder.const_i32(imm as i32);
+        ctx.builder.add_i32();
+        codegen::gen_get_reg32(ctx, regs::ESP);
+        ctx.builder.call_fn2("fn_census_note_call");
+    }
     ctx.builder.free_local(value_local);
 }
 
@@ -4893,8 +4900,11 @@ pub fn instr_DB_3_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fn1_const(ctx.builder, "instr_DB_3_reg", r);
 }
 
+// FLD m80 under jit_x87_m80_inline: an image that is exactly an f64 (zero, or a normal value
+// with the integer bit set, the low 11 significand bits clear and the exponent in the f64
+// normal range) enters the relaxed form; every other image keeps its 80-bit value through
+// the helper. The ten bytes are checked readable first, as on the helper path.
 fn fld80_inline_jit(ctx: &mut JitContext, address_local: &WasmLocal) {
-    let relaxed_all = crate::cpu::fpu::get_fpu_fld80_relaxed() != 0;
     codegen::gen_safe_read64(ctx, address_local);
     let mant = ctx.builder.set_new_local_i64();
     ctx.builder.get_local(address_local);
@@ -4915,14 +4925,12 @@ fn fld80_inline_jit(ctx: &mut JitContext, address_local: &WasmLocal) {
     ctx.builder.sub_i32();
     ctx.builder.const_i32(0x7FE);
     ctx.builder.ltu_i32();
-    if !relaxed_all {
-        ctx.builder.get_local_i64(&mant);
-        ctx.builder.const_i64(i64::MIN | 0x7FF);
-        ctx.builder.and_i64();
-        ctx.builder.const_i64(i64::MIN);
-        ctx.builder.eq_i64();
-        ctx.builder.and_i32();
-    }
+    ctx.builder.get_local_i64(&mant);
+    ctx.builder.const_i64(if crate::jit::x87_m80_inline_mutated() { i64::MIN } else { i64::MIN | 0x7FF });
+    ctx.builder.and_i64();
+    ctx.builder.const_i64(i64::MIN);
+    ctx.builder.eq_i64();
+    ctx.builder.and_i32();
     ctx.builder.get_local(&se);
     ctx.builder.const_i32(0x7FFF);
     ctx.builder.and_i32();
@@ -4962,6 +4970,7 @@ fn fld80_inline_jit(ctx: &mut JitContext, address_local: &WasmLocal) {
     ctx.builder.else_();
     ctx.builder.get_local(address_local);
     ctx.builder.call_fn1("fpu_fldm80_without_fault");
+    codegen::gen_x87_local_cache_invalidate_all_runtime(ctx);
     ctx.builder.block_end();
     ctx.builder.free_local(zero);
     ctx.builder.free_local(fexp);
@@ -4981,12 +4990,47 @@ pub fn instr_DB_5_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
         return;
     }
     codegen::gen_readable_or_pagefault(ctx, &address_local, 10);
+    if crate::jit::x87_m80_inline_enabled() && crate::softfloat::is_fpu_relaxed() {
+        codegen::gen_mark_fpu_simd_dirty_once(ctx);
+        fld80_inline_jit(ctx, &address_local);
+        ctx.builder.free_local(address_local);
+        return;
+    }
     ctx.builder.get_local(&address_local);
     ctx.builder.call_fn1("fpu_fldm80_without_fault");
     ctx.builder.free_local(address_local);
 }
 pub fn instr_DB_5_reg_jit(ctx: &mut JitContext, r: u32) {
     codegen::gen_fpu_relaxed_fcomi(ctx, r, false, "fpu_fucomi");
+}
+
+pub fn instr_DB_7_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if !crate::jit::x87_m80_inline_enabled() {
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+        codegen::gen_modrm_resolve(ctx, modrm_byte);
+        codegen::gen_modrm_fn0(ctx.builder, "instr_DB_7_mem");
+        codegen::gen_move_registers_from_memory_to_locals(ctx);
+        return;
+    }
+    let address_local = codegen::gen_modrm_resolve_into_local(ctx, modrm_byte);
+    codegen::gen_writable_or_pagefault(ctx, &address_local, 10);
+    if crate::softfloat::is_fpu_relaxed() {
+        codegen::gen_fpu_relaxed_fstp_m80(ctx, &address_local);
+    }
+    else {
+        ctx.builder.get_local(&address_local);
+        ctx.builder.call_fn1("instr_DB_7_mem");
+    }
+    ctx.builder.free_local(address_local);
+}
+pub fn instr_DB_7_reg_jit(ctx: &mut JitContext, r: u32) {
+    if !crate::jit::x87_m80_inline_enabled() {
+        codegen::gen_move_registers_from_locals_to_memory(ctx);
+        codegen::gen_fn1_const(ctx.builder, "instr_DB_7_reg", r);
+        codegen::gen_move_registers_from_memory_to_locals(ctx);
+        return;
+    }
+    codegen::gen_trigger_ud(ctx);
 }
 
 pub fn instr_DB_6_mem_jit(ctx: &mut JitContext, _modrm_byte: ModrmByte) {
@@ -5651,12 +5695,22 @@ fn gen_indirect_call32(ctx: &mut JitContext, new_eip: WasmLocal) {
         ctx.builder
             .load_fixed_i32(crate::jit::wbuf_intrinsic_enabled_ptr());
         ctx.builder.if_void();
+        let (min_ptr, max_ptr) = if crate::jit::wbuf_full_range_enabled() {
+            (
+                crate::jit::wbuf_intrinsic_min_target_ptr(),
+                crate::jit::wbuf_intrinsic_max_target_ptr(),
+            )
+        }
+        else {
+            (
+                crate::jit::wbuf_intrinsic_hot_min_target_ptr(),
+                crate::jit::wbuf_intrinsic_hot_max_target_ptr(),
+            )
+        };
         ctx.builder.get_local(&new_eip);
-        ctx.builder
-            .load_fixed_i32(crate::jit::wbuf_intrinsic_min_target_ptr());
+        ctx.builder.load_fixed_i32(min_ptr);
         ctx.builder.geu_i32();
-        ctx.builder
-            .load_fixed_i32(crate::jit::wbuf_intrinsic_max_target_ptr());
+        ctx.builder.load_fixed_i32(max_ptr);
         ctx.builder.get_local(&new_eip);
         ctx.builder.geu_i32();
         ctx.builder.and_i32();
@@ -5765,12 +5819,23 @@ pub fn instr16_FF_4_reg_jit(ctx: &mut JitContext, r: u32) {
         .store_aligned_i32(global_pointers::instruction_pointer as u32);
 }
 pub fn instr32_FF_4_mem_jit(ctx: &mut JitContext, modrm_byte: ModrmByte) {
+    if !crate::jit::wbuf_tail_jmp_enabled() {
+        ctx.builder.const_i32(0);
+        codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
+        codegen::gen_add_cs_offset(ctx);
+        ctx.builder
+            .store_aligned_i32(global_pointers::instruction_pointer as u32);
+        return;
+    }
     codegen::gen_modrm_resolve_safe_read32(ctx, modrm_byte);
     codegen::gen_add_cs_offset(ctx);
     let new_eip = ctx.builder.set_new_local();
     gen_indirect_jump32(ctx, new_eip);
 }
 
+/// `JMP m32` with set_jit_wbuf_tail_jmp: the import-thunk tail of `call rel32; jmp [IAT]`.
+/// Guarded by the whole registry, since thunk-called stubs (OpenGL and the like) are not hot
+/// slots. A hit leaves the stack as the stub's `RET N` would; a miss is the plain JMP.
 fn gen_indirect_jump32(ctx: &mut JitContext, new_eip: WasmLocal) {
     if ctx.cpu.ssize_32() {
         ctx.builder.const_i32(-1);

@@ -337,6 +337,9 @@ pub static mut tlb_data: [i32; 0x100000] = [0; 0x100000];
 /// notice it — `tools/validate-tlb-mirror.mjs` fails the build if a second writer appears.
 #[inline]
 pub unsafe fn set_tlb_entry(page: i32, entry: i32) {
+    if crate::fn_census::enabled() {
+        crate::fn_census::note_tlb_write(page, entry);
+    }
     tlb_data[page as usize] = entry;
     crate::cpu::perm_map::perm_map[page as usize] = crate::cpu::perm_map::perm_byte_of(page, entry);
 }
@@ -1073,6 +1076,9 @@ pub unsafe fn call_interrupt_vector(
     is_software_int: bool,
     error_code: Option<i32>,
 ) {
+    if !is_software_int && crate::fn_census::enabled() {
+        crate::fn_census::note_exception(interrupt_nr);
+    }
     if *protected_mode {
         if vm86_mode() && *cr.offset(4) & CR4_VME != 0 {
             panic!("Unimplemented: VME");
@@ -3296,6 +3302,11 @@ pub unsafe fn cycle_internal() {
     let initial_eip = *instruction_pointer;
     // Which ADDRESS the dispatcher re-entered at (roadmap 07). No-op unless DISPATCH_STATS.
     jit::note_entry_eip(initial_eip as u32);
+    // Exit-site sampling: the dispatch entry is the fallback attribution for an interpreted
+    // block or a module exit that stores no site of its own.
+    if jit::exit_site_sampling_enabled() {
+        jit::JIT_EXIT_SITE_EIP = initial_eip as u32;
+    }
     // dbg_on_instruction stays: it's gated by DBG_ENABLED (off by default), the guest debugger's
     // interpreter hook.
     // BottleShip: when ONLY breakpoints are active (no step-trace), restrict the per-block hook to
@@ -3640,13 +3651,15 @@ pub unsafe fn main_loop() -> f64 {
     loop {
         do_many_cycles_native();
 
-        // If cycle_limit was lowered for preemption → lean yield. Same when EIP is
-        // parked on the spin loop: without this the outer loop would re-enter
+        // If cycle_limit was lowered for preemption → lean yield. Same when the host
+        // dropped the limit to 0 during this pass (an urgent exit requested from a port
+        // handler): every further pass would retire nothing until TIME_PER_FRAME. And
+        // when EIP is parked on the spin loop: without this the outer loop would re-enter
         // do_many_cycles_native (which exits immediately at the park address) in a
         // hot loop until TIME_PER_FRAME.
         if is_preempt_mode
-            || hypercall::eip_at_park(*instruction_pointer as u32)
             || hypercall::read_cycle_limit() == 0
+            || hypercall::eip_at_park(*instruction_pointer as u32)
         {
             let now = js::microtick();
             js::run_hardware_timers(*acpi_enabled, now);
@@ -5123,6 +5136,7 @@ pub unsafe fn check_page_switch(block_addr: u32, next_block_addr: u32) {
 
 #[no_mangle]
 pub unsafe fn reset_cpu() {
+    crate::fn_census::note_cpu_reset();
     for i in 0..8 {
         *segment_is_null.offset(i) = false;
         *segment_limits.offset(i) = 0;

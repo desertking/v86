@@ -171,7 +171,7 @@ pub unsafe fn trace2_watch_page(addr: u32) -> u32 {
     }
     WATCHED_PAGES.push(page);
     ENABLED = true;
-    jit::jit_dirty_page(page);
+    jit::jit_dirty_page_instrumentation(page);
     1
 }
 
@@ -180,7 +180,7 @@ pub unsafe fn trace2_watch_page(addr: u32) -> u32 {
 #[no_mangle]
 pub unsafe fn trace2_reset() {
     for &page in WATCHED_PAGES.iter() {
-        jit::jit_dirty_page(page);
+        jit::jit_dirty_page_instrumentation(page);
     }
     WATCHED_PAGES.clear();
     ENABLED = false;
@@ -197,7 +197,7 @@ pub unsafe fn trace2_reset() {
 #[no_mangle]
 pub unsafe fn trace2_unwatch_all() {
     for &page in WATCHED_PAGES.iter() {
-        jit::jit_dirty_page(page);
+        jit::jit_dirty_page_instrumentation(page);
     }
     WATCHED_PAGES.clear();
     ENABLED = false;

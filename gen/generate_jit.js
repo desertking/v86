@@ -270,6 +270,13 @@ function gen_instruction_body_after_fixed_g(encoding, size)
             );
         }
 
+        if(encoding.mem_boundary_unless)
+        {
+            mem_postfix.push(
+                `if !${encoding.mem_boundary_unless} { *instr_flags |= jit::JIT_INSTR_BLOCK_BOUNDARY_FLAG; }`
+            );
+        }
+
         if(encoding.reg_ud)
         {
             reg_postfix.push(

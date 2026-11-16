@@ -14,6 +14,7 @@ use crate::cpu::global_pointers;
 use crate::cpu::hypercall;
 use crate::cpu::memory;
 use crate::cpu_context::CpuContext;
+use crate::jit_block_map;
 use crate::jit_instructions;
 use crate::opstats;
 use crate::page::Page;
@@ -65,9 +66,22 @@ static mut JIT_DISABLED: bool = false;
 // BottleShip write-buffer CALL intrinsic. The JS thunk dispatcher registers the exact
 // guest stub addresses after it patches them to WBUF trampolines. JITed `CALL r/m32`
 // sites use the cheap enabled/min/max words below as a miss guard, then call the helper
-// only for targets inside the registered stub span. A hit appends the exact trampoline
-// payload and returns the stdcall cleanup byte count; the emitter then resumes at the
-// instruction after CALL without entering either the stub or trampoline Wasm module.
+// only for targets inside the guarded span: the D3D9 hot slots by default, the whole
+// registry with set_jit_wbuf_full_range. A hit appends the exact trampoline payload and
+// returns the stdcall cleanup byte count; the emitter then resumes at the instruction after
+// CALL without entering either the stub or trampoline Wasm module.
+//
+// With set_jit_wbuf_tail_jmp, a JITed `JMP m32` (the `jmp [IAT]` import thunk reached by a
+// direct `call rel32`) does the same against the whole registry: [ESP] is the caller's return
+// address and the arguments follow it. The helper validates the return address together with
+// the arguments; on a hit the code pops the return address into EIP and adds the cleanup,
+// which is what `jmp stub; ...; ret N` would have done. On a miss it is the plain JMP.
+//
+// Both switches are code-shaping, default off (modules byte-identical to before they
+// existed) and folded into jit_codegen_fingerprint only when on.
+//
+// A hit never executes the stub or the trampoline, so a debugger breakpoint there would
+// never fire under the JIT. The helper therefore declines while breakpoints are armed.
 //
 // This is deliberately runtime-registered rather than baked into the codegen fingerprint:
 // thunk addresses and ids belong to each guest process, while generated modules all import
@@ -131,6 +145,40 @@ pub(crate) fn wbuf_intrinsic_bitmap_ptr() -> u32 {
 fn wbuf_bitmap_granule(target: u32) -> usize { (target >> 4) as usize & 0xFFFF }
 static mut WBUF_INTRINSIC_HITS: u32 = 0;
 static mut WBUF_INTRINSIC_FALLBACKS: u32 = 0;
+// Targets inside the guarded span that are not registered. Kept apart from FALLBACKS so that
+// FALLBACKS keeps meaning "registered but declined" under the wider guards.
+static mut WBUF_INTRINSIC_PROBE_MISSES: u32 = 0;
+const WBUF_NOT_REGISTERED: i32 = -2;
+static mut JIT_WBUF_TAIL_JMP: bool = false;
+static mut JIT_WBUF_FULL_RANGE: bool = false;
+
+#[no_mangle]
+pub fn set_jit_wbuf_tail_jmp(on: u32) {
+    unsafe {
+        if JIT_WBUF_TAIL_JMP == (on != 0) {
+            return;
+        }
+        JIT_WBUF_TAIL_JMP = on != 0;
+    }
+    jit_clear_cache_js();
+}
+#[no_mangle]
+pub fn get_jit_wbuf_tail_jmp() -> u32 { unsafe { JIT_WBUF_TAIL_JMP as u32 } }
+pub(crate) fn wbuf_tail_jmp_enabled() -> bool { unsafe { JIT_WBUF_TAIL_JMP } }
+
+#[no_mangle]
+pub fn set_jit_wbuf_full_range(on: u32) {
+    unsafe {
+        if JIT_WBUF_FULL_RANGE == (on != 0) {
+            return;
+        }
+        JIT_WBUF_FULL_RANGE = on != 0;
+    }
+    jit_clear_cache_js();
+}
+#[no_mangle]
+pub fn get_jit_wbuf_full_range() -> u32 { unsafe { JIT_WBUF_FULL_RANGE as u32 } }
+pub(crate) fn wbuf_full_range_enabled() -> bool { unsafe { JIT_WBUF_FULL_RANGE } }
 static mut WBUF_INTRINSIC_CODEGEN_CALL32: u32 = 0;
 static mut WBUF_INTRINSIC_CODEGEN_SS32: u32 = 0;
 
@@ -174,7 +222,9 @@ pub unsafe fn jit_wbuf_intrinsic_set_enabled(enabled: u32) {
     WBUF_INTRINSIC_ENABLED = (enabled != 0) as u32;
 }
 
-/// kind: 0 = scalar WBUF, 1 = D3D shader-constant capture.
+/// kind: 0 = scalar WBUF (arg_count 1..=8), 1 = D3D shader-constant capture (arg_count 4),
+/// 2 = no arguments (arg_count 0): writes `func_id, 0`, the arity-1 entry the zero-argument
+/// trampoline writes, with no stack cleanup.
 /// Returns 1 on insert/update, 0 for invalid metadata or a saturated probe window.
 #[no_mangle]
 pub unsafe fn jit_wbuf_intrinsic_register(
@@ -721,6 +771,9 @@ unsafe fn wbuf_intrinsic_execute_inner(target: u32, esp: u32, lead: u32) -> i32 
 #[inline(always)]
 unsafe fn wbuf_intrinsic_execute_with(acc: &WbufAccess, target: u32, esp: u32, lead: u32) -> i32 {
     let desc = wbuf_intrinsic_find(target);
+    if desc.target != 0 && cpu::DBG_ENABLED && cpu::DBG_BP_COUNT != 0 {
+        return -1;
+    }
     // The control word is read AND written back, so it must be writable, not merely present.
     if desc.target == 0 || !wbuf_ok(acc, desc.ctrl_addr, 4, true) {
         return -1;
@@ -817,6 +870,8 @@ pub unsafe fn jit_wbuf_intrinsic_get_hits() -> u32 { WBUF_INTRINSIC_HITS }
 #[no_mangle]
 pub unsafe fn jit_wbuf_intrinsic_get_fallbacks() -> u32 { WBUF_INTRINSIC_FALLBACKS }
 #[no_mangle]
+pub unsafe fn jit_wbuf_intrinsic_get_probe_misses() -> u32 { WBUF_INTRINSIC_PROBE_MISSES }
+#[no_mangle]
 pub unsafe fn jit_wbuf_intrinsic_get_enabled() -> u32 { WBUF_INTRINSIC_ENABLED }
 #[no_mangle]
 pub unsafe fn jit_wbuf_intrinsic_get_registered() -> u32 { WBUF_INTRINSIC_REGISTERED }
@@ -832,6 +887,7 @@ pub unsafe fn jit_wbuf_intrinsic_get_codegen_ss32() -> u32 { WBUF_INTRINSIC_CODE
 pub unsafe fn jit_wbuf_intrinsic_reset_stats() {
     WBUF_INTRINSIC_HITS = 0;
     WBUF_INTRINSIC_FALLBACKS = 0;
+    WBUF_INTRINSIC_PROBE_MISSES = 0;
 }
 
 /// Drop all process-owned WBUF intrinsic state. Generated modules only retain pointers to
@@ -850,6 +906,7 @@ pub unsafe fn jit_wbuf_intrinsic_clear_registry() {
     WBUF_INTRINSIC_REGISTERED = 0;
     WBUF_INTRINSIC_HITS = 0;
     WBUF_INTRINSIC_FALLBACKS = 0;
+    WBUF_INTRINSIC_PROBE_MISSES = 0;
     WBUF_INTRINSIC_CODEGEN_CALL32 = 0;
     WBUF_INTRINSIC_CODEGEN_SS32 = 0;
 }
@@ -880,6 +937,54 @@ pub fn set_jit_page_tails(on: u32) { unsafe { JIT_PAGE_TAILS = on != 0 } }
 #[no_mangle]
 pub fn get_jit_page_tails() -> u32 { unsafe { JIT_PAGE_TAILS as u32 } }
 fn page_tails_enabled() -> bool { unsafe { JIT_PAGE_TAILS } }
+
+// Exit-site sampling for the harness EIP profiler. A JS sampler can only read CPU state between
+// slices, and a slice ends at the first budget check after its instruction budget runs out:
+// a module exit or chain attempt, which has already written the TARGET's address into
+// instruction_pointer. Sampled EIPs therefore name the block entered next, not the activation
+// that spent the budget. With this on, every real module exit stores its own exit instruction
+// (a physical address, equal to the virtual one under an identity map) into
+// JIT_EXIT_SITE_EIP, and cycle_internal stores the dispatch entry first, so the slot always
+// names the last activation that ran. Code-shaping and folded into the fingerprint only when
+// on; needs a JIT cache clear to reach already-compiled modules.
+static mut JIT_EXIT_SITE_SAMPLING: bool = false;
+pub static mut JIT_EXIT_SITE_EIP: u32 = 0;
+
+#[no_mangle]
+pub fn set_jit_exit_site_sampling(on: u32) { unsafe { JIT_EXIT_SITE_SAMPLING = on != 0 } }
+#[no_mangle]
+pub fn get_jit_exit_site_sampling() -> u32 { unsafe { JIT_EXIT_SITE_SAMPLING as u32 } }
+#[no_mangle]
+pub fn jit_exit_site_eip() -> u32 { unsafe { JIT_EXIT_SITE_EIP } }
+pub fn exit_site_sampling_enabled() -> bool { unsafe { JIT_EXIT_SITE_SAMPLING } }
+
+// x87 80-bit memory forms in relaxed FPU mode. FLD m80 converts inline when the image is
+// exactly representable as f64 (zero, or a normal value with the integer bit set, the low
+// 11 significand bits clear and the exponent in the f64 normal range); every other image
+// takes the helper and keeps its full 80-bit value. FSTP m80 writes a relaxed register
+// inline (zero or a normal f64, which convert exactly) and leaves everything else to the
+// helper, and it no longer ends the basic block. Code-shaping; default off emits
+// byte-identical modules. Changing the mode clears the JIT cache, so no module compiled
+// under one mode is captured for AOT under another.
+// Mode 2 is a deliberately wrong build for the differential's negative control: FLD m80
+// also converts images whose low significand bits are set, truncating them.
+static mut JIT_X87_M80_INLINE: u32 = 0;
+
+#[no_mangle]
+pub fn set_jit_x87_m80_inline(mode: u32) {
+    let mode = if mode > 2 { 1 } else { mode };
+    unsafe {
+        if JIT_X87_M80_INLINE == mode {
+            return;
+        }
+        JIT_X87_M80_INLINE = mode;
+    }
+    jit_clear_cache_js();
+}
+#[no_mangle]
+pub fn get_jit_x87_m80_inline() -> u32 { unsafe { JIT_X87_M80_INLINE } }
+pub fn x87_m80_inline_enabled() -> bool { unsafe { JIT_X87_M80_INLINE != 0 } }
+pub fn x87_m80_inline_mutated() -> bool { unsafe { JIT_X87_M80_INLINE == 2 } }
 
 // Hot-edge region formation. A module stops growing at a page whose entries are already
 // compiled elsewhere (page_blacklist) or at MAX_PAGES, so a hot direct CALL/JMP between two
@@ -3251,8 +3356,13 @@ struct JitState {
     // reorder the page walk -- changing which pages a stock module admits under its cap.
     region_joins: HashMap<Page, Vec<Page>, FixedHasher>,
     region_join_done: HashSet<(Page, Page), FixedHasher>,
+    fn_census: crate::fn_census::Census,
     #[cfg(debug_assertions)]
     wasm_table_index_to_page: HashMap<WasmTableIndex, HashSet<Page>>,
+}
+
+pub fn with_fn_census<R>(f: impl FnOnce(&mut crate::fn_census::Census) -> R) -> R {
+    f(&mut get_jit_state().fn_census)
 }
 
 fn check_jit_state_invariants(ctx: &mut JitState) {
@@ -3354,6 +3464,7 @@ impl JitState {
             tier2_blocked_pages: HashSet::new(),
             region_joins: HashMap::default(),
             region_join_done: HashSet::default(),
+            fn_census: crate::fn_census::Census::new(),
 
             #[cfg(debug_assertions)]
             wasm_table_index_to_page: HashMap::new(),
@@ -4334,7 +4445,7 @@ pub unsafe fn jit_find_cache_entry_for_dynamic_chaining(
     -1
 }
 
-type FixedHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
+pub type FixedHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
 
 struct JoinBudget {
     // pages admitted past the page cap by hot-edge joins
@@ -6093,6 +6204,7 @@ fn gen_chain_or_exit_to_known_successor(
             ctx.builder.store_aligned_i32(0);
         }
         codegen::gen_dispatch_stat_increment(ctx.builder, stat::MODULE_EXIT_CHAINABLE);
+        codegen::gen_sample_exit_site(ctx.builder, last_instruction_addr);
         ctx.builder.br(ctx.exit_label);
         return;
     }
@@ -6493,6 +6605,7 @@ fn jit_generate_module(
     gg_plan: Option<&analysis::GgPlan>,
 ) -> (Vec<(u32, u16)>, bool) {
     builder.reset();
+    jit_block_map::begin_module();
     builder.branch_hint_mask = branch_hint_mask();
     builder.branch_hint_offset_fuzz = unsafe { JIT_BRANCH_HINT_OFFSET_FUZZ };
 
@@ -6575,7 +6688,7 @@ fn jit_generate_module(
         builder.get_local(&instruction_counter);
         builder.const_i32(cpu::LOOP_COUNTER);
         builder.geu_i32();
-        if cfg!(feature = "profiler") {
+        if cfg!(feature = "profiler") || exit_site_sampling_enabled() {
             builder.if_void();
             codegen::gen_debug_track_jit_exit(builder, 0);
             builder.br(exit_label);
@@ -6708,6 +6821,10 @@ fn jit_generate_module(
         .collect();
 
     while let Some(block) = work.pop_front() {
+        jit_block_map::mark(ctx.builder.instruction_body_length(), match &block {
+            Work::WasmStructure(WasmStructure::BasicBlock(addr)) => basic_blocks.get(addr),
+            _ => None,
+        });
         let next_addr: Option<Vec<u32>> = work.iter().find_map(|x| match x {
             Work::WasmStructure(l) => Some(l.head().collect()),
             _ => None,
@@ -7457,7 +7574,7 @@ fn jit_generate_module(
                         ctx.builder.get_local(&ctx.instruction_counter);
                         ctx.builder.const_i32(cpu::LOOP_COUNTER);
                         ctx.builder.geu_i32();
-                        if cfg!(feature = "profiler") {
+                        if cfg!(feature = "profiler") || exit_site_sampling_enabled() {
                             ctx.builder.if_void();
                             codegen::gen_debug_track_jit_exit(ctx.builder, addr);
                             ctx.builder.br(exit_label);
@@ -7573,6 +7690,7 @@ fn jit_generate_module(
     }
 
     dbg_assert!(label_for_addr.is_empty());
+    jit_block_map::mark(ctx.builder.instruction_body_length(), None);
 
     {
         ctx.builder.block_end(); // default case for the brtable
@@ -7584,6 +7702,7 @@ fn jit_generate_module(
         // module exit: the interpreter re-resolves the eip through the normal
         // cache path (worst case: recompile). `unreachable` turned this race
         // into a fatal wasm trap. Debug builds still flag it via check_dispatcher_target.
+        codegen::gen_sample_exit_site(ctx.builder, 0);
         ctx.builder.br(ctx.exit_label);
     }
     {
@@ -7643,6 +7762,7 @@ fn jit_generate_module(
         name[start..].reverse();
     }
 
+    jit_block_map::end_module(ctx.builder.instruction_body_length());
     ctx.builder.finish();
 
     let entries = Vec::from_iter(entry_blocks.iter().map(|addr| {
@@ -8477,6 +8597,15 @@ fn free_wasm_module_forest(ctx: &mut JitState, roots: Vec<WasmTableIndex>) {
 
 /// Register a write in this page: Delete all present code
 fn jit_dirty_page_ctx(ctx: &mut JitState, page: Page) {
+    if crate::fn_census::enabled() {
+        crate::fn_census::note_page_dirty(&mut ctx.fn_census, page);
+    }
+    jit_dirty_page_instrumentation_ctx(ctx, page)
+}
+
+pub fn jit_dirty_page_instrumentation(page: Page) { jit_dirty_page_instrumentation_ctx(&mut get_jit_state(), page) }
+
+fn jit_dirty_page_instrumentation_ctx(ctx: &mut JitState, page: Page) {
     let mut did_have_code = false;
 
     if let Some(PageInfo {
@@ -8585,7 +8714,7 @@ fn jit_clear_cache(ctx: &mut JitState) {
     }
 
     for page in pages_with_code {
-        jit_dirty_page_ctx(ctx, page);
+        jit_dirty_page_instrumentation_ctx(ctx, page);
     }
 }
 
@@ -8824,6 +8953,13 @@ fn jit_codegen_fingerprint() -> u64 {
         if JIT_PAGE_TAILS {
             add(0x7A11_0001);
         }
+        if JIT_EXIT_SITE_SAMPLING {
+            add(0x7A11_0004);
+        }
+        if JIT_X87_M80_INLINE != 0 {
+            add(0x7A11_0005);
+            add(JIT_X87_M80_INLINE);
+        }
         if JIT_HOT_EDGE_REGIONS {
             add(0x7A11_0002);
             add(HOT_EDGE_EXTRA_PAGES);
@@ -8966,6 +9102,16 @@ fn jit_codegen_fingerprint() -> u64 {
         }
         if crate::cpu::fpu::get_fpu_fld80_relaxed() != 0 {
             add(0x7A11_0030);
+        }
+        if JIT_WBUF_TAIL_JMP {
+            add(0x7A11_0006);
+        }
+        if JIT_WBUF_FULL_RANGE {
+            add(0x7A11_0007);
+        }
+        if crate::fn_census::enabled() {
+            add(0x7A11_0008);
+            add(crate::fn_census::SCHEMA_VERSION);
         }
         if JIT_GUARD_GROUPS || GG_DEBUG != 0 {
             add(0x7A11_0003);
