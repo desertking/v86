@@ -19,6 +19,10 @@
 // created here would reseed the HashSets the page walk creates after it, and change which
 // pages a stock module admits even with the census off.
 //
+// Schema 2 adds the call sites of every candidate (direct target or indirect, and the
+// callee's return form). A direct call moves the caller's ESP model by the callee's
+// `ret imm16`; an indirect call or a callee with no or mixed returns leaves ESP unknown.
+//
 // The window generation is 64-bit and saturates: a proof taken under an older generation
 // never compares equal again, and an exhausted generation refuses new proofs. The mutation
 // switch exists only for the negative controls in tests/jit-fn-census.mjs.
@@ -33,7 +37,7 @@ use crate::state_flags::CachedStateFlags;
 use crate::jit::FixedHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub const ROW_WORDS: usize = 40;
 pub const MAX_ROWS: usize = 8192;
@@ -73,6 +77,17 @@ pub const R_ANALYSES: usize = 28;
 pub const R_CODE_PAGE0: usize = 29;
 pub const R_FIRST_WINDOW_EIP: usize = 32;
 pub const R_FIRST_WINDOW_OP: usize = 33;
+pub const R_CALL_START: usize = 34;
+pub const R_CALL_COUNT: usize = 35;
+pub const R_RET_SUMMARY: usize = 36;
+
+pub const MAX_CALLS: usize = 131072;
+pub const CALL_WORDS: usize = 4;
+pub const CALL_INDIRECT: u32 = 1;
+pub const CALL_CALLEE_RET_KNOWN: u32 = 2;
+pub const CALL_CALLEE_RET_MIXED: u32 = 4;
+pub const RET_KNOWN: u32 = 0x1_0000;
+pub const RET_MIXED: u32 = 0x2_0000;
 
 pub const ROW_FLAG_STALE: u32 = 1;
 pub const ROW_FLAG_ANALYSED: u32 = 2;
@@ -96,6 +111,7 @@ pub const W_ESP_MERGE: u32 = 1 << 2;
 pub const W_ESP_UNBALANCED: u32 = 1 << 3;
 pub const W_OUT_CALL: u32 = 1 << 4;
 pub const W_EXTENT_PAGES: u32 = 1 << 5;
+pub const W_CALLEE_ESP_UNKNOWN: u32 = 1 << 6;
 
 pub const PR_SLOT_ESCAPES: u32 = 1 << 0;
 pub const PR_UNKNOWN_ALIAS: u32 = 1 << 1;
@@ -133,7 +149,8 @@ pub const S_CALLS_NOT_FLAT32: usize = 9;
 pub const S_EXCEPTIONS: usize = 10;
 pub const S_WINDOW_PROBES: usize = 11;
 pub const S_WINDOW_ADMITTED: usize = 12;
-const STAT_COUNT: usize = 13;
+pub const S_CALL_OVERFLOW: usize = 13;
+const STAT_COUNT: usize = 14;
 
 pub const M_SKIP_IDENTITY: u32 = 1 << 0;
 pub const M_FILL_TLB: u32 = 1 << 1;
@@ -141,6 +158,7 @@ pub const M_NO_REVOCATION: u32 = 1 << 2;
 pub const M_GENERATION_WRAPS: u32 = 1 << 3;
 pub const M_JOIN_ESP_ONLY: u32 = 1 << 5;
 pub const M_KEEP_OBSOLETE_RANGES: u32 = 1 << 6;
+pub const M_CALLS_ESP_NEUTRAL: u32 = 1 << 4;
 
 const GENERATION_EXHAUSTED: u64 = u64::MAX;
 
@@ -166,6 +184,8 @@ pub struct Census {
     ranges: Vec<(u32, u32, u32)>,
     owners: BTreeMap<u32, (u32, u32)>,
     page_rows: HashMap<Page, Vec<u32>, FixedHasher>,
+    calls: Vec<u32>,
+    callee_ret: HashMap<u32, u32, FixedHasher>,
 }
 
 impl Census {
@@ -176,6 +196,8 @@ impl Census {
             ranges: Vec::new(),
             owners: BTreeMap::new(),
             page_rows: HashMap::default(),
+            calls: Vec::new(),
+            callee_ret: HashMap::default(),
         }
     }
     fn clear(&mut self) {
@@ -184,6 +206,8 @@ impl Census {
         self.ranges = Vec::new();
         self.owners = BTreeMap::new();
         self.page_rows = HashMap::default();
+        self.calls = Vec::new();
+        self.callee_ret = HashMap::default();
     }
     fn row(&mut self, i: u32) -> &mut [u32] {
         let s = i as usize * ROW_WORDS;
@@ -284,6 +308,12 @@ pub fn fn_census_row_count() -> u32 { crate::jit::with_fn_census(|c| (c.rows.len
 
 #[no_mangle]
 pub fn fn_census_rows_ptr() -> u32 { crate::jit::with_fn_census(|c| c.rows.as_ptr() as u32) }
+
+#[no_mangle]
+pub fn fn_census_call_count() -> u32 { crate::jit::with_fn_census(|c| (c.calls.len() / CALL_WORDS) as u32) }
+
+#[no_mangle]
+pub fn fn_census_calls_ptr() -> u32 { crate::jit::with_fn_census(|c| c.calls.as_ptr() as u32) }
 
 #[no_mangle]
 pub fn fn_census_range_count() -> u32 { crate::jit::with_fn_census(|c| c.ranges.len() as u32) }
@@ -547,6 +577,9 @@ pub fn fn_census_note_call(target: u32, esp: u32) {
 #[inline(never)]
 pub fn note_page_dirty(c: &mut Census, page: Page) {
     stat_add(S_SMC_DIRTIES, 1.0);
+    if !c.callee_ret.is_empty() {
+        c.callee_ret = HashMap::default();
+    }
     let rows = match c.page_rows.get(&page) {
         Some(rows) => rows.clone(),
         None => return,
@@ -796,6 +829,8 @@ struct Ctx {
     other_accesses: u32,
     x87_ops: u32,
     out_calls: u32,
+    ret_summary: u32,
+    calls: Vec<[u32; CALL_WORDS]>,
     first_refuse_eip: u32,
     first_refuse_op: u32,
     first_window_eip: u32,
@@ -820,7 +855,7 @@ impl Ctx {
     }
 }
 
-fn analyse(entry: u32, sf: CachedStateFlags) -> (Ctx, u32) {
+fn analyse(entry: u32, sf: CachedStateFlags, mut callees: Option<&mut HashMap<u32, u32, FixedHasher>>) -> (Ctx, u32) {
     let mut c = Ctx {
         unit: 0,
         window: 0,
@@ -836,6 +871,8 @@ fn analyse(entry: u32, sf: CachedStateFlags) -> (Ctx, u32) {
         other_accesses: 0,
         x87_ops: 0,
         out_calls: 0,
+        ret_summary: 0,
+        calls: Vec::new(),
         first_refuse_eip: 0,
         first_refuse_op: 0,
         first_window_eip: 0,
@@ -993,6 +1030,34 @@ fn analyse(entry: u32, sf: CachedStateFlags) -> (Ctx, u32) {
                     if op == 0xE8 {
                         c.out_calls += 1;
                         c.window |= W_OUT_CALL;
+                        let summary = match callees.as_deref_mut() {
+                            Some(cache) => match cache.get(&target) {
+                                Some(&v) => v,
+                                None => {
+                                    let v = analyse(target, sf, None).0.ret_summary;
+                                    cache.insert(target, v);
+                                    v
+                                },
+                            },
+                            None => 0,
+                        };
+                        let mut flags = 0;
+                        if summary & RET_MIXED != 0 {
+                            flags |= CALL_CALLEE_RET_MIXED;
+                        }
+                        else if summary & RET_KNOWN != 0 {
+                            flags |= CALL_CALLEE_RET_KNOWN;
+                        }
+                        c.calls.push([virt, target, flags, summary & 0xFFFF]);
+                        if unsafe { MUTATION } & M_CALLS_ESP_NEUTRAL == 0 {
+                            if flags & CALL_CALLEE_RET_KNOWN != 0 {
+                                st.esp = st.esp.map(|e| e + (summary & 0xFFFF) as i32);
+                            }
+                            else {
+                                st.esp = None;
+                                c.window |= W_CALLEE_ESP_UNKNOWN;
+                            }
+                        }
                         false
                     }
                     else if condition.is_some() {
@@ -1006,8 +1071,25 @@ fn analyse(entry: u32, sf: CachedStateFlags) -> (Ctx, u32) {
                 },
                 _ => a.no_next_instruction,
             };
+            if op == 0xFF && reg == 2 {
+                c.calls.push([virt, 0, CALL_INDIRECT, 0]);
+                if unsafe { MUTATION } & M_CALLS_ESP_NEUTRAL == 0 {
+                    st.esp = None;
+                    c.window |= W_CALLEE_ESP_UNKNOWN;
+                }
+            }
             if op == 0xC3 || op == 0xC2 {
-                if st.esp != Some(0) {
+                let imm = if op == 0xC2 { memory::read16(phys + ins.imm_at) as u32 } else { 0 };
+                c.ret_summary = if c.ret_summary == 0 {
+                    RET_KNOWN | imm
+                }
+                else if c.ret_summary & RET_MIXED != 0 || c.ret_summary & 0xFFFF != imm {
+                    RET_MIXED
+                }
+                else {
+                    c.ret_summary
+                };
+                if st.esp.map_or(false, |e| e != 0) {
                     c.window |= W_ESP_UNBALANCED;
                 }
             }
@@ -1314,7 +1396,7 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
             }
         }
     }
-    let (c, entry_phys) = analyse(entry, sf);
+    let (c, entry_phys) = analyse(entry, sf, Some(&mut census.callee_ret));
     let mut range_start = census.ranges.len() as u32;
     let mut range_count = 0;
     for &(s, e) in &c.runs {
@@ -1331,6 +1413,16 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
     }
     for &p in &c.pages {
         census.page_rows.entry(p).or_insert_with(Vec::new).push(row);
+    }
+    let call_start = (census.calls.len() / CALL_WORDS) as u32;
+    let mut call_count = 0;
+    for rec in &c.calls {
+        if census.calls.len() / CALL_WORDS >= MAX_CALLS {
+            stat_add(S_CALL_OVERFLOW, 1.0);
+            break;
+        }
+        census.calls.extend_from_slice(rec);
+        call_count += 1;
     }
     let analyses = census.row(row)[R_ANALYSES];
     let r = census.row(row);
@@ -1356,6 +1448,9 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
     r[R_RANGE_START] = range_start;
     r[R_RANGE_COUNT] = range_count;
     r[R_OUT_CALLS] = c.out_calls;
+    r[R_RET_SUMMARY] = c.ret_summary;
+    r[R_CALL_START] = call_start;
+    r[R_CALL_COUNT] = call_count;
     r[R_ANALYSES] = analyses + 1;
     r[R_FLAGS] = (r[R_FLAGS] & !ROW_FLAG_STALE) | ROW_FLAG_ANALYSED;
     for i in 0..3 {

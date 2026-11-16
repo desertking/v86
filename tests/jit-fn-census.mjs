@@ -34,10 +34,10 @@ const ITER = 30000, ITER2 = 4000;
 const MEM_SIZE = 32 * 1024 * 1024, TIMEOUT_MS = 120000;
 
 const U = { GUEST_CALL: 1, GUEST_CALL_INDIRECT: 2, INDIRECT_JUMP: 4, STATE_INSN: 8, HELPER_REENTRY: 16, PAGE_BUDGET: 32 };
-const W = { ESP_UNTRACKED: 1, ESP_ALIGN: 2, ESP_MERGE: 4, ESP_UNBALANCED: 8, OUT_CALL: 16, EXTENT_PAGES: 32 };
+const W = { ESP_UNTRACKED: 1, ESP_ALIGN: 2, ESP_MERGE: 4, ESP_UNBALANCED: 8, OUT_CALL: 16, EXTENT_PAGES: 32, CALLEE_ESP_UNKNOWN: 64 };
 const P4 = { FLDCW: 1, DEPTH_MERGE: 2, DEPTH_UNKNOWN: 4, STRICT_FPU: 8, FPU_ENV: 16, NO_X87: 32 };
 const WP = { NOT_RESIDENT: 1, READONLY: 2, NO_USER: 4, MAPPED: 8, HAS_CODE: 16, NOT_IDENTITY: 32, WRAP: 64, SS: 128, EXHAUSTED: 256, EXTENT: 512, NO_STATIC: 1024 };
-const R = { WEIP: 32, VIRT: 0, PHYS: 1, ENTRIES: 2, UNIT: 3, WSTATIC: 4, PROMO: 5, P4: 6, INSNS: 7, BLOCKS: 8, BYTES: 9, PAGES: 10, LO: 12, HI: 13, WADM: 14, WREF: 15, WSEEN: 16, WMAXP: 17, SMC: 18, FRAME: 19, OTHER: 20, X87: 21, RSTART: 24, RCOUNT: 25, FLAGS: 26, OUTCALLS: 27 };
+const R = { CSTART: 34, CCOUNT: 35, RETSUM: 36, WEIP: 32, VIRT: 0, PHYS: 1, ENTRIES: 2, UNIT: 3, WSTATIC: 4, PROMO: 5, P4: 6, INSNS: 7, BLOCKS: 8, BYTES: 9, PAGES: 10, LO: 12, HI: 13, WADM: 14, WREF: 15, WSEEN: 16, WMAXP: 17, SMC: 18, FRAME: 19, OTHER: 20, X87: 21, RSTART: 24, RCOUNT: 25, FLAGS: 26, OUTCALLS: 27 };
 
 function header(dv, entry, end)
 {
@@ -152,6 +152,20 @@ function build_census_image()
     f.emit(0x8B, 0x45, 0xE0, 0x5D, 0xC3);           // join: mov eax, [ebp-32]; pop ebp; ret
     F.reg = f.here();
     f.emit(0xB8, 0x01, 0, 0, 0, 0xC3);              // mov eax, 1; ret
+    F.cdecl = f.here();
+    f.emit(0x55, 0x8B, 0xEC, 0x6A, 0x05);           // push ebp; mov ebp, esp; push 5
+    f.call(F.reg);
+    f.emit(0x83, 0xC4, 0x04, 0x5D, 0xC3);           // add esp, 4; pop ebp; ret
+    F.icall = f.here();
+    f.emit(0x55, 0x8B, 0xEC, 0xB8); f.u32(F.leaf);  // push ebp; mov ebp, esp; mov eax, leaf
+    f.emit(0x6A, 0x01, 0xFF, 0xD0, 0x5D, 0xC3);     // push 1; call eax; pop ebp; ret
+    F.mixret = f.here();
+    f.emit(0x31, 0xC0, 0x85, 0xC0, 0x74, 0x01, 0xC3); // xor eax,eax; test eax,eax; jz +1; ret
+    f.emit(0xC2, 0x04, 0x00);                       // ret 4
+    F.mixcaller = f.here();
+    f.emit(0x55, 0x8B, 0xEC, 0x6A, 0x03);           // push ebp; mov ebp, esp; push 3
+    f.call(F.mixret);
+    f.emit(0x5D, 0xC3);                             // pop ebp; ret
     F.big = BASE + BIG_OFF;
     for(let p = 0; p < 3; p++)
     {
@@ -174,6 +188,7 @@ function build_census_image()
     a.call(F.caller); a.call(F.ind); a.call(F.fldcw); a.call(F.align);
     a.emit(0xA1); a.u32(INVL);                      // mov eax, [INVL]
     a.call(F.state); a.call(F.xmerge); a.call(F.reg); a.call(F.diamond);
+    a.call(F.cdecl); a.call(F.icall); a.call(F.mixcaller);
     a.emit(0x51); a.call(F.ebpgpr);
     a.emit(0x49); a.jnz(l1);
     a.emit(0xB9); a.u32(ITER2);
@@ -258,6 +273,7 @@ function run({ build, census, toggle, mutation = 0, jit = true, onCheck })
             const out = {
                 status, img, modules, fp, checks,
                 rows: rows_of(cpu, w),
+                calls: Array.from(new Uint32Array(cpu.wasm_memory.buffer, w.fn_census_calls_ptr() >>> 0, (w.fn_census_call_count() >>> 0) * 4)),
                 stats: Array.from({ length: w.fn_census_stat_count() }, (_, i) => w.fn_census_stat(i)),
                 gen: generation(w),
                 counter: new Uint32Array(cpu.wasm_memory.buffer, 664, 1)[0],
@@ -391,7 +407,17 @@ if(leaf[R.WADM] < ITER * 0.5) fail(`leaf window admitted ${leaf[R.WADM]} < ${ITE
 if(leaf[R.WREF] < ITER2 * 0.5) fail(`leaf window refused ${leaf[R.WREF]} < ${ITER2 * 0.5} (alias stack)`);
 if(leaf[R.WSEEN] !== WP.NOT_IDENTITY) fail(`leaf refusals seen ${hex(leaf[R.WSEEN])} != NOT_IDENTITY only`);
 if(leaf[R.ENTRIES] !== leaf[R.WADM] + leaf[R.WREF]) fail("leaf entries != admitted + refused");
-if(!(caller[R.UNIT] & U.GUEST_CALL) || !(caller[R.WSTATIC] & W.OUT_CALL) || caller[R.OUTCALLS] !== 1) fail(`caller ${hex(caller[R.UNIT])}/${hex(caller[R.WSTATIC])}`);
+if(caller[R.UNIT] !== U.GUEST_CALL || caller[R.WSTATIC] !== W.OUT_CALL || caller[R.OUTCALLS] !== 1) fail(`caller (stdcall callee) unit ${hex(caller[R.UNIT])} window ${hex(caller[R.WSTATIC])}, want guest call / out-call only`);
+const callsOf = r => Array.from({ length: r[R.CCOUNT] }, (_, i) => on.calls.slice((r[R.CSTART] + i) * 4, (r[R.CSTART] + i + 1) * 4));
+const cc = callsOf(caller);
+if(cc.length !== 1 || cc[0][1] !== F.leaf || cc[0][2] !== 2 || cc[0][3] !== 4) fail(`caller call sites ${JSON.stringify(cc)}, want one site to leaf, callee ret known, imm 4`);
+if(leaf[R.RETSUM] !== (0x10000 | 4)) fail(`leaf ret summary ${hex(leaf[R.RETSUM])}`);
+const cdecl = need("cdecl", F.cdecl), icall = need("icall", F.icall), mixcaller = need("mixcaller", F.mixcaller);
+if(cdecl[R.WSTATIC] !== W.OUT_CALL) fail(`cdecl caller window ${hex(cdecl[R.WSTATIC])}, want out-call only`);
+if(icall[R.UNIT] !== U.GUEST_CALL_INDIRECT || icall[R.WSTATIC] !== W.CALLEE_ESP_UNKNOWN) fail(`indirect caller ${hex(icall[R.UNIT])}/${hex(icall[R.WSTATIC])}`);
+const ic = callsOf(icall);
+if(ic.length !== 1 || ic[0][1] !== 0 || ic[0][2] !== 1) fail(`indirect call site ${JSON.stringify(ic)}`);
+if(!(mixcaller[R.WSTATIC] & W.CALLEE_ESP_UNKNOWN) || callsOf(mixcaller)[0]?.[2] !== 4) fail(`mixed-ret callee: caller window ${hex(mixcaller[R.WSTATIC])}, site ${JSON.stringify(callsOf(mixcaller))}`);
 if(!(ind[R.UNIT] & U.INDIRECT_JUMP)) fail(`ind unit ${hex(ind[R.UNIT])}`);
 if(fldcw[R.UNIT] !== 0 || !(fldcw[R.P4] & P4.FLDCW) || fldcw[R.WSTATIC] !== 0) fail(`fldcw ${hex(fldcw[R.UNIT])}/${hex(fldcw[R.P4])}/${hex(fldcw[R.WSTATIC])}`);
 if(align[R.UNIT] !== 0 || !(align[R.WSTATIC] & W.ESP_ALIGN)) fail(`align ${hex(align[R.UNIT])}/${hex(align[R.WSTATIC])}`);
