@@ -142,6 +142,14 @@ function build_census_image()
     f.emit(0x55, 0x89, 0xE5, 0x55);                 // push ebp; mov ebp,esp; push ebp
     f.emit(0x89, 0xC5, 0xD1, 0xED, 0x5D);           // mov ebp,eax; shr ebp,1; pop ebp
     f.emit(0x8B, 0x45, 0x08, 0xC9, 0xC2, 0x04, 0x00); // mov eax,[ebp+8]; leave; ret 4
+    F.diamond = f.here();
+    f.emit(0x55, 0x89, 0xE5);                       // push ebp; mov ebp, esp
+    f.emit(0xF7, 0xC1, 0x01, 0, 0, 0, 0x74, 0x02);  // test ecx, 1; jz wide
+    f.emit(0xEB, 0x0E);                             // jmp join
+    f.emit(0x81, 0xEC); f.u32(256);                 // wide: sub esp, 256
+    f.emit(0x89, 0xE5);                             // mov ebp, esp
+    f.emit(0x81, 0xC4); f.u32(256);                 // add esp, 256
+    f.emit(0x8B, 0x45, 0xE0, 0x5D, 0xC3);           // join: mov eax, [ebp-32]; pop ebp; ret
     F.reg = f.here();
     f.emit(0xB8, 0x01, 0, 0, 0, 0xC3);              // mov eax, 1; ret
     F.big = BASE + BIG_OFF;
@@ -165,7 +173,7 @@ function build_census_image()
     a.emit(0x51); a.call(F.leaf);                   // push ecx; call leaf
     a.call(F.caller); a.call(F.ind); a.call(F.fldcw); a.call(F.align);
     a.emit(0xA1); a.u32(INVL);                      // mov eax, [INVL]
-    a.call(F.state); a.call(F.xmerge); a.call(F.reg);
+    a.call(F.state); a.call(F.xmerge); a.call(F.reg); a.call(F.diamond);
     a.emit(0x51); a.call(F.ebpgpr);
     a.emit(0x49); a.jnz(l1);
     a.emit(0xB9); a.u32(ITER2);
@@ -178,6 +186,11 @@ function build_census_image()
     a.emit(0x88, 0x0D); a.u32(F.smc + 0x800);      // mov [smc page + 0x800], cl
     a.call(F.smc);
     a.emit(0x49); a.jnz(l2);
+    a.emit(0xC6, 0x05); a.u32(F.smc); a.emit(0xC3);   // mov byte [smc], ret: the body shrinks to RET
+    a.emit(0xB9); a.u32(ITER2);
+    const l3 = a.here();
+    a.call(F.smc);
+    a.emit(0x49); a.jnz(l3);
     a.emit(0xC7, 0x05); a.u32(STACK - 0x100); a.u32(1);  // write the stack page
     a.emit(0xA1); a.u32(READ_ONLY);                 // mov eax, [READ_ONLY]: read-only fill
     a.out(1);
@@ -194,6 +207,7 @@ function build_census_image()
     a.emit(0xC7, 0x05); a.u32(STACK - 0x100); a.u32(5);
     a.out(5);
     a.emit(0xF4);
+    build_census_image.F = F;
     return { buf, F };
 }
 
@@ -293,6 +307,8 @@ const onCheck = (v, cpu, w) => {
     const lo = STACK - 0x200, hi = STACK - 0x80;
     if(v === 1)
     {
+        proofs.ownerSmcStart = w.fn_census_owner_of(build_census_image.F.smc);
+        proofs.ownerSmcDead = w.fn_census_owner_of(build_census_image.F.smc + 4);
         proofs.a = w.fn_census_proof_admit(lo, hi);
         proofs.aValid1 = w.fn_census_proof_valid(proofs.a);
         proofs.untouched = w.fn_census_window_probe(UNTOUCHED, UNTOUCHED + 0x100);
@@ -385,6 +401,15 @@ if(align[R.WSEEN] !== WP.NO_STATIC) fail(`align probe ${hex(align[R.WSEEN])} != 
 if(!(state[R.UNIT] & U.STATE_INSN)) fail(`state unit ${hex(state[R.UNIT])}`);
 if(xmerge[R.UNIT] !== 0 || !(xmerge[R.P4] & P4.DEPTH_MERGE)) fail(`xmerge ${hex(xmerge[R.UNIT])}/${hex(xmerge[R.P4])}`);
 if(reg[R.UNIT] !== 0 || reg[R.WSTATIC] !== 0 || !(reg[R.P4] & P4.NO_X87) || reg[R.HI] !== 4 || (reg[R.LO] | 0) !== 0) fail(`reg ${JSON.stringify(reg.slice(0, 14))}`);
+const diamond = need("diamond", F.diamond);
+if(!(diamond[R.WSTATIC] & W.ESP_MERGE) || diamond[R.WADM] !== 0) fail(`diamond: equal ESP but different EBP at the join must refuse the window (window ${hex(diamond[R.WSTATIC])}, admitted ${diamond[R.WADM]}, frame [${diamond[R.LO] | 0}, ${diamond[R.HI]}))`);
+{
+    const idx = [...on.rows.keys()].indexOf(F.smc >>> 0);
+    const smcRow = on.rows.get(F.smc >>> 0) ?? [];
+    if(proofs.ownerSmcStart !== idx + 1) fail(`after SMC re-analysis owner_of(body) = ${proofs.ownerSmcStart}, want row ${idx + 1}`);
+    if(proofs.ownerSmcDead !== 0) fail(`after the body shrank to RET, owner_of(old body + 4) = ${proofs.ownerSmcDead}: an obsolete range still owns executed work`);
+    if(smcRow[R.INSNS] !== 1) fail(`smc row was not re-analysed to the 1-instruction body (${smcRow[R.INSNS]} instructions)`);
+}
 if(!(big[R.UNIT] & U.PAGE_BUDGET)) fail(`big unit ${hex(big[R.UNIT])} lacks PAGE_BUDGET`);
 if(smc[R.SMC] < ITER2 * 0.5 || smc[R.UNIT] !== 0) fail(`smc row: ${smc[R.SMC]} code-page writes recorded, unit ${hex(smc[R.UNIT])}`);
 for(const [addr, r] of on.rows) if(addr !== F.smc && r[R.SMC] !== 0) fail(`${hex(addr)}: ${r[R.SMC]} SMC events on a page nothing writes`);

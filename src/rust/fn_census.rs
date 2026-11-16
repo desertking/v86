@@ -139,6 +139,8 @@ pub const M_SKIP_IDENTITY: u32 = 1 << 0;
 pub const M_FILL_TLB: u32 = 1 << 1;
 pub const M_NO_REVOCATION: u32 = 1 << 2;
 pub const M_GENERATION_WRAPS: u32 = 1 << 3;
+pub const M_JOIN_ESP_ONLY: u32 = 1 << 5;
+pub const M_KEEP_OBSOLETE_RANGES: u32 = 1 << 6;
 
 const GENERATION_EXHAUSTED: u64 = u64::MAX;
 
@@ -161,7 +163,7 @@ static mut CAP_WINDOW_PAGES: u32 = 3;
 pub struct Census {
     rows: Vec<u32>,
     index: HashMap<u32, u32, FixedHasher>,
-    ranges: Vec<(u32, u32)>,
+    ranges: Vec<(u32, u32, u32)>,
     owners: BTreeMap<u32, (u32, u32)>,
     page_rows: HashMap<Page, Vec<u32>, FixedHasher>,
 }
@@ -289,7 +291,7 @@ pub fn fn_census_range_count() -> u32 { crate::jit::with_fn_census(|c| c.ranges.
 #[no_mangle]
 pub fn fn_census_range(i: u32, end: u32) -> u32 {
     crate::jit::with_fn_census(|c| match c.ranges.get(i as usize) {
-        Some(&(s, e)) => if end != 0 { e } else { s },
+        Some(&(s, e, _)) => if end != 0 { e } else { s },
         None => 0,
     })
 }
@@ -555,6 +557,13 @@ pub fn note_page_dirty(c: &mut Census, page: Page) {
         r[R_SMC_EVENTS] = r[R_SMC_EVENTS].saturating_add(1);
         r[R_FLAGS] |= ROW_FLAG_STALE;
     }
+}
+
+fn frame_differs(a: &FlowState, b: &FlowState) -> bool {
+    if unsafe { MUTATION } & M_JOIN_ESP_ONLY != 0 {
+        return a.esp != b.esp;
+    }
+    a.esp != b.esp || a.ebp != b.ebp || a.saved_ebp != b.saved_ebp
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -850,7 +859,10 @@ fn analyse(entry: u32, sf: CachedStateFlags) -> (Ctx, u32) {
 
     'paths: while let Some((start, mut st)) = work.pop() {
         if let Some(prev) = seen.get(&start) {
-            if prev.esp != st.esp {
+            if frame_differs(prev, &st) {
+                if c.window == 0 {
+                    c.first_window_eip = start;
+                }
                 c.window |= W_ESP_MERGE;
             }
             if prev.x87 != st.x87 {
@@ -869,7 +881,10 @@ fn analyse(entry: u32, sf: CachedStateFlags) -> (Ctx, u32) {
         let mut run: Option<(u32, u32)> = None;
         loop {
             if let Some(prev) = seen.get(&virt) {
-                if prev.esp != st.esp {
+                if frame_differs(prev, &st) {
+                    if c.window == 0 {
+                        c.first_window_eip = virt;
+                    }
                     c.window |= W_ESP_MERGE;
                 }
                 if prev.x87 != st.x87 {
@@ -1281,6 +1296,24 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
             v.retain(|&x| x != row);
         }
     }
+    let (old_start, old_count) = {
+        let r = census.row(row);
+        (r[R_RANGE_START] as usize, r[R_RANGE_COUNT] as usize)
+    };
+    let old_count = if unsafe { MUTATION } & M_KEEP_OBSOLETE_RANGES != 0 { 0 } else { old_count };
+    for i in old_start..(old_start + old_count).min(census.ranges.len()) {
+        let (s, e, owner) = census.ranges[i];
+        census.ranges[i] = (0, 0, u32::MAX);
+        if owner != row || e <= s {
+            continue;
+        }
+        if census.owners.get(&s) == Some(&(e, row)) {
+            census.owners.remove(&s);
+            if let Some(&(s2, e2, r2)) = census.ranges.iter().find(|&&(s2, e2, r2)| s2 == s && e2 > s2 && r2 != row && r2 != u32::MAX) {
+                census.owners.insert(s2, (e2, r2));
+            }
+        }
+    }
     let (c, entry_phys) = analyse(entry, sf);
     let mut range_start = census.ranges.len() as u32;
     let mut range_count = 0;
@@ -1289,7 +1322,7 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
             stat_add(S_RANGE_OVERFLOW, 1.0);
             break;
         }
-        census.ranges.push((s, e));
+        census.ranges.push((s, e, row));
         census.owners.entry(s).or_insert((e, row));
         range_count += 1;
     }
