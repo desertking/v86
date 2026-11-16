@@ -3483,10 +3483,17 @@ pub fn instr16_E8_jit(ctx: &mut JitContext, _imm: u32) {
     codegen::gen_push16(ctx, &value_local);
     ctx.builder.free_local(value_local);
 }
-pub fn instr32_E8_jit(ctx: &mut JitContext, _imm: u32) {
+pub fn instr32_E8_jit(ctx: &mut JitContext, imm: u32) {
     codegen::gen_get_real_eip(ctx);
     let value_local = ctx.builder.set_new_local();
     codegen::gen_push32(ctx, &value_local);
+    if crate::fn_census::enabled() {
+        ctx.builder.get_local(&value_local);
+        ctx.builder.const_i32(imm as i32);
+        ctx.builder.add_i32();
+        codegen::gen_get_reg32(ctx, regs::ESP);
+        ctx.builder.call_fn2("fn_census_note_call");
+    }
     ctx.builder.free_local(value_local);
 }
 
