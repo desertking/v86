@@ -1478,3 +1478,44 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
         r[R_CODE_PAGE0 + i] = c.pages.get(i).map_or(0, |p| p.to_address() >> 12);
     }
 }
+
+pub struct UnitCandidate {
+    pub phys: u32,
+    pub entries: u32,
+    pub unit: u32,
+    pub window: u32,
+    pub ret_summary: u32,
+    pub analyses: u32,
+    pub current: bool,
+    pub pages: Vec<Page>,
+    pub runs: Vec<(u32, u32)>,
+}
+
+pub fn unit_candidate(c: &mut Census, virt: u32) -> Option<UnitCandidate> {
+    let row = *c.index.get(&virt)?;
+    let r = c.row(row);
+    let flags = r[R_FLAGS];
+    let pages = (0..3)
+        .filter(|&i| r[R_CODE_PAGE0 + i] != 0)
+        .map(|i| Page::page_of(r[R_CODE_PAGE0 + i] << 12))
+        .collect::<Vec<Page>>();
+    let (start, count) = (r[R_RANGE_START] as usize, r[R_RANGE_COUNT] as usize);
+    let mut cand = UnitCandidate {
+        phys: r[R_ENTRY_PHYS],
+        entries: r[R_ENTRIES],
+        unit: r[R_UNIT_REFUSE],
+        window: r[R_WINDOW_STATIC],
+        ret_summary: r[R_RET_SUMMARY],
+        analyses: r[R_ANALYSES],
+        current: flags & ROW_FLAG_ANALYSED != 0 && flags & ROW_FLAG_STALE == 0,
+        pages,
+        runs: Vec::new(),
+    };
+    for i in start..(start + count).min(c.ranges.len()) {
+        let (s, e, owner) = c.ranges[i];
+        if owner == row && e > s {
+            cand.runs.push((s, e));
+        }
+    }
+    Some(cand)
+}
