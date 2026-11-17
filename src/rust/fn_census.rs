@@ -159,6 +159,7 @@ pub const M_GENERATION_WRAPS: u32 = 1 << 3;
 pub const M_JOIN_ESP_ONLY: u32 = 1 << 5;
 pub const M_KEEP_OBSOLETE_RANGES: u32 = 1 << 6;
 pub const M_CALLS_ESP_NEUTRAL: u32 = 1 << 4;
+pub const M_NO_CALLEE_DEPS: u32 = 1 << 7;
 
 const GENERATION_EXHAUSTED: u64 = u64::MAX;
 
@@ -185,7 +186,8 @@ pub struct Census {
     owners: BTreeMap<u32, (u32, u32)>,
     page_rows: HashMap<Page, Vec<u32>, FixedHasher>,
     calls: Vec<u32>,
-    callee_ret: HashMap<u32, u32, FixedHasher>,
+    callee_ret: HashMap<u32, (u32, Vec<Page>), FixedHasher>,
+    row_deps: HashMap<u32, Vec<Page>, FixedHasher>,
 }
 
 impl Census {
@@ -198,6 +200,7 @@ impl Census {
             page_rows: HashMap::default(),
             calls: Vec::new(),
             callee_ret: HashMap::default(),
+            row_deps: HashMap::default(),
         }
     }
     fn clear(&mut self) {
@@ -208,6 +211,7 @@ impl Census {
         self.page_rows = HashMap::default();
         self.calls = Vec::new();
         self.callee_ret = HashMap::default();
+        self.row_deps = HashMap::default();
     }
     fn row(&mut self, i: u32) -> &mut [u32] {
         let s = i as usize * ROW_WORDS;
@@ -831,6 +835,7 @@ struct Ctx {
     out_calls: u32,
     ret_summary: u32,
     calls: Vec<[u32; CALL_WORDS]>,
+    dep_pages: Vec<Page>,
     first_refuse_eip: u32,
     first_refuse_op: u32,
     first_window_eip: u32,
@@ -855,7 +860,7 @@ impl Ctx {
     }
 }
 
-fn analyse(entry: u32, sf: CachedStateFlags, mut callees: Option<&mut HashMap<u32, u32, FixedHasher>>) -> (Ctx, u32) {
+fn analyse(entry: u32, sf: CachedStateFlags, mut callees: Option<&mut HashMap<u32, (u32, Vec<Page>), FixedHasher>>) -> (Ctx, u32) {
     let mut c = Ctx {
         unit: 0,
         window: 0,
@@ -873,6 +878,7 @@ fn analyse(entry: u32, sf: CachedStateFlags, mut callees: Option<&mut HashMap<u3
         out_calls: 0,
         ret_summary: 0,
         calls: Vec::new(),
+        dep_pages: Vec::new(),
         first_refuse_eip: 0,
         first_refuse_op: 0,
         first_window_eip: 0,
@@ -1031,13 +1037,20 @@ fn analyse(entry: u32, sf: CachedStateFlags, mut callees: Option<&mut HashMap<u3
                         c.out_calls += 1;
                         c.window |= W_OUT_CALL;
                         let summary = match callees.as_deref_mut() {
-                            Some(cache) => match cache.get(&target) {
-                                Some(&v) => v,
-                                None => {
-                                    let v = analyse(target, sf, None).0.ret_summary;
-                                    cache.insert(target, v);
-                                    v
-                                },
+                            Some(cache) => {
+                                if !cache.contains_key(&target) {
+                                    let callee = analyse(target, sf, None).0;
+                                    cache.insert(target, (callee.ret_summary, callee.pages));
+                                }
+                                let (v, pages) = &cache[&target];
+                                if unsafe { MUTATION } & M_NO_CALLEE_DEPS == 0 {
+                                    for p in pages {
+                                        if !c.dep_pages.contains(p) {
+                                            c.dep_pages.push(*p);
+                                        }
+                                    }
+                                }
+                                *v
                             },
                             None => 0,
                         };
@@ -1373,7 +1386,8 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
         let r = census.row(row);
         (0..3).filter(|&i| r[R_CODE_PAGE0 + i] != 0).map(|i| Page::page_of(r[R_CODE_PAGE0 + i] << 12)).collect()
     };
-    for p in old_pages {
+    let old_deps = census.row_deps.remove(&row).unwrap_or_default();
+    for p in old_pages.into_iter().chain(old_deps.into_iter()) {
         if let Some(v) = census.page_rows.get_mut(&p) {
             v.retain(|&x| x != row);
         }
@@ -1413,6 +1427,13 @@ fn analyse_into(census: &mut Census, row: u32, entry: u32, sf: CachedStateFlags)
     }
     for &p in &c.pages {
         census.page_rows.entry(p).or_insert_with(Vec::new).push(row);
+    }
+    let deps: Vec<Page> = c.dep_pages.iter().copied().filter(|p| !c.pages.contains(p)).collect();
+    if !deps.is_empty() {
+        for &p in &deps {
+            census.page_rows.entry(p).or_insert_with(Vec::new).push(row);
+        }
+        census.row_deps.insert(row, deps);
     }
     let call_start = (census.calls.len() / CALL_WORDS) as u32;
     let mut call_count = 0;

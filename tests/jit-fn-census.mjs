@@ -226,6 +226,43 @@ function build_census_image()
     return { buf, F };
 }
 
+function build_dep_image()
+{
+    const buf = new Uint8Array(IMAGE);
+    header(new DataView(buf.buffer), BASE + ENTRY_OFF, BASE + IMAGE);
+    const F = { caller: BASE + 0x1000, callee: BASE + 0x2000, other: BASE + 0x3000, other2: BASE + 0x4000 };
+    const c = asm(buf, 0x1000);
+    c.emit(0x55, 0x8B, 0xEC, 0x6A, 0x01);           // push ebp; mov ebp, esp; push 1
+    c.call(F.callee);
+    c.emit(0xC9, 0xC3);                             // leave; ret
+    asm(buf, 0x2000).emit(0xC2, 0x04, 0x00);        // ret 4
+    const o = asm(buf, 0x3000);
+    o.emit(0xB8, 0x02, 0, 0, 0);                    // mov eax, 2
+    o.call(F.other2);
+    o.emit(0xC3);
+    asm(buf, 0x4000).emit(0xC3);
+    const a = asm(buf, ENTRY_OFF);
+    prologue(buf, a);
+    a.emit(0xB9); a.u32(200000);
+    const l1 = a.here();
+    a.call(F.caller); a.call(F.other);
+    a.emit(0x49); a.jnz(l1);
+    a.out(1);
+    a.emit(0xB9); a.u32(ITER2);
+    const l2 = a.here();
+    a.emit(0x88, 0x0D); a.u32(F.other2 + 0x800);    // mov [other2 page + 0x800], cl: a callee page the caller does not use
+    a.call(F.caller); a.call(F.other);
+    a.emit(0x49); a.jnz(l2);
+    a.out(2);
+    a.emit(0xC6, 0x05); a.u32(F.callee + 1); a.emit(0x08);   // the callee becomes ret 8
+    a.emit(0xB9); a.u32(200000);
+    const l3 = a.here();
+    a.call(F.caller);
+    a.emit(0x49); a.jnz(l3);
+    a.emit(0xF4);
+    return { buf, F };
+}
+
 function build_fault_image(k, iters = 200000)
 {
     const buf = new Uint8Array(IMAGE);
@@ -463,6 +500,26 @@ if(P.aValid4 !== 0 || P.bValid4 !== 0) fail(`two revocations later A/B must stay
 if(!P.c || P.cValid4 !== 1) fail("proof C at the last generation not admitted");
 if(P.cValid5 !== 0) fail("proof C valid after the generation was exhausted");
 if(!(P.exhausted & WP.EXHAUSTED) || P.dAdmit !== 0) fail(`exhausted generation still admits (${hex(P.exhausted)}/${P.dAdmit})`);
+
+{
+    const snap = (cpu, w) => {
+        const rows = rows_of(cpu, w);
+        const calls = Array.from(new Uint32Array(cpu.wasm_memory.buffer, w.fn_census_calls_ptr() >>> 0, (w.fn_census_call_count() >>> 0) * 4));
+        return { rows, calls };
+    };
+    const at = {};
+    const dep = await run({ build: build_dep_image, census: true, mutation: MUTATION, onCheck: (v, cpu, w) => { at[v] = snap(cpu, w); return true; } });
+    at.end = { rows: dep.rows, calls: dep.calls };
+    const F2 = dep.img.F;
+    const siteOf = (s, addr) => { const r = s?.rows.get(addr >>> 0); return r && r[R.CCOUNT] ? { row: r, site: s.calls.slice(r[R.CSTART] * 4, r[R.CSTART] * 4 + 4) } : { row: r }; };
+    if(dep.status !== "halt" || !at[1] || !at[2]) fail(`dependency fixture did not finish (${dep.status})`);
+    const p1 = siteOf(at[1], F2.caller), p2 = siteOf(at[2], F2.caller), p3 = siteOf(at.end, F2.caller);
+    if(p1.site?.[1] !== F2.callee || p1.site?.[3] !== 4) fail(`dependency fixture: caller site before the write ${JSON.stringify(p1.site)}, want callee imm 4`);
+    const o2 = siteOf(at[2], F2.other);
+    if(!o2.row || o2.row[R.SMC] === 0) fail("dependency fixture: the caller of the written page was not marked stale");
+    if(p2.row?.[R.SMC] !== 0 || p2.site?.[3] !== 4) fail(`a write to an unrelated callee page touched the caller (${p2.row?.[R.SMC]} SMC events, site ${JSON.stringify(p2.site)})`);
+    if(!p3.row || p3.row[R.SMC] === 0 || p3.site?.[3] !== 8) fail(`the callee's ret imm changed to 8 on another page, the caller still reports ${JSON.stringify(p3.site)} (${p3.row?.[R.SMC]} SMC events)`);
+}
 
 const K = 24;
 const faultJit = await run({ build: () => build_fault_image(K), census: true });
