@@ -30,6 +30,7 @@ use std::ptr;
 mod wasm {
     extern "C" {
         pub fn call_indirect1(f: i32, x: u16);
+        pub fn call_indirect1_i32(f: i32, x: i32);
     }
 }
 
@@ -3330,7 +3331,13 @@ pub unsafe fn cycle_internal() {
     if crate::fn_unit::enabled() && !DBG_ENABLED {
         if let Some(unit) = jit::fn_unit_lookup(initial_eip as u32, initial_state_flags) {
             let initial_instruction_counter = *instruction_counter;
-            wasm::call_indirect1(unit.index as i32 + WASM_TABLE_OFFSET as i32, unit.state);
+            if unit.chain {
+                crate::fn_unit::reset_depth();
+                wasm::call_indirect1_i32(unit.index as i32 + WASM_TABLE_OFFSET as i32, unit.ret_addr as i32);
+            }
+            else {
+                wasm::call_indirect1(unit.index as i32 + WASM_TABLE_OFFSET as i32, unit.state);
+            }
             jit::fn_unit_note_return(&unit, (*instruction_counter).wrapping_sub(initial_instruction_counter));
             return;
         }
