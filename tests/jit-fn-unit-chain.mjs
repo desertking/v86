@@ -516,7 +516,12 @@ function run(opts)
                 fp = { before: fp0, census: fp1, after: [w.jit_codegen_fingerprint_lo() >>> 0, w.jit_codegen_fingerprint_hi() >>> 0], defaults };
                 w.jit_set_region_exclusion(BASE + FN_LO, BASE + FN_HI);
                 globalThis.__jitPublicationCapture = {
-                    begin(start, tableIndex) { modules.push({ start, tableIndex }); return null; },
+                    begin(start, tableIndex, slot, code) {
+                        let h = 0x811C9DC5;
+                        for(const b of code) h = Math.imul(h ^ b, 0x01000193) >>> 0;
+                        modules.push({ start, tableIndex, hash: h, length: code.length });
+                        return null;
+                    },
                 };
                 cpu.jit_clear_cache?.();
                 freeInitial = w.jit_aot_free_table_index_count() >>> 0;
@@ -677,8 +682,26 @@ for(const [name, r] of [["off", off], ["offAfterOn", offAfterOn], ["interpreter"
     if(r.counters.some(v => v !== 0)) fail(`${name}: chain counters moved while off: ${r.counters}`);
     if(r.count !== 0) fail(`${name}: units published while off`);
 }
-const ours = r => [...new Set(r.modules.filter(m => m.start >= BASE && m.start < BASE + IMAGE).map(m => m.start))].sort((x, y) => x - y).join(",");
-if(ours(off) !== ours(offAfterOn)) fail("page modules differ after enabling and disabling units, chain and and-esp");
+// Which pages get compiled when, and with which entry points, depends on instantiation timing in
+// two independent runs; every page compiled in both must have at least one byte-identical module.
+{
+    const byStart = r => {
+        const m = new Map();
+        for(const x of r.modules.filter(x => x.start >= BASE && x.start < BASE + IMAGE))
+            m.set(x.start, (m.get(x.start) ?? new Set()).add(x.hash + ":" + x.length));
+        return m;
+    };
+    const a = byStart(off), b = byStart(offAfterOn);
+    let common = 0;
+    for(const [start, hs] of a)
+    {
+        const o = b.get(start);
+        if(!o) continue;
+        common++;
+        if(![...hs].some(h => o.has(h))) fail(`page module at ${hex(start)} differs after enabling and disabling units, chain and and-esp`);
+    }
+    if(common === 0) fail("off and offAfterOn compiled no common page module");
+}
 if(units.counters.some(v => v !== 0)) fail(`units: chain counters moved with the chain off: ${units.counters}`);
 if(units.stats[S.SITES] !== 0) fail("units: chain sites compiled with the chain off");
 
