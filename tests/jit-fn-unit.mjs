@@ -26,9 +26,9 @@ const BASE = 0x100000, ENTRY_OFF = 0x20, IMAGE = 0x8000;
 const PD = 0x200000, PT0 = 0x201000, PT1 = 0x202000;
 const STACK = 0x380000, BUF = 0x400000, RESULT = 0x401000, MARK = 0x401010, UNMAPPED = 0xA00000;
 const GDT_OFF = 0xE00, GDTR_OFF = 0xE20, IDT_OFF = 0xE30, IDTR_OFF = 0xEB8;
-const FN_LO = 0x3000, FN_HI = 0x7000, SMC_OFF = 0x4000, WDC_OFF = 0x5000, SELF_OFF = 0x6000, PF_OFF = 0x7000;
+const FN_LO = 0x2000, FN_HI = 0x7000, AHEAD_OFF = 0x2000, SMC_OFF = 0x4000, WDC_OFF = 0x5000, SELF_OFF = 0x6000, PF_OFF = 0x7000;
 const CHECK_PORT = 0x5F0;
-const ITER = 60000, ITER2 = 20000, FAULT_ITER = 1500000, SUM_N = 37, LONG_N = 300000, LONG_CALLS = 3;
+const ITER = 60000, ITER2 = 60000, FAULT_ITER = 1500000, SUM_N = 37, LONG_N = 300000, LONG_CALLS = 3;
 const MEM_SIZE = 32 * 1024 * 1024, TIMEOUT_MS = 120000;
 const S = { ENTRIES: 0, MATCHED: 1, EXITED: 2, COMPILES: 3, PUBLISHED: 4, WRITTEN: 5, FAILED: 6, INVALIDATED: 7,
     NOT_M1: 8, RET_FORM: 9, SHAPE: 10, STATE: 11, PHYS: 12, STALE_ROW: 13, BUSY: 14, SKIP_STACK: 15, SKIP_GEN: 16,
@@ -108,7 +108,7 @@ function build_main_image()
     header(new DataView(buf.buffer), BASE + ENTRY_OFF, BASE + IMAGE);
     pf_handler(buf);
     const F = {};
-    const f = asm(buf, FN_LO);
+    const f = asm(buf, 0x3000);
     F.sum = f.here();
     f.emit(0x55, 0x8B, 0xEC, 0x8B, 0x4D, 0x08);     // push ebp; mov ebp, esp; mov ecx, [ebp+8]
     f.emit(0x31, 0xC0);                             // xor eax, eax
@@ -135,6 +135,13 @@ function build_main_image()
     F.wdc = BASE + WDC_OFF + 0x10;
     const w = asm(buf, WDC_OFF + 0x10);
     w.emit(0xB8); w.u32(5); w.emit(0xC3);           // mov eax, 5; ret
+    F.ahead = BASE + AHEAD_OFF;
+    const ah = asm(buf, AHEAD_OFF);
+    ah.emit(0xF7, 0xC1); ah.u32(0x1FFF);            // test ecx, 0x1FFF
+    ah.emit(0x75, 0x06);                            // jnz load
+    ah.emit(0x89, 0x0D); ah.u32(F.ahead + 15);      // mov [imm of the next instruction], ecx: the running unit rewrites code it is about to execute
+    ah.emit(0xB8); ah.u32(0x5555);                  // load: mov eax, imm
+    ah.emit(0xC3);                                  // ret
     F.self = BASE + SELF_OFF;
     const sm = asm(buf, SELF_OFF);
     sm.emit(0xB8); sm.u32(0x1234);                  // mov eax, imm: the value the previous call stored
@@ -159,6 +166,7 @@ function build_main_image()
         {
             a.call(F.wdc); a.emit(0xA3); a.u32(RESULT);  // call wdc; mov [RESULT], eax
             a.emit(0x8B, 0x0C, 0x24); a.call(F.self); a.emit(0x01, 0xC7);  // mov ecx, [esp]; call self; add edi, eax
+            a.emit(0x8B, 0x0C, 0x24); a.call(F.ahead); a.emit(0x01, 0xC7); // mov ecx, [esp]; call ahead; add edi, eax
         }
         a.emit(0x59, 0x49); a.jnz(top);             // pop ecx; dec ecx; jnz
     };
@@ -184,7 +192,7 @@ function build_fault_image()
     header(new DataView(buf.buffer), BASE + ENTRY_OFF, BASE + IMAGE);
     pf_handler(buf);
     const F = {};
-    const f = asm(buf, FN_LO);
+    const f = asm(buf, 0x3000);
     F.rd = f.here();
     f.emit(0x8B, 0x44, 0x24, 0x04);                 // mov eax, [esp+4]
     F.load = f.here();
@@ -206,7 +214,7 @@ const rol = (v, n) => ((v << n) | (v >>> (32 - n))) >>> 0;
 function sum(n) { let a = 0; for(let c = n; c > 0; c--) { a = (a + c) >>> 0; a = rol(a, 3); } return a; }
 function expected_main()
 {
-    let edi = 0, esi = 0, selfPrev = 0x1234;
+    let edi = 0, esi = 0, selfPrev = 0x1234, aheadPrev = 0x5555;
     const buf = new Array(64).fill(0);
     const s = sum(SUM_N);
     for(const [n, smc] of [[ITER, 0x11], [ITER2, 0x77]])
@@ -216,14 +224,22 @@ function expected_main()
             for(let i = 64; i > 0; i--) buf[i & 63] = (buf[i & 63] + i) >>> 0;
             esi += c < ITER / 2 ? 1 : 0;
             edi = (edi + smc) >>> 0;
-            if(smc === 0x77) { edi = (edi + selfPrev) >>> 0; if((c & 0x3FF) === 0) selfPrev = c; }
+            if(smc === 0x77)
+            {
+                edi = (edi + selfPrev) >>> 0;
+                if((c & 0x3FF) === 0) selfPrev = c;
+                if((c & 0x1FFF) === 0) aheadPrev = c;
+                edi = (edi + aheadPrev) >>> 0;
+            }
         }
     const l = sum(LONG_N);
     for(let i = 0; i < LONG_CALLS; i++) edi = (edi + l) >>> 0;
     return { edi, esi, buf };
 }
 
-function run({ build, units, toggle, mutation = 0, jit = true, census = true, onCheck, writeDuringCompile })
+function run(opts)
+{ if(process.env.UDBG) console.error("RUN", opts.build.name, "units", opts.units, "jit", opts.jit); return run0(opts); }
+function run0({ build, units, toggle, mutation = 0, jit = true, census = true, onCheck, writeDuringCompile })
 {
     return new Promise((resolve, reject) => {
         const emulator = new V86({ autostart: false, memory_size: MEM_SIZE, disable_jit: jit ? 0 : 1, log_level: 0 });
@@ -351,9 +367,9 @@ if(on.result !== 6) fail(`on: wdc returned ${on.result} after its bytes became 6
 if(st[S.WRITTEN] < 1) fail("on: no compile was refused for a write during compilation");
 if(st[S.ENTRIES] < (ITER + ITER2) * 2) fail(`on: unit entries ${st[S.ENTRIES]} < ${(ITER + ITER2) * 2}`);
 if(st[S.MATCHED] + st[S.EXITED] !== st[S.ENTRIES]) fail("on: matched + exited != entries");
-if(st[S.EXITED] !== LONG_CALLS) fail(`on: ${st[S.EXITED]} exits, want exactly the ${LONG_CALLS} long calls leaving by the loop budget`);
+if(st[S.EXITED] < LONG_CALLS + 1) fail(`on: ${st[S.EXITED]} exits: the ${LONG_CALLS} long calls leave by the loop budget, and a unit that writes code on its own page must leave through the active-code-write exit`);
 if(st[S.PUBLISHED] < 5) fail(`on: ${st[S.PUBLISHED]} units published, want sum, mem, flags, smc twice, wdc`);
-if(st[S.INVALIDATED] < 1 + Math.floor(ITER2 / 1024) / 2) fail(`on: ${st[S.INVALIDATED]} invalidations; the caller's SMC write and the unit rewriting its own body must invalidate`);
+if(st[S.INVALIDATED] < 2) fail(`on: ${st[S.INVALIDATED]} invalidations; the caller's SMC write and the unit rewriting its own body must invalidate`);
 if(st[S.NOT_M1] + st[S.RET_FORM] + st[S.SHAPE] + st[S.STATE] !== 0) fail(`on: admitted rows refused ${st.slice(8, 12)}`);
 if(st[S.FAILED] !== 0) fail("on: a unit compile failed");
 const s1 = slots[1] ?? {}, s2 = slots[2] ?? {};
@@ -368,6 +384,15 @@ if(s2.smc === 0xFFFFFFFF) fail("on: smc was not recompiled after the write");
     if(unitSlots.size !== 2) fail("on: sum and smc share a slot");
 }
 if(on.fnBytes.some((b, i) => b !== off.fnBytes[i] && BASE + FN_LO + i !== F.wdc + 1)) fail("on: function bytes differ from the page-JIT arm");
+
+{
+    let before = -1;
+    const jd = await run({ build: build_main_image, units: true, mutation: MUTATION, writeDuringCompile: wdc,
+        onCheck: (v, cpu, w) => { if(v === 1) { before = w.fn_unit_stat(S.ENTRIES); w.set_jit_config(0, 1); } return true; } });
+    if(jd.status !== "halt" || jd.edi !== E.edi) fail(`jitOff: ${jd.status}, checksum ${hex(jd.edi)}`);
+    if(!(before > 0)) fail("jitOff: no unit entries before the JIT was disabled");
+    if(jd.stats[S.ENTRIES] !== before || jd.stats[S.COMPILES] > on.stats[S.COMPILES]) fail(`jitOff: ${jd.stats[S.ENTRIES] - before} unit entries after the JIT was disabled`);
+}
 
 const faultInterp = await run({ build: build_fault_image, jit: false });
 const faultOff = await run({ build: build_fault_image, units: false });

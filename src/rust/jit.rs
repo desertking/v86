@@ -2603,12 +2603,21 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     let used = HashSet::from_iter(ctx.pages.values().map(|info| info.wasm_table_index));
     let compiling = HashSet::from_iter(ctx.compiling.as_ref().map(|&(index, _)| index));
     let staged = HashSet::from_iter(ctx.aot_staged.as_ref().map(|tx| tx.wasm_table_index));
+    let units: HashSet<WasmTableIndex> = ctx.fn_unit.units.values().map(|u| u.index).collect();
+    dbg_assert!(units.len() == ctx.fn_unit.units.len());
+    dbg_assert!(free.intersection(&units).next().is_none());
+    dbg_assert!(used.intersection(&units).next().is_none());
+    dbg_assert!(compiling.intersection(&units).next().is_none());
+    dbg_assert!(staged.intersection(&units).next().is_none());
     dbg_assert!(free.intersection(&used).next().is_none());
     dbg_assert!(used.intersection(&compiling).next().is_none());
     dbg_assert!(free.intersection(&staged).next().is_none());
     dbg_assert!(used.intersection(&staged).next().is_none());
     dbg_assert!(compiling.intersection(&staged).next().is_none());
-    dbg_assert!(free.len() + used.len() + compiling.len() + staged.len() == (WASM_TABLE_SIZE - 1) as usize);
+    dbg_assert!(
+        free.len() + used.len() + compiling.len() + staged.len() + units.len()
+            == (WASM_TABLE_SIZE - 1) as usize
+    );
 
     let hidden: HashSet<WasmTableIndex> = ctx
         .pages
@@ -7124,7 +7133,7 @@ pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_ji
 /// or as a hidden, superseded one that may still be running)? Upstream 2b49f4b7.
 pub fn jit_page_has_wasm_table_index(page: Page, wasm_table_index: u16) -> bool {
     let ctx = get_jit_state();
-    match ctx.pages.get(&page) {
+    let in_page = match ctx.pages.get(&page) {
         Some(info) => {
             info.wasm_table_index.to_u16() == wasm_table_index
                 || info
@@ -7133,7 +7142,8 @@ pub fn jit_page_has_wasm_table_index(page: Page, wasm_table_index: u16) -> bool 
                     .any(|w| w.to_u16() == wasm_table_index)
         },
         None => false,
-    }
+    };
+    in_page || ctx.fn_unit.slot_has_page(wasm_table_index, page)
 }
 
 fn jit_page_has_code_ctx(ctx: &mut JitState, page: Page) -> bool {
@@ -7835,6 +7845,9 @@ fn fn_unit_maybe_compile(ctx: &mut JitState, virt: u32, state_flags: CachedState
 /// Dispatcher side: the unit to enter at `virt`, if one is current. Compiles admitted rows.
 pub unsafe fn fn_unit_lookup(virt: u32, state_flags: CachedStateFlags) -> Option<FnUnitEntry> {
     use crate::fn_unit::*;
+    if unsafe { JIT_DISABLED } {
+        return None;
+    }
     let mut ctx = get_jit_state();
     let (phys, index, state, generation, flags, ret_imm) = match ctx.fn_unit.units.get(&virt) {
         Some(u) => (u.phys, u.index, u.state, u.generation, u.state_flags, u.ret_imm),

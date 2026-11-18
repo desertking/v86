@@ -53,6 +53,7 @@ pub const STAT_COUNT: usize = 20;
 pub const M_NO_INVALIDATION: u32 = 1 << 0;
 pub const M_NO_GENERATION_CHECK: u32 = 1 << 1;
 pub const M_RESUME_AFTER_EXIT: u32 = 1 << 2;
+pub const M_NO_ACTIVE_WRITE_EXIT: u32 = 1 << 3;
 
 static mut ENABLED: bool = false;
 static mut MUTATION: u32 = 0;
@@ -99,6 +100,11 @@ impl Units {
     }
 
     pub fn generation(&self, virt: u32) -> u32 { *self.generations.get(&virt).unwrap_or(&0) }
+
+    /// The active-code-write owner asks whether the slot running a store owns `page`.
+    pub fn slot_has_page(&self, index: u16, page: Page) -> bool {
+        !mutation(M_NO_ACTIVE_WRITE_EXIT) && !self.units.is_empty() && self.units.values().any(|u| u.index.to_u16() == index && u.pages.contains(&page))
+    }
 
     pub fn track_pages(&mut self, virt: u32, pages: &[Page]) {
         for &p in pages {
