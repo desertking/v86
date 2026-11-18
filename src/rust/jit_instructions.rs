@@ -3486,6 +3486,7 @@ pub fn instr16_E8_jit(ctx: &mut JitContext, _imm: u32) {
 pub fn instr32_E8_jit(ctx: &mut JitContext, imm: u32) {
     if ctx.unit_chain.is_some() {
         if let Some(site) = crate::jit::unit_chain().and_then(|c| c.sites.get(&ctx.start_of_current_instruction).copied()) {
+            dbg_assert!(site.site_virt.wrapping_add(ctx.cpu.eip.wrapping_sub(ctx.start_of_current_instruction)).wrapping_add(imm) == site.target);
             crate::jit::gen_unit_chain_call(ctx, imm, site);
             return;
         }

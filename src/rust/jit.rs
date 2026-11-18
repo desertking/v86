@@ -4225,7 +4225,9 @@ fn jit_find_basic_blocks(
 
     let basic_blocks: Vec<BasicBlock> = basic_blocks.into_iter().map(|(_, block)| block).collect();
 
-    for i in 0..basic_blocks.len() - 1 {
+    // Empty when a function unit's only entry lies in the last bytes of its page without page
+    // tails; fn_unit_compile then refuses the shape.
+    for i in 0..basic_blocks.len().saturating_sub(1) {
         let next_block_addr = basic_blocks[i + 1].addr;
         let next_block_end_addr = basic_blocks[i + 1].end_addr;
         let next_block_is_entry = basic_blocks[i + 1].is_entry_block;
@@ -7761,6 +7763,9 @@ fn fn_unit_compile(
         let token = next_token();
         let (sites, callees, waiting) =
             unit_chain_sites(ctx, virt, cand.phys, state_flags, own_chain.to_u16(), own_slot.to_u16(), token);
+        let mut links: Vec<u32> = sites.values().map(|s| s.target).collect();
+        links.sort_unstable();
+        links.dedup();
         unsafe {
             UNIT_CHAIN = Some(UnitChainCompile {
                 sites,
@@ -7770,7 +7775,7 @@ fn fn_unit_compile(
                 mode: chain_mode(),
             })
         };
-        Some((token, callees, waiting))
+        Some((token, callees, waiting, links))
     }
     else if chain_mode() != 0 {
         return Err(S_DEFERRED_BUSY);
@@ -7897,7 +7902,7 @@ fn fn_unit_compile(
     cpu::tlb_set_has_code_multiple(&pages, true);
     ctx.fn_unit.track_pages(virt, &page_list);
     let generation = ctx.fn_unit.generation(virt);
-    let (token, callees, waiting_on) = chain_compile.unwrap_or((0, Vec::new(), Vec::new()));
+    let (token, callees, waiting_on, links) = chain_compile.unwrap_or((0, Vec::new(), Vec::new(), Vec::new()));
     ctx.fn_unit.pending = Some(Pending {
         virt,
         phys: cand.phys,
@@ -7910,6 +7915,7 @@ fn fn_unit_compile(
         token,
         callees,
         waiting_on,
+        links,
     });
     ctx.compiling = Some((wasm_table_index, CompilingPageState::Unit));
     stat_add(S_COMPILES, 1.0);
@@ -7982,6 +7988,7 @@ fn fn_unit_finished(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
             ret_imm: p.ret_imm,
             chain: p.chain,
             token: p.token,
+            links: p.links,
         },
     );
     if p.chain.is_some() {
@@ -8018,7 +8025,10 @@ fn fn_unit_maybe_compile(ctx: &mut JitState, virt: u32, state_flags: CachedState
         stat_add(S_REFUSE_STALE_ROW, 1.0);
         return;
     }
-    if !state_flags.is_32() || !state_flags.has_flat_segmentation() {
+    if !state_flags.is_32()
+        || !state_flags.has_flat_segmentation()
+        || !state_flags.ssize_32() && !mutation(M_ADMIT_SS16)
+    {
         return refuse(ctx, S_REFUSE_STATE);
     }
     let (unit_ok, window_ok) = {
@@ -8135,7 +8145,8 @@ fn chain_flag_addrs() -> [u32; 5] {
 }
 
 /// Body of `f`, the dispatcher entry of a chain-layout unit. Parameter 0 is the return address
-/// the dispatcher read at entry. Loads the state, calls `g` with the full loop budget, and on
+/// the dispatcher read at entry. Loads the state, calls `g` with the entry budget the dispatcher
+/// computed from the live slice (at most the loop budget), and on
 /// MATCHED stores the returned state with EIP at that return address. EXITED left canonical
 /// state already.
 fn unit_chain_entry_body() -> (Vec<u8>, usize) {
@@ -8181,7 +8192,13 @@ fn unit_chain_entry_body() -> (Vec<u8>, usize) {
         c(&mut b, a as i32);
         ld(&mut b, 0);
     }
-    c(&mut b, cpu::LOOP_COUNTER);
+    if crate::fn_unit::mutation(crate::fn_unit::M_CHAIN_FIXED_BUDGET) {
+        c(&mut b, cpu::LOOP_COUNTER);
+    }
+    else {
+        c(&mut b, crate::fn_unit::entry_budget_addr() as i32);
+        ld(&mut b, 0);
+    }
     b.push(op::OP_CALL);
     let call_at = b.len();
     b.extend([0, 0]);
@@ -8296,6 +8313,10 @@ pub fn gen_unit_chain_call(ctx: &mut JitContext, imm: u32, site: crate::fn_unit:
     ctx.builder.le_i32();
     chain_br_if(ctx, fallback, C_FB_BUDGET);
 
+    if !mutation(M_CHAIN_FIXED_BUDGET) {
+        gen_unit_chain_slice_check(ctx, fallback, &rem);
+    }
+
     if !mutation(M_CHAIN_NO_TOKEN) {
         ctx.builder.load_fixed_i32(token_addr(site.token_slot));
         ctx.builder.const_i32(site.token as i32);
@@ -8344,6 +8365,23 @@ pub fn gen_unit_chain_call(ctx: &mut JitContext, imm: u32, site: crate::fn_unit:
     codegen::gen_update_instruction_counter(ctx);
     ctx.builder.const_i32(0);
     ctx.builder.set_local(&ctx.instruction_counter);
+
+    // The push can write a code page and drop the callee (or any unit) on the way. The CALL has
+    // committed: on a moved token the unit leaves with the pushed stack, EIP at the target and
+    // the CALL retired once, and the dispatcher continues from there.
+    if !mutation(M_CHAIN_NO_TOKEN_AFTER_PUSH) {
+        ctx.builder.load_fixed_i32(token_addr(site.token_slot));
+        ctx.builder.const_i32(site.token as i32);
+        ctx.builder.ne_i32();
+        ctx.builder.if_void();
+        chain_count(ctx, C_TOKEN_AFTER_PUSH);
+        ctx.builder.const_i32(global_pointers::instruction_pointer as i32);
+        ctx.builder.get_local(&target);
+        ctx.builder.store_aligned_i32(0);
+        ctx.builder.br(ctx.exit_label);
+        ctx.builder.block_end();
+    }
+
     ctx.builder.get_local(&rem);
     ctx.builder.set_local(&budget);
     if canonical {
@@ -8360,6 +8398,8 @@ pub fn gen_unit_chain_call(ctx: &mut JitContext, imm: u32, site: crate::fn_unit:
     ctx.builder.const_i32(1);
     ctx.builder.add_i32();
     ctx.builder.store_aligned_i32(0);
+    ctx.builder.load_fixed_i32(global_pointers::instruction_pointer as u32);
+    let eip_saved = ctx.builder.set_new_local();
     ctx.builder.const_i32(global_pointers::instruction_pointer as i32);
     ctx.builder.get_local(&target);
     ctx.builder.store_aligned_i32(0);
@@ -8425,8 +8465,16 @@ pub fn gen_unit_chain_call(ctx: &mut JitContext, imm: u32, site: crate::fn_unit:
         ctx.builder.block_end();
     }
 
+    // Back in the caller's block: EIP regains the value it had before the call, on the block's
+    // page, so the block epilogue computes the continuation exactly once (also when it is the
+    // first byte of the next page).
     ctx.builder.const_i32(global_pointers::instruction_pointer as i32);
-    ctx.builder.get_local(&cont);
+    if mutation(M_CHAIN_EIP_ABSOLUTE) {
+        ctx.builder.get_local(&cont);
+    }
+    else {
+        ctx.builder.get_local(&eip_saved);
+    }
     ctx.builder.store_aligned_i32(0);
     ctx.builder.br(done);
     ctx.builder.block_end();
@@ -8438,12 +8486,55 @@ pub fn gen_unit_chain_call(ctx: &mut JitContext, imm: u32, site: crate::fn_unit:
         ctx.builder.free_local(l);
     }
     ctx.builder.free_local(outcome);
+    ctx.builder.free_local(eip_saved);
     ctx.builder.free_local(b_out);
     ctx.builder.free_local(target);
     ctx.builder.free_local(cont);
     ctx.builder.free_local(rem);
     ctx.builder.free_local(depth);
     chain_free_caches(ctx);
+}
+
+/// The slice deadline the page chain honours (jit_find_cache_entry_for_chaining): an urgent exit
+/// request (cycle limit 0 with the hypercall page on) or a used-up slice falls back before the
+/// CALL commits; otherwise `rem` becomes the smaller of itself and what is left of the slice.
+fn gen_unit_chain_slice_check(ctx: &mut JitContext, fallback: Label, rem: &WasmLocal) {
+    use crate::fn_unit::*;
+    let hp = unsafe { hypercall::hp_ptr() as u32 };
+    ctx.builder.load_fixed_i32(hp);
+    let limit = ctx.builder.set_new_local();
+    ctx.builder.get_local(&limit);
+    ctx.builder.eqz_i32();
+    ctx.builder.if_void();
+    ctx.builder.load_fixed_i32(hp + 0x008);
+    chain_br_if(ctx, fallback, C_FB_BUDGET);
+    ctx.builder.const_i32(100_003);
+    ctx.builder.set_local(&limit);
+    ctx.builder.block_end();
+
+    ctx.builder.get_local(&limit);
+    ctx.builder.load_fixed_i32(global_pointers::instruction_counter as u32);
+    ctx.builder.get_local(&ctx.instruction_counter);
+    ctx.builder.add_i32();
+    ctx.builder.load_fixed_i32(std::ptr::addr_of!(cpu::jit_cycle_start_instruction_counter) as u32);
+    ctx.builder.sub_i32();
+    let elapsed = ctx.builder.tee_new_local();
+    ctx.builder.leu_i32();
+    chain_br_if(ctx, fallback, C_FB_BUDGET);
+
+    ctx.builder.get_local(&limit);
+    ctx.builder.get_local(&elapsed);
+    ctx.builder.sub_i32();
+    let left = ctx.builder.tee_new_local();
+    ctx.builder.get_local(rem);
+    ctx.builder.get_local(&left);
+    ctx.builder.get_local(rem);
+    ctx.builder.ltu_i32();
+    ctx.builder.select();
+    ctx.builder.set_local(rem);
+    ctx.builder.free_local(left);
+    ctx.builder.free_local(elapsed);
+    ctx.builder.free_local(limit);
 }
 
 /// RET of a unit in the chain layout: MATCHED when ESP is the entry ESP and the return address
@@ -8528,13 +8619,30 @@ fn unit_chain_sites(
             Ok(p) => p,
             Err(_) => continue,
         };
+        // Only a plain E8 rel32 (no prefix, operand size 32 from the admitted state) whose
+        // decoded target is the recorded one becomes a site; its five bytes are on one page.
+        if site_phys & 0xFFF > 0x1000 - 5
+            || crate::cpu::memory::read8(site_phys) != 0xE8
+            || site_virt.wrapping_add(5).wrapping_add(crate::cpu::memory::read32s(site_phys + 1) as u32) != target
+        {
+            stat_add(S_CHAIN_TARGET_MISMATCH, 1.0);
+            continue;
+        }
         let site = if target == virt {
-            Some(ChainSite { target, callee_phys: phys, chain_slot: own_chain, token_slot: own_slot, token: own_token })
+            Some(ChainSite {
+                site_virt,
+                target,
+                callee_phys: phys,
+                chain_slot: own_chain,
+                token_slot: own_slot,
+                token: own_token,
+            })
         }
         else {
             match ctx.fn_unit.units.get(&target) {
                 Some(u) if u.chain.is_some() && u.state_flags == state_flags && u.generation == ctx.fn_unit.generation(target) => {
                     Some(ChainSite {
+                        site_virt,
                         target,
                         callee_phys: u.phys,
                         chain_slot: u.chain.unwrap().to_u16(),
@@ -8584,6 +8692,12 @@ pub fn fn_unit_get_and_esp() -> u32 { crate::fn_unit::and_esp() as u32 }
 #[no_mangle]
 pub fn fn_unit_pending_chain_slot() -> u32 {
     get_jit_state().fn_unit.pending.as_ref().and_then(|p| p.chain).map_or(0, |c| c.to_u16() as u32)
+}
+
+/// 1 when the published unit at `caller` was compiled with a chained call site to `callee`.
+#[no_mangle]
+pub fn fn_unit_chain_linked(caller: u32, callee: u32) -> u32 {
+    get_jit_state().fn_unit.units.get(&caller).map_or(false, |u| u.chain.is_some() && u.links.contains(&callee)) as u32
 }
 
 #[no_mangle]

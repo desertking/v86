@@ -27,10 +27,21 @@
 // (outcome, eax..edi, the same tuple, budget); it sits in a second dispatcher-owned table slot.
 // `f` is the dispatcher entry: it loads the state, calls `g` and stores the result on MATCHED.
 // A direct CALL in a unit whose target is a published unit becomes, after a depth, budget,
-// callee-token and TLB-mapping check, the committed CALL (push, EIP = target) and a
+// slice, callee-token and TLB-mapping check, the committed CALL (push, EIP = target) and a
 // call_indirect of the callee's `g`. Any failed check leaves the unit at the CALL EIP before
-// anything commits. The callee's RET checks ESP against its entry ESP and the popped value
-// against the expected continuation before it pops; on a mismatch it leaves at the RET EIP.
+// anything commits. The push can write a code page and drop the callee: the callee token is
+// checked again after it, and a moved token leaves with the CALL committed (pushed stack, EIP
+// at the target, the CALL retired once). The budget is the live remainder: the dispatcher
+// starts `f` with the smaller of the loop budget and what is left of the slice, and every
+// chained call honours the slice deadline and an urgent exit request (cycle limit 0) like the
+// page chain. A unit that leaves before its first instruction retired (a chained CALL at its
+// entry that fell back) does not end the dispatch: it continues on the ordinary path, so the
+// unit is not entered again at the same EIP without progress. After MATCHED the caller's
+// EIP regains its pre-call value, so the block epilogue computes the continuation once.
+// Sites are admitted only for a plain E8 rel32 whose decoded target is the recorded one, and
+// units only for a 32-bit stack segment. The callee's RET checks ESP against its entry ESP
+// and the popped value against the expected continuation before it pops; on a mismatch it
+// leaves at the RET EIP.
 // EXITED from a callee propagates without writing caller locals: the callee left canonical
 // state. After MATCHED the caller compares its own token; a moved token stores the returned
 // state at the continuation and leaves. Units promote no stack memory, so there is nothing to
@@ -69,7 +80,9 @@ pub const S_CHAIN_UNCHAINED: usize = 21;
 pub const S_CHAIN_DROPPED: usize = 22;
 pub const S_CHAIN_STALE_PUBLISH: usize = 23;
 pub const S_MAX_RETIRED: usize = 24;
-pub const STAT_COUNT: usize = 25;
+pub const S_NO_PROGRESS: usize = 25;
+pub const S_CHAIN_TARGET_MISMATCH: usize = 26;
+pub const STAT_COUNT: usize = 27;
 
 pub const C_CALLS: usize = 0;
 pub const C_FB_DEPTH: usize = 1;
@@ -80,7 +93,8 @@ pub const C_CALLEE_EXITED: usize = 5;
 pub const C_CALLER_TOKEN: usize = 6;
 pub const C_RET_MATCHED: usize = 7;
 pub const C_RET_MISMATCH: usize = 8;
-pub const C_COUNT: usize = 9;
+pub const C_TOKEN_AFTER_PUSH: usize = 9;
+pub const C_COUNT: usize = 10;
 
 pub const CHAIN_MAX_DEPTH: u32 = 16;
 
@@ -95,6 +109,11 @@ pub const M_CHAIN_NO_DEPTH: u32 = 1 << 7;
 pub const M_CHAIN_STALE_FLAGS: u32 = 1 << 8;
 pub const M_CHAIN_NO_DEPENDANTS: u32 = 1 << 9;
 pub const M_CHAIN_BUDGET_NOT_CARRIED: u32 = 1 << 10;
+pub const M_CHAIN_NO_TOKEN_AFTER_PUSH: u32 = 1 << 11;
+pub const M_CHAIN_EIP_ABSOLUTE: u32 = 1 << 12;
+pub const M_NO_PROGRESS_GUARD: u32 = 1 << 13;
+pub const M_CHAIN_FIXED_BUDGET: u32 = 1 << 14;
+pub const M_ADMIT_SS16: u32 = 1 << 15;
 
 static mut ENABLED: bool = false;
 static mut CHAIN_MODE: u32 = 0;
@@ -105,6 +124,7 @@ pub static mut CHAIN_DEPTH: u32 = 0;
 pub static mut CHAIN_RET_EXPECT: [u32; CHAIN_MAX_DEPTH as usize + 1] = [0; CHAIN_MAX_DEPTH as usize + 1];
 pub static mut CHAIN_TOKENS: [u32; crate::jit::WASM_TABLE_SIZE as usize] = [0; crate::jit::WASM_TABLE_SIZE as usize];
 pub static mut CHAIN_COUNTERS: [u32; C_COUNT] = [0; C_COUNT];
+pub static mut CHAIN_ENTRY_BUDGET: u32 = 0;
 static mut MUTATION: u32 = 0;
 static mut THRESHOLD: u32 = 16;
 static mut STATS: [f64; STAT_COUNT] = [0.0; STAT_COUNT];
@@ -119,6 +139,7 @@ pub struct Unit {
     pub ret_imm: u32,
     pub chain: Option<WasmTableIndex>,
     pub token: u32,
+    pub links: Vec<u32>,
 }
 
 pub struct Pending {
@@ -133,12 +154,14 @@ pub struct Pending {
     pub token: u32,
     pub callees: Vec<(u32, u16, u32)>,
     pub waiting_on: Vec<u32>,
+    pub links: Vec<u32>,
 }
 
 /// One direct CALL of a unit being compiled whose target is a published unit (or the unit
 /// itself): the callee's chain slot, its token slot and token, and its entry page.
 #[derive(Clone, Copy)]
 pub struct ChainSite {
+    pub site_virt: u32,
     pub target: u32,
     pub callee_phys: u32,
     pub chain_slot: u16,
@@ -285,6 +308,10 @@ pub fn token_of(slot: u16) -> u32 { unsafe { CHAIN_TOKENS[slot as usize] } }
 pub fn token_addr(slot: u16) -> u32 { unsafe { std::ptr::addr_of!(CHAIN_TOKENS[slot as usize]) as u32 } }
 
 pub fn depth_addr() -> u32 { std::ptr::addr_of!(CHAIN_DEPTH) as u32 }
+
+pub fn entry_budget_addr() -> u32 { std::ptr::addr_of!(CHAIN_ENTRY_BUDGET) as u32 }
+
+pub fn set_entry_budget(n: u32) { unsafe { CHAIN_ENTRY_BUDGET = n } }
 
 pub fn ret_expect_addr() -> u32 { std::ptr::addr_of!(CHAIN_RET_EXPECT) as u32 }
 

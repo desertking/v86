@@ -3333,13 +3333,28 @@ pub unsafe fn cycle_internal() {
             let initial_instruction_counter = *instruction_counter;
             if unit.chain {
                 crate::fn_unit::reset_depth();
+                let limit = hypercall::read_cycle_limit();
+                let elapsed = initial_instruction_counter.wrapping_sub(jit_cycle_start_instruction_counter);
+                crate::fn_unit::set_entry_budget(if limit == 0 {
+                    0
+                }
+                else {
+                    limit.saturating_sub(elapsed).min(LOOP_COUNTER as u32)
+                });
                 wasm::call_indirect1_i32(unit.index as i32 + WASM_TABLE_OFFSET as i32, unit.ret_addr as i32);
             }
             else {
                 wasm::call_indirect1(unit.index as i32 + WASM_TABLE_OFFSET as i32, unit.state);
             }
-            jit::fn_unit_note_return(&unit, (*instruction_counter).wrapping_sub(initial_instruction_counter));
-            return;
+            let retired = (*instruction_counter).wrapping_sub(initial_instruction_counter);
+            jit::fn_unit_note_return(&unit, retired);
+            // A unit that left before its first instruction (a chained CALL at its entry that
+            // fell back) must not be entered again at the same EIP without progress: this
+            // dispatch continues on the ordinary path below.
+            if retired != 0 || crate::fn_unit::mutation(crate::fn_unit::M_NO_PROGRESS_GUARD) {
+                return;
+            }
+            crate::fn_unit::stat_add(crate::fn_unit::S_NO_PROGRESS, 1.0);
         }
     }
 
