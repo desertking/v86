@@ -3327,6 +3327,15 @@ pub unsafe fn cycle_internal() {
     // check. Gated inline on an empty queue, so the idle cost is a load and a branch.
     jit::tier2_drain_pending_gated();
 
+    if crate::fn_unit::enabled() && !DBG_ENABLED {
+        if let Some(unit) = jit::fn_unit_lookup(initial_eip as u32, initial_state_flags) {
+            let initial_instruction_counter = *instruction_counter;
+            wasm::call_indirect1(unit.index as i32 + WASM_TABLE_OFFSET as i32, unit.state);
+            jit::fn_unit_note_return(&unit, (*instruction_counter).wrapping_sub(initial_instruction_counter));
+            return;
+        }
+    }
+
     // DOD SoA lookup (jit::DISPATCH_META — no pointer chase). The old lookup-time
     // fastmem-generation deopt is gone: a stale unit self-deopts via its prologue
     // guard right after dispatch, one bounce, same observable behavior.

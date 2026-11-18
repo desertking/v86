@@ -2536,6 +2536,7 @@ struct PageInfo {
 enum CompilingPageState {
     Compiling { pages: HashMap<Page, PageInfo> },
     CompilingWritten,
+    Unit,
 }
 
 struct JitState {
@@ -2576,6 +2577,7 @@ struct JitState {
     region_joins: HashMap<Page, Vec<Page>, FixedHasher>,
     region_join_done: HashSet<(Page, Page), FixedHasher>,
     fn_census: crate::fn_census::Census,
+    fn_unit: crate::fn_unit::Units,
     #[cfg(debug_assertions)]
     wasm_table_index_to_page: HashMap<WasmTableIndex, HashSet<Page>>,
 }
@@ -2601,12 +2603,21 @@ fn check_jit_state_invariants(ctx: &mut JitState) {
     let used = HashSet::from_iter(ctx.pages.values().map(|info| info.wasm_table_index));
     let compiling = HashSet::from_iter(ctx.compiling.as_ref().map(|&(index, _)| index));
     let staged = HashSet::from_iter(ctx.aot_staged.as_ref().map(|tx| tx.wasm_table_index));
+    let units: HashSet<WasmTableIndex> = ctx.fn_unit.units.values().map(|u| u.index).collect();
+    dbg_assert!(units.len() == ctx.fn_unit.units.len());
+    dbg_assert!(free.intersection(&units).next().is_none());
+    dbg_assert!(used.intersection(&units).next().is_none());
+    dbg_assert!(compiling.intersection(&units).next().is_none());
+    dbg_assert!(staged.intersection(&units).next().is_none());
     dbg_assert!(free.intersection(&used).next().is_none());
     dbg_assert!(used.intersection(&compiling).next().is_none());
     dbg_assert!(free.intersection(&staged).next().is_none());
     dbg_assert!(used.intersection(&staged).next().is_none());
     dbg_assert!(compiling.intersection(&staged).next().is_none());
-    dbg_assert!(free.len() + used.len() + compiling.len() + staged.len() == (WASM_TABLE_SIZE - 1) as usize);
+    dbg_assert!(
+        free.len() + used.len() + compiling.len() + staged.len() + units.len()
+            == (WASM_TABLE_SIZE - 1) as usize
+    );
 
     let hidden: HashSet<WasmTableIndex> = ctx
         .pages
@@ -2684,6 +2695,7 @@ impl JitState {
             region_joins: HashMap::default(),
             region_join_done: HashSet::default(),
             fn_census: crate::fn_census::Census::new(),
+            fn_unit: crate::fn_unit::Units::new(),
 
             #[cfg(debug_assertions)]
             wasm_table_index_to_page: HashMap::new(),
@@ -3482,6 +3494,13 @@ struct JoinBudget {
 }
 static mut LAST_COMPILE_JOINED_PAGES: Vec<Page> = Vec::new();
 
+// Set only while a function unit is being walked and emitted: the walk stays on these pages,
+// takes no entry points from the page JIT, and the emitter leaves through plain exits.
+static mut UNIT_WALK_PAGES: Option<HashSet<Page, FixedHasher>> = None;
+fn unit_walk_pages() -> Option<&'static HashSet<Page, FixedHasher>> {
+    unsafe { (*std::ptr::addr_of!(UNIT_WALK_PAGES)).as_ref() }
+}
+
 fn jit_find_basic_blocks(
     ctx: &mut JitState,
     entry_points: HashSet<i32>,
@@ -3510,6 +3529,18 @@ fn jit_find_basic_blocks(
         };
 
         let phys_page = Page::page_of(phys_target);
+
+        if let Some(allowed) = unit_walk_pages() {
+            if !allowed.contains(&phys_page) {
+                return None;
+            }
+            if pages.is_empty() {
+                marked_as_entry.insert(virt_target);
+            }
+            pages.insert(phys_page);
+            to_visit_stack.push(virt_target);
+            return Some(phys_target);
+        }
 
         // Never GROW a module INTO the thunk/callback/spin bucket (REGION_EXCLUDE_*):
         // stub pages are full of OUT traps and must stay standalone modules. This must
@@ -3878,7 +3909,7 @@ fn jit_find_basic_blocks(
                         // region are marked as entries so the runtime
                         // jit_find_cache_entry_in_page re-dispatch stays
                         // intra-module instead of exiting to main_loop.
-                        if unsafe { JIT_INDIRECT_REGIONS } {
+                        if unsafe { JIT_INDIRECT_REGIONS } && unit_walk_pages().is_none() {
                             let targets = trace_profiler::hot_indirect_targets(
                                 addr_before_instruction,
                                 JIT_INDIRECT_REGION_MAX_TARGETS,
@@ -4038,7 +4069,7 @@ fn jit_find_basic_blocks(
     // emitter guards each with an eip compare and falls through to the normal
     // dispatch. A page dirtied under this module frees the whole module (multi-page
     // sweep in free_wasm_module), annotations included — no new SMC surface.
-    if ret_speculation_enabled() {
+    if ret_speculation_enabled() && unit_walk_pages().is_none() {
         let fall_through_virt =
             |b: &BasicBlock| (b.virt_addr & !0xFFF) + page_offset_of_end(b.addr, b.end_addr);
 
@@ -4537,8 +4568,12 @@ pub fn codegen_finalize_failed(
         2
     }
     else {
-        let (pending_wasm_table_index, _) = ctx.compiling.take().unwrap();
+        let (pending_wasm_table_index, state) = ctx.compiling.take().unwrap();
         dbg_assert!(pending_wasm_table_index == wasm_table_index);
+        if let CompilingPageState::Unit = state {
+            ctx.fn_unit.pending = None;
+            crate::fn_unit::stat_add(crate::fn_unit::S_COMPILE_FAILED, 1.0);
+        }
         free_wasm_table_index(&mut ctx, pending_wasm_table_index);
         check_jit_state_invariants(&mut ctx);
         0
@@ -4575,6 +4610,12 @@ pub fn codegen_finalize_finished(
     let pages = match mem::replace(&mut ctx.compiling, None) {
         None => {
             dbg_assert!(false);
+            return;
+        },
+        Some((in_progress_wasm_table_index, CompilingPageState::Unit)) => {
+            dbg_assert!(wasm_table_index == in_progress_wasm_table_index);
+            fn_unit_finished(&mut ctx, wasm_table_index);
+            check_jit_state_invariants(&mut ctx);
             return;
         },
         Some((in_progress_wasm_table_index, CompilingPageState::CompilingWritten)) => {
@@ -5055,8 +5096,8 @@ fn gen_chain_or_exit_to_known_successor(
     state_flags: CachedStateFlags,
     last_instruction_addr: u32,
 ) {
-    if !block_chaining_enabled() {
-        if hot_edge_regions_enabled() {
+    if !block_chaining_enabled() || unit_walk_pages().is_some() {
+        if hot_edge_regions_enabled() && unit_walk_pages().is_none() {
             // Tag the exit with its source page for cycle_internal's hot-edge sampler. Only on
             // this unchained exit: a chained one never returns to cycle_internal, and a tag it
             // left behind would pair this source with some later module's exit eip.
@@ -5762,7 +5803,7 @@ fn jit_generate_module(
                         // through to the plain module exit (the register flush is idempotent
                         // and the instruction counter was zeroed after flushing, so the
                         // epilogue's second flush/add is harmless).
-                        if ret_chaining_enabled() {
+                        if ret_chaining_enabled() && unit_walk_pages().is_none() {
                             codegen::gen_move_registers_from_locals_to_memory(ctx);
                             codegen::gen_update_instruction_counter(ctx);
 
@@ -6978,6 +7019,7 @@ pub fn jit_dirty_page_instrumentation(page: Page) { jit_dirty_page_instrumentati
 
 fn jit_dirty_page_instrumentation_ctx(ctx: &mut JitState, page: Page) {
     let mut did_have_code = false;
+    fn_unit_dirty_page(ctx, page);
 
     if let Some(PageInfo {
         wasm_table_index,
@@ -7091,7 +7133,7 @@ pub fn jit_page_has_code(page: Page) -> bool { jit_page_has_code_ctx(&mut get_ji
 /// or as a hidden, superseded one that may still be running)? Upstream 2b49f4b7.
 pub fn jit_page_has_wasm_table_index(page: Page, wasm_table_index: u16) -> bool {
     let ctx = get_jit_state();
-    match ctx.pages.get(&page) {
+    let in_page = match ctx.pages.get(&page) {
         Some(info) => {
             info.wasm_table_index.to_u16() == wasm_table_index
                 || info
@@ -7100,7 +7142,8 @@ pub fn jit_page_has_wasm_table_index(page: Page, wasm_table_index: u16) -> bool 
                     .any(|w| w.to_u16() == wasm_table_index)
         },
         None => false,
-    }
+    };
+    in_page || ctx.fn_unit.slot_has_page(wasm_table_index, page)
 }
 
 fn jit_page_has_code_ctx(ctx: &mut JitState, page: Page) -> bool {
@@ -7528,3 +7571,336 @@ pub unsafe fn jit_snapshot_get_entry_count(i: u32) -> u32 {
 // AOT offline driver (spike): feature-gated, absent from the shipped engine.
 #[cfg(feature = "aot-driver")]
 mod aot_driver;
+
+// ─── Function units (baseline oracle, fn_unit.rs) ────────────────────────────
+
+pub struct FnUnitEntry {
+    pub index: u16,
+    pub state: u16,
+    pub ret_addr: u32,
+    pub esp: u32,
+    pub ret_imm: u32,
+}
+
+fn fn_unit_free(ctx: &mut JitState, indices: Vec<WasmTableIndex>) {
+    for index in indices {
+        free_wasm_table_index(ctx, index);
+    }
+}
+
+fn fn_unit_clear(ctx: &mut JitState) {
+    let freed = ctx.fn_unit.take_all();
+    fn_unit_free(ctx, freed);
+}
+
+#[no_mangle]
+pub fn fn_unit_set_enabled(on: u32) {
+    crate::fn_unit::set_enabled(on != 0);
+    if on == 0 {
+        fn_unit_clear(&mut get_jit_state());
+    }
+}
+
+#[no_mangle]
+pub fn fn_unit_enabled() -> u32 { crate::fn_unit::enabled() as u32 }
+
+#[no_mangle]
+pub fn fn_unit_reset() {
+    fn_unit_clear(&mut get_jit_state());
+    crate::fn_unit::reset_stats();
+}
+
+#[no_mangle]
+pub fn fn_unit_count() -> u32 { get_jit_state().fn_unit.units.len() as u32 }
+
+#[no_mangle]
+pub fn fn_unit_slot(virt: u32) -> u32 {
+    get_jit_state().fn_unit.units.get(&virt).map_or(u32::MAX, |u| u.index.to_u16() as u32)
+}
+
+#[no_mangle]
+pub fn fn_unit_generation(virt: u32) -> u32 { get_jit_state().fn_unit.generation(virt) }
+
+#[no_mangle]
+pub fn fn_unit_pending() -> u32 { get_jit_state().fn_unit.pending.as_ref().map_or(0, |p| p.virt) }
+
+fn fn_unit_dirty_page(ctx: &mut JitState, page: Page) {
+    if ctx.fn_unit.page_entries.is_empty() {
+        return;
+    }
+    let freed = ctx.fn_unit.note_page_dirty(page);
+    fn_unit_free(ctx, freed);
+}
+
+/// Walks and emits the unit for an admitted census row. Err carries the refusal statistic.
+fn fn_unit_compile(
+    ctx: &mut JitState,
+    virt: u32,
+    cand: &crate::fn_census::UnitCandidate,
+    state_flags: CachedStateFlags,
+) -> Result<(), usize> {
+    use crate::fn_unit::*;
+    let allowed: HashSet<Page, FixedHasher> = cand.pages.iter().copied().collect();
+    let cpu = CpuContext { eip: 0, prefixes: 0, cs_offset: cpu::get_seg_cs() as u32, state_flags };
+
+    unsafe { UNIT_WALK_PAGES = Some(allowed) };
+    let mut entry = HashSet::new();
+    entry.insert(virt as i32);
+    let blocks = jit_find_basic_blocks(ctx, entry, cpu.clone());
+
+    let by_addr: HashMap<u32, usize> = blocks.iter().enumerate().map(|(i, b)| (b.addr, i)).collect();
+    let mut keep = vec![false; blocks.len()];
+    let mut stack = match by_addr.get(&cand.phys) {
+        Some(&i) => vec![i],
+        None => {
+            unsafe { UNIT_WALK_PAGES = None };
+            return Err(S_REFUSE_SHAPE);
+        },
+    };
+    while let Some(i) = stack.pop() {
+        if keep[i] {
+            continue;
+        }
+        keep[i] = true;
+        let mut push = |a: Option<u32>| {
+            if let Some(i) = a.and_then(|a| by_addr.get(&a)) {
+                stack.push(*i);
+            }
+        };
+        match &blocks[i].ty {
+            BasicBlockType::Normal { next_block_addr, .. } => push(*next_block_addr),
+            BasicBlockType::ConditionalJump { next_block_addr, next_block_branch_taken_addr, .. } => {
+                push(*next_block_addr);
+                push(*next_block_branch_taken_addr);
+            },
+            BasicBlockType::Exit | BasicBlockType::AbsoluteEip => {},
+        }
+    }
+    let mut kept: Vec<BasicBlock> = blocks.into_iter().zip(keep).filter(|(_, k)| *k).map(|(b, _)| b).collect();
+    let inside = |b: &BasicBlock| cand.runs.iter().any(|&(s, e)| s <= b.addr && b.end_addr <= e);
+    if !kept.iter().all(|b| inside(b) && b.indirect_local_dispatch.is_empty() && b.ret_speculation.is_empty()) {
+        unsafe { UNIT_WALK_PAGES = None };
+        return Err(S_REFUSE_SHAPE);
+    }
+    let known: HashSet<u32> = kept.iter().map(|b| b.addr).collect();
+    let mut pages = HashSet::new();
+    for b in kept.iter_mut() {
+        b.is_entry_block = b.addr == cand.phys;
+        pages.insert(Page::page_of(b.addr));
+        match &mut b.ty {
+            BasicBlockType::Normal { next_block_addr, .. } => {
+                if next_block_addr.map_or(false, |a| !known.contains(&a)) {
+                    *next_block_addr = None;
+                }
+            },
+            BasicBlockType::ConditionalJump { next_block_addr, next_block_branch_taken_addr, .. } => {
+                if next_block_addr.map_or(false, |a| !known.contains(&a)) {
+                    *next_block_addr = None;
+                }
+                if next_block_branch_taken_addr.map_or(false, |a| !known.contains(&a)) {
+                    *next_block_branch_taken_addr = None;
+                }
+            },
+            BasicBlockType::Exit | BasicBlockType::AbsoluteEip => {},
+        }
+    }
+
+    if ctx.wasm_table_index_free_list.is_empty() {
+        unsafe { UNIT_WALK_PAGES = None };
+        return Err(S_DEFERRED_BUSY);
+    }
+
+    let graph = control_flow::make_graph(&kept);
+    let mut structure = control_flow::loopify(&graph);
+    control_flow::blockify(&mut structure, &graph);
+
+    let wasm_table_index = ctx.wasm_table_index_free_list.pop().expect("unit table index");
+    let by_addr: HashMap<u32, BasicBlock> = kept.into_iter().map(|b| (b.addr, b)).collect();
+    let entries = jit_generate_module(
+        structure,
+        &by_addr,
+        cpu,
+        &mut ctx.wasm_builder,
+        wasm_table_index,
+        state_flags,
+        codegen::GgMode::Off,
+        None,
+    )
+    .0;
+    unsafe { UNIT_WALK_PAGES = None };
+
+    let state = match entries.iter().find(|&&(a, _)| a == cand.phys) {
+        Some(&(_, s)) => s,
+        None => {
+            free_wasm_table_index(ctx, wasm_table_index);
+            return Err(S_REFUSE_SHAPE);
+        },
+    };
+
+    let page_list: Vec<Page> = pages.iter().copied().collect();
+    for &p in &page_list {
+        ctx.entry_points.entry(p).or_insert_with(|| (0, HashSet::new()));
+    }
+    cpu::tlb_set_has_code_multiple(&pages, true);
+    ctx.fn_unit.track_pages(virt, &page_list);
+    let generation = ctx.fn_unit.generation(virt);
+    ctx.fn_unit.pending = Some(Pending {
+        virt,
+        phys: cand.phys,
+        state,
+        generation,
+        state_flags,
+        pages: page_list,
+        ret_imm: cand.ret_summary & 0xFFFF,
+    });
+    ctx.compiling = Some((wasm_table_index, CompilingPageState::Unit));
+    stat_add(S_COMPILES, 1.0);
+
+    codegen_finalize(
+        wasm_table_index,
+        cand.phys,
+        state_flags,
+        ctx.wasm_builder.get_output_ptr() as u32,
+        ctx.wasm_builder.get_output_len(),
+    );
+    Ok(())
+}
+
+fn fn_unit_finished(ctx: &mut JitState, wasm_table_index: WasmTableIndex) {
+    use crate::fn_unit::*;
+    let p = match ctx.fn_unit.pending.take() {
+        Some(p) => p,
+        None => {
+            free_wasm_table_index(ctx, wasm_table_index);
+            return;
+        },
+    };
+    if p.generation != ctx.fn_unit.generation(p.virt) && !mutation(M_NO_GENERATION_CHECK) {
+        stat_add(S_WRITTEN_DURING_COMPILE, 1.0);
+        free_wasm_table_index(ctx, wasm_table_index);
+        return;
+    }
+    stat_add(S_PUBLISHED, 1.0);
+    ctx.fn_unit.units.insert(
+        p.virt,
+        Unit {
+            phys: p.phys,
+            index: wasm_table_index,
+            state: p.state,
+            generation: p.generation,
+            state_flags: p.state_flags,
+            pages: p.pages,
+            ret_imm: p.ret_imm,
+        },
+    );
+}
+
+fn fn_unit_maybe_compile(ctx: &mut JitState, virt: u32, state_flags: CachedStateFlags) {
+    use crate::fn_census::{RET_KNOWN, RET_MIXED};
+    use crate::fn_unit::*;
+    if ctx.compiling.is_some() || ctx.aot_staged.is_some() || ctx.fn_unit.pending.is_some() {
+        return;
+    }
+    let cand = match crate::fn_census::unit_candidate(&mut ctx.fn_census, virt) {
+        Some(c) => c,
+        None => return,
+    };
+    if cand.entries < threshold() || ctx.fn_unit.refused.get(&virt) == Some(&cand.analyses) {
+        return;
+    }
+    let refuse = |ctx: &mut JitState, stat: usize| {
+        stat_add(stat, 1.0);
+        ctx.fn_unit.refused.insert(virt, cand.analyses);
+    };
+    if !cand.current {
+        stat_add(S_REFUSE_STALE_ROW, 1.0);
+        return;
+    }
+    if !state_flags.is_32() || !state_flags.has_flat_segmentation() {
+        return refuse(ctx, S_REFUSE_STATE);
+    }
+    if cand.unit != 0 || cand.window != 0 {
+        return refuse(ctx, S_REFUSE_NOT_M1);
+    }
+    if cand.ret_summary & RET_KNOWN == 0 || cand.ret_summary & RET_MIXED != 0 {
+        return refuse(ctx, S_REFUSE_RET_FORM);
+    }
+    if cand.pages.is_empty() || cand.runs.is_empty() {
+        return refuse(ctx, S_REFUSE_SHAPE);
+    }
+    match cpu::translate_address_read_no_side_effects(virt as i32) {
+        Ok(phys) if phys == cand.phys => {},
+        _ => {
+            stat_add(S_REFUSE_PHYS, 1.0);
+            return;
+        },
+    }
+    match fn_unit_compile(ctx, virt, &cand, state_flags) {
+        Ok(()) => {},
+        Err(S_DEFERRED_BUSY) => stat_add(S_DEFERRED_BUSY, 1.0),
+        Err(stat) => refuse(ctx, stat),
+    }
+}
+
+/// Dispatcher side: the unit to enter at `virt`, if one is current. Compiles admitted rows.
+pub unsafe fn fn_unit_lookup(virt: u32, state_flags: CachedStateFlags) -> Option<FnUnitEntry> {
+    use crate::fn_unit::*;
+    if unsafe { JIT_DISABLED } {
+        return None;
+    }
+    let mut ctx = get_jit_state();
+    let (phys, index, state, generation, flags, ret_imm) = match ctx.fn_unit.units.get(&virt) {
+        Some(u) => (u.phys, u.index, u.state, u.generation, u.state_flags, u.ret_imm),
+        None => {
+            fn_unit_maybe_compile(&mut ctx, virt, state_flags);
+            return None;
+        },
+    };
+    if generation != ctx.fn_unit.generation(virt) && !mutation(M_NO_GENERATION_CHECK) {
+        stat_add(S_SKIP_GENERATION, 1.0);
+        ctx.fn_unit.units.remove(&virt);
+        free_wasm_table_index(&mut ctx, index);
+        return None;
+    }
+    if flags != state_flags {
+        stat_add(S_SKIP_STATE, 1.0);
+        return None;
+    }
+    match cpu::translate_address_read_no_side_effects(virt as i32) {
+        Ok(p) if p == phys => {},
+        _ => {
+            stat_add(S_SKIP_MAPPING, 1.0);
+            return None;
+        },
+    }
+    let esp = cpu::read_reg32(crate::regs::ESP as i32) as u32;
+    let ret_addr = match cpu::translate_address_read_no_side_effects(esp as i32) {
+        Ok(p) if esp & 0xFFF <= 0xFFC && !memory::in_mapped_range(p) => memory::read32s(p) as u32,
+        _ => {
+            stat_add(S_SKIP_STACK, 1.0);
+            return None;
+        },
+    };
+    Some(FnUnitEntry { index: index.to_u16(), state, ret_addr, esp, ret_imm })
+}
+
+/// After the unit returned: MATCHED when its RET landed on the pushed return address with the
+/// recorded `ret imm16` applied; otherwise EXITED at the EIP the unit left.
+pub unsafe fn fn_unit_note_return(e: &FnUnitEntry, retired: u32) {
+    use crate::fn_unit::*;
+    stat_add(S_ENTRIES, 1.0);
+    stat_add(S_INSNS, retired as f64);
+    let expected_esp = e.esp.wrapping_add(4).wrapping_add(e.ret_imm);
+    let matched = *global_pointers::instruction_pointer as u32 == e.ret_addr
+        && cpu::read_reg32(crate::regs::ESP as i32) as u32 == expected_esp;
+    if matched {
+        stat_add(S_MATCHED, 1.0);
+    }
+    else {
+        stat_add(S_EXITED, 1.0);
+        if mutation(M_RESUME_AFTER_EXIT) {
+            *global_pointers::instruction_pointer = e.ret_addr as i32;
+            cpu::write_reg32(crate::regs::ESP as i32, expected_esp as i32);
+        }
+    }
+}

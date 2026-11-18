@@ -14,6 +14,7 @@ mod codegen;
 mod config;
 mod d3d9_glue;
 mod fn_census;
+mod fn_unit;
 mod control_flow;
 mod cpu_context;
 mod gen;
