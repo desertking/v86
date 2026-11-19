@@ -79,8 +79,13 @@ use crate::softfloat::F80;
 
 /// Dedicated page for hypercall shared data + preemption control.
 /// Lives in WASM data section, not in CPU state area.
+/// The host attaches 32-bit typed views to it, so it must be at least 4-byte aligned; a u8 array
+/// alone has alignment 1 and only lands aligned by accident of the link order.
+#[repr(C, align(8))]
+pub struct HypercallPage(pub [u8; 81920]);
+
 #[no_mangle]
-pub static mut HYPERCALL_PAGE: [u8; 81920] = [0u8; 81920];
+pub static mut HYPERCALL_PAGE: HypercallPage = HypercallPage([0u8; 81920]);
 
 // Offset constants
 const OFF_CYCLE_LIMIT: usize = 0x000;
