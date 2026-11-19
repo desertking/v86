@@ -8010,13 +8010,13 @@ fn fn_unit_maybe_compile(ctx: &mut JitState, virt: u32, state_flags: CachedState
     if ctx.compiling.is_some() || ctx.aot_staged.is_some() || ctx.fn_unit.pending.is_some() {
         return;
     }
-    let cand = match crate::fn_census::unit_candidate(&mut ctx.fn_census, virt) {
+    let refused = &ctx.fn_unit.refused;
+    let cand = match crate::fn_census::unit_candidate(&mut ctx.fn_census, virt, |entries, analyses| {
+        entries >= threshold() && refused.get(&virt) != Some(&analyses)
+    }) {
         Some(c) => c,
         None => return,
     };
-    if cand.entries < threshold() || ctx.fn_unit.refused.get(&virt) == Some(&cand.analyses) {
-        return;
-    }
     let refuse = |ctx: &mut JitState, stat: usize| {
         stat_add(stat, 1.0);
         ctx.fn_unit.refused.insert(virt, cand.analyses);
